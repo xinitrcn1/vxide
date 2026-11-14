@@ -1,0 +1,46 @@
+# Scripted UI test: run by tests/t_ui.sh in a scratch project.
+open src/a.c
+expect file src/a.c
+key ctrl+End
+type int g(int x) {\nreturn x;
+expect text int g(int x) {\n\treturn x;\n}
+key ctrl+z
+expect text int g(int x) {\n\t\n}
+key ctrl+y
+key ctrl+Home
+key ctrl+/
+expect text // int f(void)
+key ctrl+/
+key alt+Down
+expect text {\nint f(void)
+key ctrl+z ctrl+z ctrl+z
+expect text int f(void)\n{\n\treturn 0;
+key ctrl+g
+type 3
+key Return
+expect line 3
+key ctrl+shift+k
+expect text {\n}
+key ctrl+z
+key ctrl+Home
+key shift+alt+Down shift+alt+Down
+type //
+expect text //int f(void)\n//{\n//
+key Escape
+key ctrl+z
+key ctrl+f
+type return
+key Escape
+expect line 3
+key ctrl+f
+key Return
+key Escape
+expect line 6
+key ctrl+p
+type b.c
+key Return
+expect file b.c
+key ctrl+Tab
+expect file a.c
+key ctrl+s
+shot build/ui-test.png

@@ -838,7 +838,7 @@ static void scm_rows(void)
 		u32 cnt = 0;
 		for (u32 i = 0; i < st->count; i++)
 			cnt += sec ? st_staged(st->flags[i]) : st_changed(st->flags[i]);
-		if (!cnt && sec == 1)
+		if (!cnt)
 			continue;
 		VX_GROW(scm_item, scm_cap, scm_n + 1);
 		scm_item[scm_n++] = 0x80000000u | (u32)sec;
@@ -1202,10 +1202,12 @@ void problems_draw(int x, int y, int w, int h)
 		draw_icon(sev == LSP_SEV_ERROR ? ICON_ERROR : sev == LSP_SEV_WARNING ? ICON_WARNING : ICON_INFO, x + PX(44),
 		          ry + (rh - PX(16)) / 2, c);
 		const char *m = D->d_pool[d].b + D->d_msg[d][k];
-		char pos[48];
-		snprintf(pos, sizeof pos, "[Ln %u, Col %u]", D->d_line0[d][k] + 1, D->d_col0[d][k] + 1);
+		size_t mlen = strcspn(m, "\x1f");
+		char pos[160];
+		snprintf(pos, sizeof pos, "%s%s[Ln %u, Col %u]", m[mlen] ? m + mlen + 1 : "", m[mlen] ? " " : "",
+		         D->d_line0[d][k] + 1, D->d_col0[d][k] + 1);
 		int pw = font_width(FONT_UI, pos, strlen(pos));
-		int tx = draw_text_fit(FONT_UI, x + PX(66), ty, m, strlen(m), w - PX(66) - pw - PX(20), COL(C_FG));
+		int tx = draw_text_fit(FONT_UI, x + PX(66), ty, m, mlen, w - PX(66) - pw - PX(20), COL(C_FG));
 		draw_text(FONT_UI, tx + PX(8), ty, pos, strlen(pos), COL(C_DESCRIPTION_FG));
 	}
 }

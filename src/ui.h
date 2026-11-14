@@ -212,6 +212,7 @@ typedef struct {
 	int find_flags;
 	u32 find_count, find_index;
 	u32 find_version; /* text version the count is for */
+	u32 find_doc;
 
 	/* quick input */
 	int quick;

@@ -454,10 +454,8 @@ void ed_text(View *v, const char *s, size_t n)
 			}
 		}
 	}
-	bool ws = n == 1 && (s[0] == ' ' || s[0] == '\t');
-	ed_insert_text(v, s, n, ws ? GK_OTHER : GK_TYPE);
-	if (ws)
-		v->group_kind = GK_NONE;
+	/* consecutive typing (spaces included) is one undo step, as in VSCodium */
+	ed_insert_text(v, s, n, GK_TYPE);
 	ed_completion_trigger(v, false);
 }
 
@@ -1375,6 +1373,7 @@ void ed_find_update(View *v)
 	app.find_count = 0;
 	app.find_index = 0;
 	app.find_version = t->version;
+	app.find_doc = v->doc;
 	if (!app.find_in.n)
 		return;
 	const char *hay = text_flat(t);
@@ -2008,7 +2007,7 @@ void ed_draw(Group *g, View *v, int x, int y, int w, int h, bool focused)
 	}
 	u32 ba = 0, bb = 0;
 	bool brackets = !any_sel && match_bracket(t, v->head[0], &ba, &bb);
-	if (app.find_open && app.find_version != t->version)
+	if (app.find_open && (app.find_version != t->version || app.find_doc != v->doc))
 		ed_find_update(v);
 
 	draw_clip(x, y, w - mm - SCROLL_W, h);
@@ -2291,7 +2290,8 @@ void ed_draw(Group *g, View *v, int x, int y, int w, int h, bool focused)
 			int cy = y + (int)((i64)cur_line * h / VX_MAX((i64)nl, 1));
 			draw_rect(sx + PX(1), cy, SCROLL_W - PX(1), PX(2), (COL(C_CURSOR) & 0xFFFFFF00u) | 0xA0u);
 		}
-		if (content > h) {
+		bool over = app.hover_x >= x && app.hover_x < x + w && app.hover_y >= y && app.hover_y < y + h;
+		if (content > h && (over || drag_mode == 4)) {
 			i64 slider_h = VX_MAX((i64)h * h / content, (i64)PX(20));
 			i64 slider_y = (i64)(h - slider_h) * v->scroll_y / VX_MAX(content - h, 1);
 			bool hov = app.hover_x >= sx && app.hover_x < sx + SCROLL_W && app.hover_y >= y && app.hover_y < y + h;
@@ -2553,12 +2553,18 @@ void ed_draw_popups(View *v)
 				if (!on)
 					continue;
 				const char *m = D->d_pool[v->doc].b + D->d_msg[v->doc][i];
+				size_t mlen = strcspn(m, "\x1f");
 				u8 sev = D->d_sev[v->doc][i];
 				u32 c = sev == LSP_SEV_ERROR ? COL(C_ERROR) : sev == LSP_SEV_WARNING ? COL(C_WARNING) : COL(C_INFO);
 				if (pass == 1)
 					draw_icon(sev == LSP_SEV_ERROR ? ICON_ERROR : sev == LSP_SEV_WARNING ? ICON_WARNING : ICON_INFO,
 					          px + pad, y + (font_m[FONT_UI].line - PX(16)) / 2, c);
-				wrap_draw(FONT_UI, px + pad + PX(22), &y, pw - 2 * pad - PX(22), m, strlen(m), COL(C_FG), pass == 1);
+				wrap_draw(FONT_UI, px + pad + PX(22), &y, pw - 2 * pad - PX(22), m, mlen, COL(C_FG), pass == 1);
+				if (m[mlen]) {
+					if (pass == 1)
+						draw_text(FONT_UI, px + pad + PX(22), y, m + mlen + 1, strlen(m + mlen + 1), COL(C_DESCRIPTION_FG));
+					y += font_m[FONT_UI].line;
+				}
 				any = true;
 			}
 			if (app.hover_text) {
@@ -2600,7 +2606,13 @@ void ed_draw_popups(View *v)
 							}
 							y += app.line_h;
 						} else {
-							wrap_draw(FONT_UI, px + pad, &y, pw - 2 * pad, buf, k, COL(C_FG), pass == 1);
+							size_t h0 = 0;
+							while (h0 < k && buf[h0] == '#')
+								h0++;
+							bool head = h0 > 0 && h0 < k && buf[h0] == ' ';
+							int f = head ? FONT_UI_BOLD : FONT_UI;
+							size_t skip = head ? h0 + 1 : 0;
+							wrap_draw(f, px + pad, &y, pw - 2 * pad, buf + skip, k - skip, COL(C_FG), pass == 1);
 						}
 					}
 					lines++;

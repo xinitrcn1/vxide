@@ -909,10 +909,12 @@ static void quick_accept(void)
 	int kind = app.quick;
 	if (kind == QUICK_GOTO_LINE) {
 		View *v = active_view();
-		long line = strtol(in->b + 1, NULL, 10);
-		const char *comma = memchr(in->b, ':', in->n) ? strchr(in->b + 1, ':') : NULL;
-		if (!comma)
-			comma = strchr(in->b + 1, ',');
+		const char *p = in->b;
+		while (*p == ':' || *p == ' ')
+			p++;
+		char *after;
+		long line = strtol(p, &after, 10);
+		const char *comma = strpbrk(after, ":,");
 		long col = comma ? strtol(comma + 1, NULL, 10) : 1;
 		quick_close();
 		if (v && line > 0) {
@@ -1020,6 +1022,12 @@ static void quick_accept(void)
 		u32 arg = app.quick_arg;
 		int pk = app.quick_prompt_kind;
 		quick_close();
+		if (pk == 8 && app.git) { /* smart commit */
+			git_stage_all(app.git);
+			git_refresh(app.git);
+			run_command(CMD_GIT_COMMIT);
+			return;
+		}
 		if (pk == 6) { /* delete file/folder */
 			char rel[4096], p[8192], cmdbuf[8400];
 			fs_relpath(&app.tree, arg, rel, sizeof rel);
@@ -1108,6 +1116,8 @@ static void quick_draw(void)
 	int rh = PX(22);
 	u32 maxrows = 16;
 	bool listing = app.quick == QUICK_FILES || app.quick == QUICK_COMMANDS;
+	if (app.quick == QUICK_CONFIRM)
+		ih = -pad;
 	u32 rows = listing ? VX_MIN(app.quick_n, maxrows) : 0;
 	int title_h = app.quick_title[0] ? PX(22) : 0;
 	int msg_h = (!listing || app.quick_n == 0) ? rh : 0;
@@ -1127,8 +1137,10 @@ static void quick_draw(void)
 	                 : app.quick == QUICK_GOTO_LINE ? ""
 	                 : app.quick == QUICK_CONFIRM   ? ""
 	                                                : "";
-	input_draw(&app.quick_in, x + pad, cy, w - 2 * pad, ih, ph, true);
-	cy += ih + pad;
+	if (app.quick != QUICK_CONFIRM) {
+		input_draw(&app.quick_in, x + pad, cy, w - 2 * pad, ih, ph, true);
+		cy += ih + pad;
+	}
 	if (msg_h) {
 		char msg[256] = "";
 		View *v = active_view();
@@ -1217,6 +1229,15 @@ static void quick_draw(void)
 
 /* ---- commands --------------------------------------------------------------- */
 
+static bool git_has_staged(void)
+{
+	const GitStatus *st = git_status(app.git);
+	for (u32 i = 0; i < st->count; i++)
+		if (st->flags[i] & (GS_INDEX_NEW | GS_INDEX_MODIFIED | GS_INDEX_DELETED | GS_INDEX_RENAMED))
+			return true;
+	return false;
+}
+
 static void focus_group(u32 gi)
 {
 	if (gi >= app.ngroups) {
@@ -1279,7 +1300,8 @@ static void goto_problem(int dir)
 	/* show the message like VSCodium's marker widget (status line) */
 	for (u32 i = 0; i < D->dn[d]; i++)
 		if (D->d_line0[d][i] == bl && D->d_col0[d][i] == bc) {
-			ui_status("%s", D->d_pool[d].b + D->d_msg[d][i]);
+			ui_status("%.*s", (int)strcspn(D->d_pool[d].b + D->d_msg[d][i], "\x1f"),
+			          D->d_pool[d].b + D->d_msg[d][i]);
 			break;
 		}
 }
@@ -1490,7 +1512,15 @@ void run_command(int cmd)
 		scm_refresh();
 		break;
 	case CMD_GIT_COMMIT:
-		if (app.commit_in.n && app.git) {
+		if (app.commit_in.n && app.git && !git_has_staged()) {
+			/* VSCodium asks before a smart commit of all changes */
+			app.quick = QUICK_CONFIRM;
+			app.quick_prompt_kind = 8;
+			snprintf(app.quick_title, sizeof app.quick_title,
+			         "There are no staged changes to commit. Stage all your changes and commit them directly?");
+			input_set(&app.quick_in, "", 0);
+			app.focus = FOCUS_QUICK;
+		} else if (app.commit_in.n && app.git) {
 			char *msg = vx_strndup(app.commit_in.b, app.commit_in.n);
 			if (git_commit_staged(app.git, msg) == 0) {
 				input_set(&app.commit_in, "", 0);
@@ -1650,6 +1680,9 @@ void ui_event(const Event *e)
 		return;
 	}
 	if (e->type == EV_KEY) {
+		/* any key dismisses the hover (Ctrl+K Ctrl+I reopens it) */
+		app.hover_open = false;
+		app.hover_due = 0;
 		if (app.quick && (e->key == SDLK_ESCAPE || e->key == SDLK_RETURN || e->key == SDLK_KP_ENTER ||
 		                  e->key == SDLK_UP || e->key == SDLK_DOWN))
 			if (quick_key(e))
@@ -2538,8 +2571,8 @@ static void take_diags(const LspEvent *ev)
 		const char *m = pool_str(ev->pool, g->message[i]);
 		const char *src = pool_str(ev->pool, g->source[i]);
 		char buf[1024];
-		int k = snprintf(buf, sizeof buf, "%s%s%s%s", m, *src ? " " : "", *src ? src : "", "");
-		/* VSCodium shows "message clang(code)"; keep message + source */
+		/* "message\x1fsource": views draw the source dimmed */
+		int k = snprintf(buf, sizeof buf, "%s%s%s", m, *src ? "\x1f" : "", src);
 		D->d_msg[d][i] = pool_add(&D->d_pool[d], buf, (u32)VX_MIN(k, (int)sizeof buf - 1));
 	}
 	D->dn[d] = n;
@@ -2661,7 +2694,10 @@ static void git_tick(void)
 		Text *t = &D->text[d];
 		u32 nl = text_lines(t);
 		VX_GROW(D->gm[d], D->gm_cap[d], nl);
-		if (git_line_marks(app.git, D->path[d] + wl, text_flat(t), t->len, D->gm[d], nl) == 0)
+		u16 pf = git_path_flags(app.git, D->path[d] + wl);
+		if (pf & (GS_WT_NEW | GS_IGNORED))
+			D->gm_n[d] = 0; /* no quick diff for untracked or ignored files */
+		else if (git_line_marks(app.git, D->path[d] + wl, text_flat(t), t->len, D->gm[d], nl) == 0)
 			D->gm_n[d] = nl;
 		else
 			D->gm_n[d] = 0;

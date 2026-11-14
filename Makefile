@@ -58,7 +58,10 @@ test: ${TEST_BINS} ${B}/vxide
 	@fail=0; for t in ${TEST_BINS}; do \
 		if $$t >$$t.log 2>&1; then echo "ok   $${t##*/}"; \
 		else echo "FAIL $${t##*/} (see $$t.log)"; fail=1; fi; \
-	done; exit $$fail
+	done; \
+	if sh tests/t_ui.sh >${B}/t_ui.log 2>&1; then echo "ok   t_ui"; \
+	else echo "FAIL t_ui (see ${B}/t_ui.log)"; fail=1; fi; \
+	exit $$fail
 
 clean:
 	rm -rf ${B}
