@@ -1,4 +1,4 @@
-/* Syntax highlighting lexers: C23, x86 assembly (AT&T and Intel), Lisp,
+/* Syntax highlighting lexers: C23, C++26, Rust, x86 assembly (AT&T and Intel), Lisp,
  * shell, Perl, troff and Markdown (which embeds the others in fences).
  *
  * Each lexer is a pure function of (state at line start, line bytes) that
@@ -4963,6 +4963,10 @@ static int md_fence_lang(const char *w, u32 n)
 	    {"gitrebase", LANG_GIT_REBASE}, {"git-rebase", LANG_GIT_REBASE},
 	    {"python", LANG_PYTHON}, {"py", LANG_PYTHON}, {"python3", LANG_PYTHON}, {"py3", LANG_PYTHON},
 	    {"yaml", LANG_YAML},    {"yml", LANG_YAML},      {"codeowners", LANG_CODEOWNERS},
+	    {"java", LANG_JAVA},    {"kotlin", LANG_KOTLIN}, {"kt", LANG_KOTLIN},     {"kts", LANG_KOTLIN},
+	    {"toml", LANG_TOML},
+	    {"cpp", LANG_CPP},      {"c++", LANG_CPP},       {"cxx", LANG_CPP},       {"cc", LANG_CPP},
+	    {"hpp", LANG_CPP},      {"rust", LANG_RUST},     {"rs", LANG_RUST},
 	};
 	for (size_t i = 0; i < VX_COUNT(map); i++)
 		if (!strcmp(b, map[i].name))
@@ -5334,6 +5338,2061 @@ static u32 lex_md(u32 state, const char *s, u32 n, SynSpans *o)
 	return MD_NORMAL | MD_PARA;
 }
 
+/* ================================================================== */
+/* Java                                                                */
+/*
+ * Per VSCodium's java.tmLanguage under Dark+/Light+:
+ *   keyword.control.* (if/for/return/try/catch/throw/new/assert, switch
+ *   arms, yield)                              -> TK_CONTROL  (#C586C0)
+ *   storage.modifier.java (public static final sealed non-sealed ...,
+ *   class/interface/enum/record, extends/implements/permits/throws),
+ *   keyword.other.import/package, storage.type.local (var),
+ *   keyword.operator.instanceof, the lambda arrow  -> TK_STORAGE (#569CD6)
+ *   storage.type.java / .primitive / .generic / .annotation and
+ *   entity.name.type.class (Dark+ colours all of them #4EC9B0;
+ *   PascalCase names are types)               -> TK_TYPE     (#4EC9B0)
+ *   entity.name.function (declarations and calls) -> TK_FUNCTION
+ *   variable.other.object.property (a.b)      -> TK_VARIABLE
+ *   constant.language, variable.language.this -> TK_LANGCONST
+ *   storage.modifier.import (the imported name) stays plain (#D4D4D4).
+ * Javadoc tags (@param name) are keyword.other.documentation -> TK_STORAGE
+ * with the parameter as TK_VARIABLE.
+ *
+ * State: bits 0-1 mode (0 code, 1 block comment, 2 javadoc, 3 text block). */
+
+enum { JK_CTRL = 1, JK_MOD, JK_TYPE, JK_CONST, JK_DECL, JK_IMPORT, JK_OP, JK_VAR, JK_NEW };
+static KwSet kw_java;
+static const char java_ctrl[] = "return yield break case continue default do while for switch if else try catch "
+                                "finally throw assert";
+static const char java_mod[] = "public private protected static final native synchronized abstract transient "
+                               "volatile strictfp sealed extends implements permits throws const goto";
+static const char java_type[] = "boolean byte char short int long float double void";
+
+static void java_build(void)
+{
+	kw_list(&kw_java, java_ctrl, JK_CTRL);
+	kw_list(&kw_java, java_mod, JK_MOD);
+	kw_list(&kw_java, java_type, JK_TYPE);
+	kw_list(&kw_java, "true false null this super", JK_CONST);
+	kw_list(&kw_java, "class interface enum record", JK_DECL);
+	kw_list(&kw_java, "import package", JK_IMPORT);
+	kw_add(&kw_java, "instanceof", 10, JK_OP);
+	kw_add(&kw_java, "var", 3, JK_VAR);
+	kw_add(&kw_java, "new", 3, JK_NEW);
+}
+
+static inline bool jv_ident(u8 c) { return is_alpha(c) || is_digit(c) || c == '_' || c == '$' || c >= 0x80; }
+
+/* PascalCase-ish: an upper-case first letter and a lower-case letter later
+ * (ALL_CAPS constants stay plain, as in the grammar). */
+static bool jv_typename(const char *w, u32 n)
+{
+	if (!n || !((unsigned)((u8)w[0] - 'A') < 26u))
+		return false;
+	for (u32 k = 1; k < n; k++)
+		if ((unsigned)((u8)w[k] - 'a') < 26u)
+			return true;
+	return n == 1; /* T, E, K: generic parameters */
+}
+
+/* Java / Kotlin number: hex, binary, octal, underscores, exponents,
+ * suffixes (L f d u U). Returns its end. */
+static u32 jv_number(const char *s, u32 n, u32 i)
+{
+	u32 j = i;
+	if (s[j] == '0' && j + 1 < n && (lower((u8)s[j + 1]) == 'x' || lower((u8)s[j + 1]) == 'b')) {
+		j += 2;
+		while (j < n && (is_xdigit((u8)s[j]) || s[j] == '_'))
+			j++;
+	} else {
+		while (j < n && (is_digit((u8)s[j]) || s[j] == '_'))
+			j++;
+		if (j + 1 < n && s[j] == '.' && is_digit((u8)s[j + 1])) {
+			j++;
+			while (j < n && (is_digit((u8)s[j]) || s[j] == '_'))
+				j++;
+		} else if (j < n && s[j] == '.' && i < j && (j + 1 >= n || !is_alpha((u8)s[j + 1]))) {
+			j++; /* 1. */
+		}
+		if (j < n && lower((u8)s[j]) == 'e') {
+			u32 k = j + 1;
+			if (k < n && (s[k] == '+' || s[k] == '-'))
+				k++;
+			if (k < n && is_digit((u8)s[k])) {
+				j = k;
+				while (j < n && (is_digit((u8)s[j]) || s[j] == '_'))
+					j++;
+			}
+		}
+	}
+	while (j < n && strchr("lLfFdDuU", s[j]) && s[j])
+		j++;
+	return j;
+}
+
+/* Backslash escape at i inside a Java/Kotlin string; returns its end. */
+static u32 jv_escape(const char *s, u32 n, u32 i)
+{
+	u32 j = i + 1;
+	if (j >= n)
+		return j;
+	if (s[j] == 'u') {
+		j++;
+		while (j < n && s[j] == 'u')
+			j++;
+		for (int k = 0; k < 4 && j < n && is_xdigit((u8)s[j]); k++)
+			j++;
+		return j;
+	}
+	if (is_digit((u8)s[j])) {
+		for (int k = 0; k < 3 && j < n && s[j] >= '0' && s[j] <= '7'; k++)
+			j++;
+		return j;
+	}
+	return j + 1;
+}
+
+/* Comment body from i: returns the index after the closing star-slash or
+ * n; *closed tells which. Javadoc tags are coloured. */
+static u32 java_comment(const char *s, u32 n, u32 i, bool doc, bool *closed, SynSpans *o)
+{
+	u32 j = i;
+	*closed = false;
+	while (j < n) {
+		if (s[j] == '*' && j + 1 < n && s[j + 1] == '/') {
+			emit(o, i, j + 2 - i, TK_COMMENT);
+			*closed = true;
+			return j + 2;
+		}
+		if (doc && s[j] == '@' && j + 1 < n && is_alpha((u8)s[j + 1]) && (j == 0 || !jv_ident((u8)s[j - 1]))) {
+			emit(o, i, j - i, TK_COMMENT);
+			u32 e = j + 1;
+			while (e < n && is_alpha((u8)s[e]))
+				e++;
+			emit(o, j, e - j, TK_STORAGE);
+			bool param = e - j == 6 && !memcmp(s + j, "@param", 6);
+			j = e;
+			if (param) {
+				u32 a = skip_ws(s, n, j), b = a;
+				if (a < n && s[a] == '<') /* @param <T> */
+					a++;
+				b = a;
+				while (b < n && jv_ident((u8)s[b]))
+					b++;
+				emit(o, j, a - j, TK_COMMENT);
+				emit(o, a, b - a, TK_VARIABLE);
+				j = b;
+			}
+			i = j;
+			continue;
+		}
+		j++;
+	}
+	emit(o, i, n - i, TK_COMMENT);
+	return n;
+}
+
+/* Text block body from i ("""...""" spanning lines); returns the index
+ * after the closing quotes or n. */
+static u32 java_textblock(const char *s, u32 n, u32 i, bool *closed, SynSpans *o)
+{
+	u32 j = i, run = i;
+	*closed = false;
+	while (j < n) {
+		if (s[j] == '\\') {
+			emit(o, run, j - run, TK_STRING);
+			u32 e = j + 1 >= n ? n : jv_escape(s, n, j);
+			emit(o, j, e - j, TK_ESCAPE);
+			j = run = e;
+			continue;
+		}
+		if (s[j] == '"' && j + 2 < n && s[j + 1] == '"' && s[j + 2] == '"') {
+			emit(o, run, j + 3 - run, TK_STRING);
+			*closed = true;
+			return j + 3;
+		}
+		j++;
+	}
+	emit(o, run, n - run, TK_STRING);
+	return n;
+}
+
+static u32 lex_java(u32 state, const char *s, u32 n, SynSpans *o)
+{
+	u32 mode = state & 3u;
+	u32 i = 0;
+	bool closed;
+	if (mode == 1 || mode == 2) {
+		i = java_comment(s, n, 0, mode == 2, &closed, o);
+		if (!closed)
+			return mode;
+	} else if (mode == 3) {
+		i = java_textblock(s, n, 0, &closed, o);
+		if (!closed)
+			return 3;
+	}
+	int expect = 0; /* 1: a type name follows (class X), 2: after new */
+	bool import_stmt = false;
+	while (i < n) {
+		u8 c = (u8)s[i];
+		if (c == '/' && i + 1 < n && s[i + 1] == '/') {
+			emit(o, i, n - i, TK_COMMENT);
+			return 0;
+		}
+		if (c == '/' && i + 1 < n && s[i + 1] == '*') {
+			bool doc = i + 2 < n && s[i + 2] == '*' && !(i + 3 < n && s[i + 3] == '/');
+			emit(o, i, 2, TK_COMMENT);
+			i = java_comment(s, n, i + 2, doc, &closed, o);
+			if (!closed)
+				return doc ? 2u : 1u;
+			continue;
+		}
+		if (import_stmt) {
+			/* the imported name is plain (storage.modifier.import #D4D4D4) */
+			if (c == ';')
+				import_stmt = false;
+			i++;
+			continue;
+		}
+		if (c == '"') {
+			if (i + 2 < n && s[i + 1] == '"' && s[i + 2] == '"') {
+				emit(o, i, 3, TK_STRING);
+				i = java_textblock(s, n, i + 3, &closed, o);
+				if (!closed)
+					return 3;
+				continue;
+			}
+			u32 j = i + 1, run = i;
+			while (j < n && s[j] != '"') {
+				if (s[j] == '\\') {
+					emit(o, run, j - run, TK_STRING);
+					u32 e = jv_escape(s, n, j);
+					emit(o, j, e - j, TK_ESCAPE);
+					j = run = e;
+					continue;
+				}
+				j++;
+			}
+			if (j < n)
+				j++;
+			emit(o, run, j - run, TK_STRING);
+			i = j;
+			continue;
+		}
+		if (c == '\'') {
+			u32 j = i + 1, run = i;
+			while (j < n && s[j] != '\'') {
+				if (s[j] == '\\') {
+					emit(o, run, j - run, TK_STRING);
+					u32 e = jv_escape(s, n, j);
+					emit(o, j, e - j, TK_ESCAPE);
+					j = run = e;
+					continue;
+				}
+				j++;
+			}
+			if (j < n)
+				j++;
+			emit(o, run, j - run, TK_STRING);
+			i = j;
+			continue;
+		}
+		if (is_digit(c) || (c == '.' && i + 1 < n && is_digit((u8)s[i + 1]) && (i == 0 || !jv_ident((u8)s[i - 1])))) {
+			if (i > 0 && jv_ident((u8)s[i - 1])) {
+				i++;
+				continue;
+			}
+			u32 e = jv_number(s, n, i);
+			emit(o, i, e - i, TK_NUMBER);
+			i = e;
+			continue;
+		}
+		if (c == '@' && i + 1 < n && jv_ident((u8)s[i + 1])) {
+			u32 e = i + 1;
+			while (e < n && (jv_ident((u8)s[e]) || (s[e] == '.' && e + 1 < n && jv_ident((u8)s[e + 1]))))
+				e++;
+			if (e - i == 10 && !memcmp(s + i, "@interface", 10)) {
+				emit(o, i, e - i, TK_STORAGE);
+				expect = 1;
+			} else {
+				emit(o, i, e - i, TK_TYPE); /* storage.type.annotation.java */
+			}
+			i = e;
+			continue;
+		}
+		if (jv_ident(c)) {
+			u32 e = i;
+			while (e < n && jv_ident((u8)s[e]))
+				e++;
+			u32 len = e - i;
+			/* non-sealed is one modifier */
+			if (len == 3 && !memcmp(s + i, "non", 3) && e + 7 <= n && !memcmp(s + e, "-sealed", 7)) {
+				emit(o, i, 10, TK_STORAGE);
+				i += 10;
+				continue;
+			}
+			bool after_dot = i > 0 && s[i - 1] == '.';
+			int k = after_dot ? -1 : kw_find(&kw_java, s + i, len);
+			u32 a = skip_ws(s, n, e);
+			switch (k) {
+			case JK_CTRL:
+				emit(o, i, len, TK_CONTROL);
+				break;
+			case JK_NEW:
+				emit(o, i, len, TK_CONTROL); /* keyword.control.new.java */
+				expect = 2;
+				break;
+			case JK_MOD:
+			case JK_OP:
+				emit(o, i, len, TK_STORAGE);
+				break;
+			case JK_DECL:
+				/* "record" and "enum" are also ordinary names in other places */
+				if (a < n && jv_ident((u8)s[a])) {
+					emit(o, i, len, TK_STORAGE);
+					expect = 1;
+				}
+				break;
+			case JK_IMPORT:
+				emit(o, i, len, TK_STORAGE);
+				import_stmt = true;
+				break;
+			case JK_TYPE:
+				emit(o, i, len, TK_TYPE);
+				break;
+			case JK_CONST:
+				emit(o, i, len, TK_LANGCONST);
+				break;
+			case JK_VAR:
+				/* var is a keyword only in `var name` */
+				if (a < n && jv_ident((u8)s[a]))
+					emit(o, i, len, TK_STORAGE);
+				break;
+			default:
+				if (expect == 1) {
+					emit(o, i, len, TK_TYPE); /* entity.name.type.class */
+					expect = 0;
+				} else if (expect == 2) {
+					emit(o, i, len, TK_TYPE);
+					if (!(a < n && s[a] == '.'))
+						expect = 0;
+				} else if (a < n && s[a] == '(') {
+					emit(o, i, len, TK_FUNCTION);
+				} else if (jv_typename(s + i, len)) {
+					emit(o, i, len, TK_TYPE);
+				} else if (after_dot) {
+					emit(o, i, len, TK_VARIABLE); /* variable.other.object.property */
+				}
+				break;
+			}
+			i = e;
+			continue;
+		}
+		if (c == '-' && i + 1 < n && s[i + 1] == '>') {
+			emit(o, i, 2, TK_STORAGE); /* storage.type.function.arrow.java */
+			i += 2;
+			continue;
+		}
+		if (strchr("+-*/%=!&|^~?:", c) && c) {
+			emit(o, i, 1, TK_OPERATOR);
+			i++;
+			continue;
+		}
+		if (c == '<' || c == '>') {
+			/* comparisons are operators; generic brackets stay punctuation */
+			bool generic = (i + 1 < n && (jv_typename(s + i + 1, 1) || s[i + 1] == '?' || s[i + 1] == '>')) ||
+			               (c == '>' && i > 0 && (jv_ident((u8)s[i - 1]) || s[i - 1] == '>') &&
+			                (i + 1 >= n || s[i + 1] != '='));
+			if (!generic)
+				emit(o, i, 1, TK_OPERATOR);
+			i++;
+			continue;
+		}
+		i++;
+	}
+	return 0;
+}
+
+/* ================================================================== */
+/* Kotlin                                                              */
+/*
+ * VSCodium ships no Kotlin grammar; this follows the common Kotlin
+ * TextMate grammar (fwcd/vscode-kotlin) under Dark+/Light+:
+ *   keyword.control (if when for while do return break continue throw try
+ *   catch finally)                              -> TK_CONTROL
+ *   storage.type (fun class interface object val var typealias
+ *   constructor init companion), storage.modifier (public data sealed
+ *   suspend inline override ...), keyword.operator.wordlike (in is as),
+ *   import/package                              -> TK_STORAGE
+ *   entity.name.type (class names, types, PascalCase), annotations
+ *                                               -> TK_TYPE
+ *   entity.name.function (fun name, calls)      -> TK_FUNCTION
+ *   val/var names, property access a.b          -> TK_VARIABLE
+ *   true/false/null/this/super                  -> TK_LANGCONST
+ * String templates: "$x" and "${...}" -- the $ and braces are
+ * punctuation.definition.template-expression (#569CD6, TK_STORAGE), the
+ * name is TK_VARIABLE and the ${} expression is lexed as Kotlin.
+ *
+ * State: bits 0-1 mode (0 code, 1 block comment, 2 raw """ string),
+ * bits 2-9 nesting depth of block comments. */
+
+enum { KK_CTRL = 1, KK_DECL, KK_MOD, KK_OP, KK_CONST, KK_FUN, KK_CLASS, KK_VAL, KK_IMPORT };
+static KwSet kw_kt;
+static const char kt_ctrl[] = "if else when for while do return break continue throw try catch finally";
+static const char kt_mod[] = "public private internal protected abstract final open override data sealed inline "
+                             "suspend lateinit const enum annotation operator infix tailrec external vararg "
+                             "noinline crossinline reified expect actual inner value out by where companion "
+                             "constructor init";
+
+static void kt_build(void)
+{
+	kw_list(&kw_kt, kt_ctrl, KK_CTRL);
+	kw_list(&kw_kt, kt_mod, KK_MOD);
+	kw_list(&kw_kt, "in is as", KK_OP);
+	kw_list(&kw_kt, "true false null this super", KK_CONST);
+	kw_add(&kw_kt, "fun", 3, KK_FUN);
+	kw_list(&kw_kt, "class interface object typealias", KK_CLASS);
+	kw_list(&kw_kt, "val var", KK_VAL);
+	kw_list(&kw_kt, "import package", KK_IMPORT);
+}
+
+#define KT_STATE(mode, depth) ((u32)(mode) | ((u32)(depth) << 2))
+
+/* Kotlin string body from i (after the opening quote(s)); raw strings
+ * have no escapes and may span lines. Returns the index after the close
+ * or n with *closed false. */
+static u32 kt_string(const char *s, u32 n, u32 i, bool raw, bool *closed, SynSpans *o)
+{
+	u32 j = i, run = i;
+	*closed = false;
+	while (j < n) {
+		u8 c = (u8)s[j];
+		if (!raw && c == '\\') {
+			emit(o, run, j - run, TK_STRING);
+			u32 e = jv_escape(s, n, j);
+			emit(o, j, e - j, TK_ESCAPE);
+			j = run = e;
+			continue;
+		}
+		if (c == '$' && j + 1 < n && s[j + 1] == '{') {
+			emit(o, run, j - run, TK_STRING);
+			/* find the matching brace */
+			u32 k = j + 2;
+			int depth = 1;
+			while (k < n && depth) {
+				if (s[k] == '{')
+					depth++;
+				else if (s[k] == '}' && --depth == 0)
+					break;
+				else if (s[k] == '"') { /* nested string: skip it */
+					k++;
+					while (k < n && s[k] != '"') {
+						if (s[k] == '\\')
+							k++;
+						k++;
+					}
+				}
+				k++;
+			}
+			emit(o, j, 2, TK_STORAGE);
+			lex_shifted(LANG_KOTLIN, 0, s, VX_MIN(k, n), j + 2, o);
+			if (k < n) {
+				emit(o, k, 1, TK_STORAGE);
+				k++;
+			}
+			j = run = k;
+			continue;
+		}
+		if (c == '$' && j + 1 < n && (is_alpha((u8)s[j + 1]) || s[j + 1] == '_')) {
+			emit(o, run, j - run, TK_STRING);
+			u32 e = j + 1;
+			while (e < n && jv_ident((u8)s[e]) && s[e] != '$')
+				e++;
+			emit(o, j, 1, TK_STORAGE);
+			emit(o, j + 1, e - j - 1, TK_VARIABLE);
+			j = run = e;
+			continue;
+		}
+		if (c == '"') {
+			if (!raw) {
+				emit(o, run, j + 1 - run, TK_STRING);
+				*closed = true;
+				return j + 1;
+			}
+			if (j + 2 < n && s[j + 1] == '"' && s[j + 2] == '"') {
+				u32 e = j + 3;
+				while (e < n && s[e] == '"') /* """" ends with the last three */
+					e++;
+				emit(o, run, e - run, TK_STRING);
+				*closed = true;
+				return e;
+			}
+		}
+		j++;
+	}
+	emit(o, run, n - run, TK_STRING);
+	return n;
+}
+
+/* Nested block comment from i with depth d (>= 1). */
+static u32 kt_comment(const char *s, u32 n, u32 i, u32 *d, SynSpans *o)
+{
+	u32 j = i;
+	while (j < n && *d) {
+		if (s[j] == '/' && j + 1 < n && s[j + 1] == '*') {
+			(*d)++;
+			j += 2;
+		} else if (s[j] == '*' && j + 1 < n && s[j + 1] == '/') {
+			(*d)--;
+			j += 2;
+		} else {
+			j++;
+		}
+	}
+	emit(o, i, j - i, TK_COMMENT);
+	return j;
+}
+
+static u32 lex_kotlin(u32 state, const char *s, u32 n, SynSpans *o)
+{
+	u32 mode = state & 3u, depth = (state >> 2) & 0xFFu;
+	u32 i = 0;
+	bool closed;
+	if (mode == 1) {
+		if (!depth)
+			depth = 1;
+		i = kt_comment(s, n, 0, &depth, o);
+		if (depth)
+			return KT_STATE(1, depth);
+	} else if (mode == 2) {
+		i = kt_string(s, n, 0, true, &closed, o);
+		if (!closed)
+			return KT_STATE(2, 0);
+	}
+	int expect = 0; /* 1 fun name, 2 type name, 3 val/var name */
+	bool import_stmt = false;
+	while (i < n) {
+		u8 c = (u8)s[i];
+		if (c == '/' && i + 1 < n && s[i + 1] == '/') {
+			emit(o, i, n - i, TK_COMMENT);
+			return 0;
+		}
+		if (c == '/' && i + 1 < n && s[i + 1] == '*') {
+			u32 d = 1;
+			emit(o, i, 2, TK_COMMENT);
+			i = kt_comment(s, n, i + 2, &d, o);
+			if (d)
+				return KT_STATE(1, VX_MIN(d, 255u));
+			continue;
+		}
+		if (import_stmt) {
+			i++;
+			continue;
+		}
+		if (c == '"') {
+			bool raw = i + 2 < n && s[i + 1] == '"' && s[i + 2] == '"';
+			emit(o, i, raw ? 3 : 1, TK_STRING);
+			i = kt_string(s, n, i + (raw ? 3 : 1), raw, &closed, o);
+			if (raw && !closed)
+				return KT_STATE(2, 0);
+			continue;
+		}
+		if (c == '\'') {
+			u32 j = i + 1, run = i;
+			while (j < n && s[j] != '\'') {
+				if (s[j] == '\\') {
+					emit(o, run, j - run, TK_STRING);
+					u32 e = jv_escape(s, n, j);
+					emit(o, j, e - j, TK_ESCAPE);
+					j = run = e;
+					continue;
+				}
+				j++;
+			}
+			if (j < n)
+				j++;
+			emit(o, run, j - run, TK_STRING);
+			i = j;
+			continue;
+		}
+		if (is_digit(c) && (i == 0 || !jv_ident((u8)s[i - 1]))) {
+			u32 e = jv_number(s, n, i);
+			emit(o, i, e - i, TK_NUMBER);
+			i = e;
+			continue;
+		}
+		if (c == '@' && i + 1 < n && jv_ident((u8)s[i + 1]) && (i == 0 || !jv_ident((u8)s[i - 1]))) {
+			/* annotation (@file:JvmName too) */
+			u32 e = i + 1;
+			while (e < n && (jv_ident((u8)s[e]) || ((s[e] == '.' || s[e] == ':') && e + 1 < n && jv_ident((u8)s[e + 1]))))
+				e++;
+			emit(o, i, e - i, TK_TYPE);
+			i = e;
+			continue;
+		}
+		if (c == '`') {
+			/* `backticked identifier` */
+			u32 e = i + 1;
+			while (e < n && s[e] != '`')
+				e++;
+			if (e < n)
+				e++;
+			if (expect == 1)
+				emit(o, i, e - i, TK_FUNCTION);
+			expect = 0;
+			i = e;
+			continue;
+		}
+		if (jv_ident(c) && c != '$') {
+			u32 e = i;
+			while (e < n && jv_ident((u8)s[e]) && s[e] != '$')
+				e++;
+			u32 len = e - i;
+			bool after_dot = i > 0 && (s[i - 1] == '.' || (i > 1 && s[i - 1] == ':' && s[i - 2] == ':'));
+			int k = after_dot ? -1 : kw_find(&kw_kt, s + i, len);
+			u32 a = skip_ws(s, n, e);
+			/* soft keywords used as names: x.by, out(...) */
+			if (k == KK_MOD && a < n && (s[a] == '(' || s[a] == '=' || s[a] == '.' || s[a] == ')' || s[a] == ','))
+				k = -1;
+			switch (k) {
+			case KK_CTRL:
+				emit(o, i, len, TK_CONTROL);
+				break;
+			case KK_MOD:
+			case KK_OP:
+				emit(o, i, len, TK_STORAGE);
+				if (k == KK_OP && e < n && (s[e] == '?' || s[e] == '!')) /* as? */
+					emit(o, e, 1, TK_STORAGE), e++;
+				break;
+			case KK_CONST:
+				emit(o, i, len, TK_LANGCONST);
+				break;
+			case KK_FUN:
+				emit(o, i, len, TK_STORAGE);
+				expect = 1;
+				break;
+			case KK_CLASS:
+				emit(o, i, len, TK_STORAGE);
+				expect = 2;
+				break;
+			case KK_VAL:
+				emit(o, i, len, TK_STORAGE);
+				expect = 3;
+				break;
+			case KK_IMPORT:
+				emit(o, i, len, TK_STORAGE);
+				import_stmt = true;
+				break;
+			default:
+				if (expect == 1) {
+					/* fun Type.name / fun List<T>.name: the receiver is a type,
+					 * the last part the name */
+					if (a < n && (s[a] == '.' || s[a] == '<')) {
+						emit(o, i, len, TK_TYPE);
+					} else {
+						emit(o, i, len, TK_FUNCTION);
+						expect = 0;
+					}
+				} else if (expect == 2) {
+					emit(o, i, len, TK_TYPE);
+					expect = 0;
+				} else if (expect == 3) {
+					emit(o, i, len, TK_VARIABLE);
+					expect = 0;
+				} else if (a < n && s[a] == '(') {
+					/* PascalCase calls are constructor calls: types */
+					emit(o, i, len, jv_typename(s + i, len) ? TK_TYPE : TK_FUNCTION);
+				} else if (jv_typename(s + i, len)) {
+					emit(o, i, len, TK_TYPE);
+				} else if (after_dot) {
+					emit(o, i, len, TK_VARIABLE);
+				}
+				break;
+			}
+			i = e;
+			continue;
+		}
+		if (c == '!' && i + 2 < n && (!memcmp(s + i, "!in", 3) || !memcmp(s + i, "!is", 3)) &&
+		    (i + 3 >= n || !jv_ident((u8)s[i + 3]))) {
+			emit(o, i, 3, TK_STORAGE);
+			i += 3;
+			continue;
+		}
+		if (c == '<' && expect == 1) {
+			/* fun <T> name: skip the type parameters */
+			u32 e = i + 1;
+			while (e < n && s[e] != '>') {
+				if (jv_ident((u8)s[e])) {
+					u32 b = e;
+					while (b < n && jv_ident((u8)s[b]))
+						b++;
+					emit(o, e, b - e, TK_TYPE);
+					e = b;
+					continue;
+				}
+				e++;
+			}
+			i = e < n ? e + 1 : n;
+			continue;
+		}
+		if (c == '-' && i + 1 < n && s[i + 1] == '>') {
+			emit(o, i, 2, TK_STORAGE);
+			i += 2;
+			continue;
+		}
+		if (strchr("+-*/%=!&|^~?:", c) && c) {
+			emit(o, i, 1, TK_OPERATOR);
+			i++;
+			continue;
+		}
+		if ((c == '<' || c == '>') && !(i + 1 < n && (jv_typename(s + i + 1, 1) || s[i + 1] == '>')) &&
+		    !(c == '>' && i > 0 && jv_ident((u8)s[i - 1]) && (i + 1 >= n || s[i + 1] != '=')))
+			emit(o, i, 1, TK_OPERATOR);
+		i++;
+	}
+	return 0;
+}
+
+/* ================================================================== */
+/* TOML                                                                */
+/*
+ * VSCodium ships no TOML grammar; scopes follow Even Better TOML:
+ *   table headers [a.b] / [[arrays]]         -> TK_TAG     (section headings)
+ *   keys (bare, quoted, dotted; also inside inline tables)
+ *     support.type.property-name.toml        -> TK_PROPERTY (#9CDCFE)
+ *   strings basic / literal / multi-line     -> TK_STRING, escapes TK_ESCAPE
+ *   numbers, inf/nan, dates and times        -> TK_NUMBER
+ *   true/false                               -> TK_LANGCONST
+ * A key is something followed by '=': inside multi-line arrays a quoted
+ * value is not mistaken for a key.
+ *
+ * State: 0 normal, 1 inside """ basic, 2 inside ''' literal. */
+
+static inline bool toml_bare(u8 c) { return is_alpha(c) || is_digit(c) || c == '_' || c == '-'; }
+
+/* Multi-line string body from i; returns the index after the closing
+ * quotes or n with *closed false. */
+static u32 toml_ml(const char *s, u32 n, u32 i, bool basic, bool *closed, SynSpans *o)
+{
+	u32 j = i, run = i;
+	char q = basic ? '"' : '\'';
+	*closed = false;
+	while (j < n) {
+		if (basic && s[j] == '\\') {
+			emit(o, run, j - run, TK_STRING);
+			u32 e = j + 1 >= n ? n : (s[j + 1] == 'u' ? VX_MIN(j + 6, n) : s[j + 1] == 'U' ? VX_MIN(j + 10, n) : j + 2);
+			emit(o, j, e - j, TK_ESCAPE);
+			j = run = e;
+			continue;
+		}
+		if (s[j] == q && j + 2 < n && s[j + 1] == q && s[j + 2] == q) {
+			u32 e = j + 3;
+			while (e < n && e < j + 5 && s[e] == q) /* up to two quotes may precede the close */
+				e++;
+			emit(o, run, e - run, TK_STRING);
+			*closed = true;
+			return e;
+		}
+		j++;
+	}
+	emit(o, run, n - run, TK_STRING);
+	return n;
+}
+
+/* Single-line string at i (opening quote); returns its end. */
+static u32 toml_string(const char *s, u32 n, u32 i, u8 cls, SynSpans *o)
+{
+	char q = s[i];
+	u32 j = i + 1, run = i;
+	while (j < n && s[j] != q) {
+		if (q == '"' && s[j] == '\\' && cls == TK_STRING) {
+			emit(o, run, j - run, cls);
+			u32 e = j + 1 >= n ? n : (s[j + 1] == 'u' ? VX_MIN(j + 6, n) : s[j + 1] == 'U' ? VX_MIN(j + 10, n) : j + 2);
+			emit(o, j, e - j, TK_ESCAPE);
+			j = run = e;
+			continue;
+		}
+		if (s[j] == '\\' && q == '"')
+			j++;
+		j++;
+	}
+	if (j < n)
+		j++;
+	emit(o, run, VX_MIN(j, n) - run, cls);
+	return VX_MIN(j, n);
+}
+
+/* A key path at i followed by '=': emit it and return the index after the
+ * '=', or return i when there is none. */
+static u32 toml_key(const char *s, u32 n, u32 i, SynSpans *o)
+{
+	u32 j = i;
+	u32 parts[16][2], np = 0;
+	for (;;) {
+		j = skip_ws(s, n, j);
+		if (j >= n)
+			return i;
+		u32 a = j;
+		if (s[j] == '"' || s[j] == '\'') {
+			char q = s[j++];
+			while (j < n && s[j] != q) {
+				if (s[j] == '\\' && q == '"')
+					j++;
+				j++;
+			}
+			if (j >= n)
+				return i;
+			j++;
+		} else {
+			while (j < n && toml_bare((u8)s[j]))
+				j++;
+			if (j == a)
+				return i;
+		}
+		if (np < 16) {
+			parts[np][0] = a;
+			parts[np][1] = j;
+			np++;
+		}
+		j = skip_ws(s, n, j);
+		if (j < n && s[j] == '.') {
+			j++;
+			continue;
+		}
+		if (j < n && s[j] == '=' && !(j + 1 < n && s[j + 1] == '='))
+			break;
+		return i;
+	}
+	for (u32 k = 0; k < np; k++)
+		emit(o, parts[k][0], parts[k][1] - parts[k][0], TK_PROPERTY);
+	return j + 1;
+}
+
+static u32 lex_toml(u32 state, const char *s, u32 n, SynSpans *o)
+{
+	u32 i = 0;
+	bool closed;
+	if (state == 1 || state == 2) {
+		i = toml_ml(s, n, 0, state == 1, &closed, o);
+		if (!closed)
+			return state;
+	} else {
+		i = skip_ws(s, n, 0);
+		if (i < n && s[i] == '[') {
+			/* [table] or [[array of tables]] up to the closing bracket(s) */
+			u32 e = i;
+			while (e < n && s[e] != ']') {
+				if (s[e] == '"' || s[e] == '\'') {
+					char q = s[e++];
+					while (e < n && s[e] != q)
+						e++;
+				}
+				if (e < n)
+					e++;
+			}
+			while (e < n && s[e] == ']')
+				e++;
+			emit(o, i, e - i, TK_TAG);
+			i = skip_ws(s, n, e);
+			if (i < n && s[i] == '#')
+				emit(o, i, n - i, TK_COMMENT);
+			return 0;
+		}
+		if (i < n && s[i] != '#')
+			i = toml_key(s, n, i, o);
+	}
+	int braces = 0; /* inline table depth: keys follow { and , */
+	while (i < n) {
+		u8 c = (u8)s[i];
+		if (is_space(c)) {
+			i++;
+			continue;
+		}
+		if (c == '#') {
+			emit(o, i, n - i, TK_COMMENT);
+			break;
+		}
+		if (c == '"' || c == '\'') {
+			if (i + 2 < n && s[i + 1] == c && s[i + 2] == c) {
+				emit(o, i, 3, TK_STRING);
+				i = toml_ml(s, n, i + 3, c == '"', &closed, o);
+				if (!closed)
+					return c == '"' ? 1u : 2u;
+				continue;
+			}
+			i = toml_string(s, n, i, TK_STRING, o);
+			continue;
+		}
+		if (c == '{' || (c == ',' && braces > 0)) {
+			if (c == '{')
+				braces++;
+			i = toml_key(s, n, i + 1, o);
+			continue;
+		}
+		if (c == '}') {
+			if (braces > 0)
+				braces--;
+			i++;
+			continue;
+		}
+		if (is_digit(c) || c == '+' || c == '-' || c == '.') {
+			/* numbers, dates, times: one run of number-ish characters */
+			u32 e = i;
+			while (e < n && (toml_bare((u8)s[e]) || s[e] == '.' || s[e] == ':' || s[e] == '+'))
+				e++;
+			emit(o, i, e - i, TK_NUMBER);
+			i = e;
+			continue;
+		}
+		if (is_alpha(c)) {
+			u32 e = i;
+			while (e < n && toml_bare((u8)s[e]))
+				e++;
+			if (word_is(s + i, e - i, "true") || word_is(s + i, e - i, "false"))
+				emit(o, i, e - i, TK_LANGCONST);
+			else if (word_is(s + i, e - i, "inf") || word_is(s + i, e - i, "nan"))
+				emit(o, i, e - i, TK_NUMBER);
+			i = e;
+			continue;
+		}
+		i++;
+	}
+	return 0;
+}
+
+/* ================================================================== */
+/* C++                                                                 */
+/*
+ * Follows VSCodium's cpp.tmLanguage under Dark+/Light+; comments,
+ * escapes, numbers and the preprocessor work as in the C lexer:
+ *   keyword.control (if for return co_await co_yield co_return try catch
+ *   throw goto), keyword.control.directive (#include, module import),
+ *   keyword.other.using, keyword.other.operator and entity.name.operator
+ *   (operator+), keyword.operator.new / .delete -> TK_CONTROL (#C586C0)
+ *   storage.type (primitives, class struct enum template typename
+ *   namespace concept), storage.modifier (const constexpr consteval
+ *   constinit virtual ...), keyword.other (requires export module
+ *   typedef), keyword.operator.wordlike (and or not, sizeof alignof
+ *   typeid noexcept decltype, *_cast), access specifiers, user-defined
+ *   string suffixes ("x"_s)                     -> TK_STORAGE (#569CD6)
+ *   entity.name.type (class names, template parameters, scope resolution
+ *   std::, template types vector<int>, declared types Foo x), attributes
+ *   [[...]] (as in C)                           -> TK_TYPE
+ *   entity.name.function (definitions, calls, f<T>(), operator""_km)
+ *                                               -> TK_FUNCTION
+ *   constant.language (true false nullptr NULL), variable.language.this
+ *                                               -> TK_LANGCONST
+ *   numbers with digit separators and literal suffixes (1'000'000_km)
+ *                                               -> TK_NUMBER
+ * C++26 contract specifiers pre/post are keywords only before '(' after a
+ * function declarator (a ')' that did not close an if/while/for/switch
+ * condition, or a trailing const/volatile/noexcept/override/final), or
+ * alone at a line start (with a `name:` result binding or no ';' at the
+ * end); contract_assert is a keyword like static_assert. The pack index
+ * `Ts...[0]` is punctuation and never opens an attribute.
+ *
+ * State: as for C (bits 0-2 mode, bit 3 continued directive, bits 4-5 its
+ * kind, bits 8-15 #if 0 depth) plus mode 7, inside a raw string R"d(...)d":
+ * bits 3-7 hold the delimiter length (0-16) and bits 8-19 a 12-bit hash of
+ * the delimiter, which continuation lines match against `)d"`. */
+
+enum {
+	XK_CTRL = 1, XK_COND, XK_STORAGE, XK_QUAL, XK_WORDOP, XK_LANGCONST, XK_TYPE, XK_TAG, XK_GOTO,
+	XK_DEFINED, XK_NEWDEL, XK_USING, XK_OPERATOR, XK_TEMPLATE, XK_ACCESS, XK_IMPORT, XK_EXPORT,
+	XK_CONTRACT
+};
+static KwSet kw_cpp;
+static const char cpp_cond[] = "if while for switch catch";
+static const char cpp_ctrl[] = "break continue do else return case default try throw co_return co_yield "
+                               "co_await _Pragma";
+static const char cpp_storage[] =
+	"unsigned signed double short float long void char bool int wchar_t char8_t char16_t char32_t auto "
+	"typedef register inline virtual explicit friend override final alignas alignof sizeof typeid "
+	"decltype noexcept static_assert contract_assert requires module typeof __typeof__ __typeof "
+	"__attribute__ __attribute __declspec __asm__ asm __asm __int128 __restrict__ __restrict __inline__ "
+	"__extension__ __thread static_cast dynamic_cast reinterpret_cast const_cast _Atomic _Alignas "
+	"_Alignof _Static_assert";
+static const char cpp_qual[] = "const volatile constexpr consteval constinit static extern mutable thread_local";
+static const char cpp_wordop[] = "and or not xor bitand bitor compl and_eq or_eq xor_eq not_eq";
+
+static void cpp_build(void)
+{
+	kw_add(&kw_cpp, "goto", 4, XK_GOTO);
+	kw_add(&kw_cpp, "defined", 7, XK_DEFINED);
+	kw_list(&kw_cpp, cpp_cond, XK_COND);
+	kw_list(&kw_cpp, cpp_ctrl, XK_CTRL);
+	kw_list(&kw_cpp, cpp_storage, XK_STORAGE);
+	kw_list(&kw_cpp, cpp_qual, XK_QUAL);
+	kw_list(&kw_cpp, cpp_wordop, XK_WORDOP);
+	kw_list(&kw_cpp, "true false nullptr NULL this", XK_LANGCONST);
+	kw_list(&kw_cpp, c_support, XK_TYPE);
+	kw_list(&kw_cpp, "struct union enum class typename concept namespace", XK_TAG);
+	kw_list(&kw_cpp, "new delete", XK_NEWDEL);
+	kw_add(&kw_cpp, "using", 5, XK_USING);
+	kw_add(&kw_cpp, "operator", 8, XK_OPERATOR);
+	kw_add(&kw_cpp, "template", 8, XK_TEMPLATE);
+	kw_list(&kw_cpp, "public private protected", XK_ACCESS);
+	kw_add(&kw_cpp, "import", 6, XK_IMPORT);
+	kw_add(&kw_cpp, "export", 6, XK_EXPORT);
+	kw_list(&kw_cpp, "pre post", XK_CONTRACT);
+}
+
+#define CPP_RAW 7u
+#define CPP_RAW_STATE(len, h) (CPP_RAW | ((u32)(len) << 3) | ((u32)(h) << 8))
+
+static inline u32 cpp_delim_hash(const char *s, u32 n) { return kw_hash(s, n) & 0xFFFu; }
+static inline bool cpp_delim_char(u8 c) { return c > ' ' && c != '(' && c != ')' && c != '\\' && c != 0x7F; }
+
+static bool cpp_raw_prefix(const char *w, u32 n)
+{
+	return word_is(w, n, "R") || word_is(w, n, "u8R") || word_is(w, n, "uR") || word_is(w, n, "UR") ||
+	       word_is(w, n, "LR");
+}
+
+/* Raw string body from i through `)delim"`. The opening line knows the
+ * delimiter d; continuation lines (d == NULL) match its length and hash.
+ * Returns the end, or n with *closed false. */
+static u32 cpp_raw(const char *s, u32 n, u32 i, const char *d, u32 dl, u32 dh, bool *closed)
+{
+	for (u32 j = i; j + 1 + dl < n; j++) {
+		if (s[j] != ')' || s[j + 1 + dl] != '"')
+			continue;
+		bool ok = d ? memcmp(s + j + 1, d, dl) == 0 : cpp_delim_hash(s + j + 1, dl) == dh;
+		for (u32 k = 0; ok && k < dl; k++)
+			ok = cpp_delim_char((u8)s[j + 1 + k]);
+		if (ok) {
+			*closed = true;
+			return j + 2 + dl;
+		}
+	}
+	*closed = false;
+	return n;
+}
+
+/* User-defined literal suffix right after a string/char literal
+ * (keyword.other.suffix.literal.user-defined). */
+static u32 cpp_udl(const char *s, u32 n, u32 i, SynSpans *o)
+{
+	if (i < n && (is_alpha((u8)s[i]) || s[i] == '_')) {
+		u32 j = i + 1;
+		while (j < n && is_cident((u8)s[j]))
+			j++;
+		emit(o, i, j - i, TK_STORAGE);
+		return j;
+	}
+	return i;
+}
+
+/* String/char body from i (past the quote), span from st; C++23 braced
+ * escapes \x{..} \o{..} \u{..} \N{..}. No printf placeholders. */
+static u32 cpp_string(const char *s, u32 n, u32 i, u32 st, u8 q, SynSpans *o, bool *cont)
+{
+	u32 run = st;
+	*cont = false;
+	while (i < n) {
+		u8 c = (u8)s[i];
+		if (c == q) {
+			i++;
+			emit(o, run, i - run, TK_STRING);
+			return cpp_udl(s, n, i, o);
+		}
+		if (c == '\\') {
+			emit(o, run, i - run, TK_STRING);
+			if (i + 1 == n) {
+				emit(o, i, 1, TK_ESCAPE);
+				*cont = true;
+				return n;
+			}
+			bool ok = true;
+			u32 j;
+			if (i + 2 < n && s[i + 1] && strchr("oxuN", s[i + 1]) && s[i + 2] == '{') {
+				j = i + 3;
+				while (j < n && s[j] != '}' && s[j] != (char)q)
+					j++;
+				ok = j < n && s[j] == '}';
+				if (ok)
+					j++;
+			} else {
+				j = c_escape(s, n, i, &ok);
+			}
+			emit(o, i, j - i, ok ? TK_ESCAPE : TK_INVALID);
+			i = run = j;
+			continue;
+		}
+		i++;
+	}
+	emit(o, run, n - run, TK_STRING);
+	return n;
+}
+
+/* Does the '<' at i open a template argument list closed on this line?
+ * Returns the index after the matching '>' or 0. */
+static u32 cpp_angle(const char *s, u32 n, u32 i)
+{
+	int depth = 0;
+	for (u32 j = i; j < n; j++) {
+		u8 c = (u8)s[j];
+		if (c == '<') {
+			depth++;
+		} else if (c == '>') {
+			if (--depth == 0)
+				return j + 1 < n && s[j + 1] == '=' && !(j + 2 < n && s[j + 2] == '=') ? 0 : j + 1;
+		} else if (c == '&' && j + 1 < n && s[j + 1] == '&') {
+			u32 k = skip_ws(s, n, j + 2);
+			if (!(k < n && (s[k] == '>' || s[k] == ',')))
+				return 0; /* a && b: a comparison chain */
+			j++;
+		} else if (!(is_cident(c) || is_space(c) || (c && strchr(",:*&.()[]+-", c)))) {
+			return 0;
+		}
+	}
+	return 0;
+}
+
+/* A declaration follows a name at j: `Foo x`, `Foo* p`, `Foo& r`. */
+static bool cpp_decl_follows(const char *s, u32 n, u32 j)
+{
+	u32 k = j;
+	while (k < n && (s[k] == '*' || s[k] == '&'))
+		k++;
+	if (k >= n || !is_space((u8)s[k]))
+		return false;
+	k = skip_ws(s, n, k);
+	if (k >= n || !(is_alpha((u8)s[k]) || s[k] == '_' || (u8)s[k] >= 0x80))
+		return false;
+	u32 e = k;
+	while (e < n && is_cident((u8)s[e]))
+		e++;
+	return kw_find(&kw_cpp, s + k, e - k) != XK_WORDOP;
+}
+
+/* pre/post at i (followed by '(' at p) in a function declarator? */
+static bool cpp_contract_ctx(const char *s, u32 n, u32 i, u32 p, bool close_ctrl)
+{
+	u32 k = i;
+	while (k > 0 && is_space((u8)s[k - 1]))
+		k--;
+	if (k == 0) {
+		/* alone on a line: post(r: ...) binds a result; a call ends with ';' */
+		u32 a = skip_ws(s, n, p + 1), b = a;
+		while (b < n && is_cident((u8)s[b]))
+			b++;
+		u32 z = skip_ws(s, n, b);
+		if (b > a && z < n && s[z] == ':' && !(z + 1 < n && s[z + 1] == ':'))
+			return true;
+		u32 e = n;
+		while (e > 0 && is_space((u8)s[e - 1]))
+			e--;
+		return e && s[e - 1] != ';';
+	}
+	u8 c = (u8)s[k - 1];
+	if (c == ')')
+		return !close_ctrl;
+	if (!is_cident(c))
+		return false;
+	u32 a = k;
+	while (a > 0 && is_cident((u8)s[a - 1]))
+		a--;
+	const char *w = s + a;
+	u32 wl = k - a;
+	return word_is(w, wl, "const") || word_is(w, wl, "volatile") || word_is(w, wl, "noexcept") ||
+	       word_is(w, wl, "override") || word_is(w, wl, "final");
+}
+
+enum { XP_NONE, XP_DOT, XP_TAG, XP_GOTO, XP_DEFINE, XP_INCLUDE, XP_PRAGMA, XP_QUAL, XP_USING, XP_OPERATOR, XP_EXPORT };
+
+static u32 lex_cpp(u32 state, const char *s, u32 n, SynSpans *o)
+{
+	u32 mode = state & 7u;
+	u32 i = 0;
+	bool closed;
+	if (mode == CPP_RAW) {
+		i = cpp_raw(s, n, 0, NULL, (state >> 3) & 31u, (state >> 8) & 0xFFFu, &closed);
+		emit(o, 0, i, TK_STRING);
+		if (!closed)
+			return state;
+		i = cpp_udl(s, n, i, o);
+		state = 0;
+		mode = CM_NORMAL;
+	}
+	u32 ppk = (state >> 4) & 3u, if0 = (state >> 8) & 0xFFu;
+	bool pp = (state & C_PP) != 0;
+
+	/* inside `#if 0`, as in C */
+	if (if0 && mode == CM_NORMAL && !pp) {
+		u32 j = skip_ws(s, n, 0);
+		if (j < n && s[j] == '#') {
+			u32 a = skip_ws(s, n, j + 1), b = a;
+			while (b < n && is_cident((u8)s[b]))
+				b++;
+			if (c_dead_opener(s + a, b - a)) {
+				emit(o, 0, n, TK_COMMENT);
+				return C_STATE(CM_NORMAL, 0, 0, if0 < 255 ? if0 + 1 : if0);
+			}
+			if (word_is(s + a, b - a, "endif")) {
+				if (--if0) {
+					emit(o, 0, n, TK_COMMENT);
+					return C_STATE(CM_NORMAL, 0, 0, if0);
+				}
+			} else if (if0 == 1 && c_dead_else(s + a, b - a)) {
+				if0 = 0;
+			} else {
+				emit(o, 0, n, TK_COMMENT);
+				return state;
+			}
+		} else {
+			emit(o, 0, n, TK_COMMENT);
+			return state;
+		}
+	}
+
+	switch (mode) {
+	case CM_BLOCK:
+	case CM_DOCBLOCK:
+		i = c_block(s, n, 0, 0, mode == CM_DOCBLOCK, o, &closed);
+		if (!closed)
+			return state;
+		break;
+	case CM_LINECMT:
+	case CM_DOCLINE:
+		c_comment_text(s, 0, n, mode == CM_DOCLINE, o);
+		if (n && s[n - 1] == '\\')
+			return state;
+		return C_STATE(CM_NORMAL, 0, 0, if0);
+	case CM_STRING:
+	case CM_CHAR: {
+		bool cont;
+		i = cpp_string(s, n, 0, 0, mode == CM_STRING ? '"' : '\'', o, &cont);
+		if (cont)
+			return state;
+		break;
+	}
+	default:
+		break;
+	}
+
+	bool line_pp = pp;
+	u32 kind = pp ? ppk : PPK_OTHER;
+	u32 if0_next = if0;
+	u32 prev = XP_NONE;
+	bool in_params = false;
+	u32 attr = 0;
+	u32 angle = 0;        /* open template angle brackets */
+	bool tpl_open = false; /* the next '<' opens a template list */
+	u32 depth = 0, ctrl_depth = 0;
+	bool ctrl_pending = false, close_ctrl = false;
+
+	if (!pp && i == 0) {
+		u32 j = skip_ws(s, n, 0);
+		if (j < n && s[j] == '#') {
+			u32 a = skip_ws(s, n, j + 1), b = a;
+			while (b < n && is_cident((u8)s[b]))
+				b++;
+			const char *w = s + a;
+			u32 wl = b - a;
+			emit(o, j, b - j, TK_CONTROL);
+			line_pp = true;
+			i = b;
+			if (word_is(w, wl, "define") || word_is(w, wl, "undef")) {
+				kind = PPK_DEFINE;
+				prev = XP_DEFINE;
+			} else if (word_is(w, wl, "include") || word_is(w, wl, "include_next") ||
+			           word_is(w, wl, "import") || word_is(w, wl, "embed")) {
+				prev = XP_INCLUDE;
+			} else if (word_is(w, wl, "if") || word_is(w, wl, "elif") || word_is(w, wl, "ifdef") ||
+			           word_is(w, wl, "ifndef") || word_is(w, wl, "elifdef") || word_is(w, wl, "elifndef")) {
+				kind = PPK_COND;
+				if (word_is(w, wl, "if") || word_is(w, wl, "elif")) {
+					u32 z = skip_ws(s, n, b);
+					if (z < n && s[z] == '0' && (z + 1 == n || is_space((u8)s[z + 1]) || s[z + 1] == '/'))
+						if0_next = 1;
+				}
+			} else if (word_is(w, wl, "error") || word_is(w, wl, "warning")) {
+				kind = PPK_DIAG;
+			} else if (word_is(w, wl, "pragma")) {
+				prev = XP_PRAGMA;
+			}
+		}
+	}
+
+	if (line_pp && kind == PPK_DIAG) {
+		u32 a = skip_ws(s, n, i);
+		bool cont = n && s[n - 1] == '\\';
+		emit(o, a, n - a - (cont ? 1 : 0), TK_STRING);
+		if (cont) {
+			emit(o, n - 1, 1, TK_ESCAPE);
+			return C_STATE(CM_NORMAL, 1, PPK_DIAG, if0_next);
+		}
+		return C_STATE(CM_NORMAL, 0, 0, if0_next);
+	}
+
+	u32 dflt = line_pp ? TK_PREPROC : TK_TEXT;
+
+	while (i < n) {
+		u8 c = (u8)s[i];
+		if (is_space(c)) {
+			i++;
+			continue;
+		}
+		u32 newprev = XP_NONE;
+		bool topen = tpl_open;
+		tpl_open = false;
+
+		if (c == '/' && i + 1 < n && s[i + 1] == '/') {
+			bool d = i + 2 < n && (s[i + 2] == '!' || (s[i + 2] == '/' && !(i + 3 < n && s[i + 3] == '/')));
+			c_comment_text(s, i, n, d, o);
+			if (s[n - 1] == '\\')
+				return C_STATE(d ? CM_DOCLINE : CM_LINECMT, line_pp, kind, if0_next);
+			return C_STATE(CM_NORMAL, 0, 0, if0_next);
+		}
+		if (c == '/' && i + 1 < n && s[i + 1] == '*') {
+			bool d = i + 2 < n && (s[i + 2] == '!' || (s[i + 2] == '*' && !(i + 3 < n && s[i + 3] == '/')));
+			i = c_block(s, n, i, i + 2, d, o, &closed);
+			if (!closed)
+				return C_STATE(d ? CM_DOCBLOCK : CM_BLOCK, line_pp, kind, if0_next);
+			tpl_open = topen;
+			continue;
+		}
+		if (prev == XP_OPERATOR) {
+			/* the overloaded operator: entity.name.operator */
+			if (c == '"' && i + 1 < n && s[i + 1] == '"') {
+				u32 a = skip_ws(s, n, i + 2), b = a;
+				while (b < n && is_cident((u8)s[b]))
+					b++;
+				emit(o, i, 2, TK_FUNCTION); /* entity.name.operator.custom-literal */
+				emit(o, a, b - a, TK_FUNCTION);
+				i = b;
+				prev = XP_NONE;
+				continue;
+			}
+			if (i + 1 < n && ((c == '(' && s[i + 1] == ')') || (c == '[' && s[i + 1] == ']'))) {
+				emit(o, i, 2, TK_CONTROL);
+				i += 2;
+				prev = XP_NONE;
+				continue;
+			}
+			u32 j = i;
+			while (j < n && s[j] && strchr("+-*/%^&|~!=<>,", s[j]))
+				j++;
+			if (j > i) {
+				emit(o, i, j - i, TK_CONTROL);
+				i = j;
+				prev = XP_NONE;
+				continue;
+			}
+		}
+		if (c == '"' || c == '\'') {
+			bool cont;
+			i = cpp_string(s, n, i + 1, i, c, o, &cont);
+			if (cont)
+				return C_STATE(c == '"' ? CM_STRING : CM_CHAR, line_pp, kind, if0_next);
+			prev = XP_NONE;
+			continue;
+		}
+		if (c == '<' && prev == XP_INCLUDE) {
+			u32 j = i + 1;
+			while (j < n && s[j] != '>')
+				j++;
+			if (j < n)
+				j++;
+			emit(o, i, j - i, TK_STRING);
+			i = j;
+			prev = XP_NONE;
+			continue;
+		}
+		if (is_digit(c) || (c == '.' && i + 1 < n && is_digit((u8)s[i + 1]))) {
+			u32 j = c_number(s, n, i); /* digit separators and suffixes included */
+			emit(o, i, j - i, TK_NUMBER);
+			i = j;
+			prev = XP_NONE;
+			continue;
+		}
+		if (is_cident(c)) {
+			u32 j = i + 1;
+			while (j < n && is_cident((u8)s[j]))
+				j++;
+			u32 len = j - i;
+			const char *w = s + i;
+			if (j < n && s[j] == '"' && cpp_raw_prefix(w, len)) {
+				u32 d = j + 1, e = d;
+				while (e < n && e - d <= 16 && cpp_delim_char((u8)s[e]))
+					e++;
+				if (e < n && s[e] == '(' && e - d <= 16) {
+					u32 dl = e - d;
+					u32 end = cpp_raw(s, n, e + 1, s + d, dl, 0, &closed);
+					emit(o, i, end - i, TK_STRING);
+					if (!closed)
+						return CPP_RAW_STATE(dl, cpp_delim_hash(s + d, dl));
+					i = cpp_udl(s, n, end, o);
+					prev = XP_NONE;
+					continue;
+				}
+			}
+			if (j < n && (s[j] == '"' || s[j] == '\'') && c_str_prefix(w, len)) {
+				bool cont;
+				u8 q = (u8)s[j];
+				i = cpp_string(s, n, j + 1, i, q, o, &cont);
+				if (cont)
+					return C_STATE(q == '"' ? CM_STRING : CM_CHAR, line_pp, kind, if0_next);
+				prev = XP_NONE;
+				continue;
+			}
+			u32 nx = skip_ws(s, n, j);
+			bool scope = nx + 1 < n && s[nx] == ':' && s[nx + 1] == ':';
+			int k = kw_find(&kw_cpp, w, len);
+			if (k == XK_IMPORT && !((skip_ws(s, n, 0) == i || prev == XP_EXPORT) &&
+			                        !(nx < n && (s[nx] == '(' || s[nx] == '=' || s[nx] == ':'))))
+				k = -1; /* import is a directive only at a statement start */
+			if (k == XK_CONTRACT && !(nx < n && s[nx] == '(' && cpp_contract_ctx(s, n, i, nx, close_ctrl)))
+				k = -1;
+			u32 cls, ae;
+			if (prev == XP_DEFINE) {
+				cls = TK_PREPROC;
+				in_params = j < n && s[j] == '(';
+			} else if (in_params) {
+				cls = TK_VARIABLE;
+			} else if (prev == XP_PRAGMA) {
+				cls = TK_VARIABLE;
+			} else if (k >= 0) {
+				switch (k) {
+				case XK_CTRL: cls = TK_CONTROL; break;
+				case XK_COND:
+					cls = TK_CONTROL;
+					ctrl_pending = true;
+					break;
+				case XK_GOTO:
+					cls = TK_CONTROL;
+					newprev = XP_GOTO;
+					break;
+				case XK_DEFINED: cls = (line_pp && kind == PPK_COND) ? TK_CONTROL : dflt; break;
+				case XK_NEWDEL: cls = TK_CONTROL; break;
+				case XK_USING:
+					cls = TK_CONTROL;
+					newprev = XP_USING;
+					break;
+				case XK_OPERATOR:
+					cls = TK_CONTROL;
+					newprev = XP_OPERATOR;
+					break;
+				case XK_IMPORT:
+					cls = TK_CONTROL;
+					newprev = XP_INCLUDE;
+					break;
+				case XK_LANGCONST: cls = TK_LANGCONST; break;
+				case XK_TYPE: cls = TK_TYPE; break;
+				case XK_TAG:
+					cls = TK_STORAGE;
+					newprev = XP_TAG;
+					break;
+				case XK_TEMPLATE:
+					cls = TK_STORAGE;
+					tpl_open = true;
+					break;
+				case XK_ACCESS:
+					cls = TK_STORAGE;
+					if (!(nx < n && s[nx] == ':' && !scope))
+						newprev = XP_TAG; /* : public Base */
+					break;
+				case XK_QUAL:
+					cls = TK_STORAGE;
+					newprev = XP_QUAL;
+					break;
+				case XK_EXPORT:
+					cls = TK_STORAGE;
+					newprev = XP_EXPORT;
+					break;
+				default: /* storage, word-like operators, contracts */
+					cls = TK_STORAGE;
+					if (k == XK_STORAGE && prev == XP_TAG)
+						newprev = XP_TAG; /* : public virtual Base */
+					break;
+				}
+			} else if (attr) {
+				cls = TK_TYPE;
+			} else if (prev == XP_TAG) {
+				cls = TK_TYPE;
+			} else if (prev == XP_GOTO) {
+				cls = TK_LABEL;
+			} else if (line_pp && kind == PPK_COND) {
+				cls = TK_PREPROC;
+			} else if (scope) {
+				cls = TK_TYPE; /* entity.name.scope-resolution */
+			} else if (j < n && s[j] == '<' && (ae = cpp_angle(s, n, j)) != 0) {
+				u32 z = skip_ws(s, n, ae);
+				cls = z < n && s[z] == '(' ? TK_FUNCTION : TK_TYPE;
+				tpl_open = true;
+			} else if (nx < n && s[nx] == '(') {
+				cls = TK_FUNCTION;
+			} else if (len > 2 && w[len - 2] == '_' && w[len - 1] == 't') {
+				cls = TK_TYPE;
+			} else if (angle && prev != XP_DOT) {
+				cls = TK_TYPE; /* template argument */
+			} else if (prev == XP_DOT) {
+				cls = TK_VARIABLE;
+			} else if (prev == XP_USING && nx < n && s[nx] == '=') {
+				cls = TK_TYPE; /* using Alias = ... */
+			} else if (prev == XP_QUAL && !(nx < n && s[nx] && strchr("(=;,)[{:", s[nx]))) {
+				cls = TK_TYPE; /* const Foo &r */
+			} else if (nx < n && ((s[nx] == '.' && !(nx + 1 < n && s[nx + 1] == '.')) ||
+			                      (s[nx] == '-' && nx + 1 < n && s[nx + 1] == '>'))) {
+				cls = TK_VARIABLE;
+			} else if (!line_pp && cpp_decl_follows(s, n, j)) {
+				cls = TK_TYPE;
+			} else {
+				cls = dflt;
+			}
+			if (scope && (prev == XP_TAG || prev == XP_QUAL))
+				newprev = prev; /* namespace a::b, const std::string */
+			if (cls == TK_TYPE && j < n && s[j] == '<' && cpp_angle(s, n, j))
+				tpl_open = true; /* class Foo<int>, vector<int> */
+			emit(o, i, len, cls);
+			i = j;
+			prev = newprev;
+			continue;
+		}
+		/* punctuation and operators */
+		if (c == '[' && i + 1 < n && s[i + 1] == '[' && !(i >= 3 && s[i - 1] == '.' && s[i - 2] == '.' && s[i - 3] == '.')) {
+			attr++;
+			emit(o, i, 2, dflt);
+			i += 2;
+		} else if (c == ']' && attr && i + 1 < n && s[i + 1] == ']') {
+			attr--;
+			emit(o, i, 2, dflt);
+			i += 2;
+		} else if (c == ':' && i + 1 < n && s[i + 1] == ':') {
+			emit(o, i, 2, dflt);
+			i += 2;
+			if (prev == XP_TAG || prev == XP_QUAL)
+				newprev = prev;
+		} else if (c == '-' && i + 1 < n && s[i + 1] == '>') {
+			bool trailing = i > 0 && is_space((u8)s[i - 1]); /* auto f() -> T */
+			emit(o, i, 2, dflt);
+			i += 2;
+			newprev = trailing ? XP_QUAL : XP_DOT;
+		} else if (c == '.') {
+			if (i + 2 < n && s[i + 1] == '.' && s[i + 2] == '.') {
+				emit(o, i, 3, in_params ? TK_VARIABLE : dflt);
+				i += 3;
+				if (prev == XP_TAG)
+					newprev = XP_TAG; /* typename... Ts */
+			} else {
+				emit(o, i, 1, dflt);
+				i++;
+				newprev = XP_DOT;
+			}
+		} else if (c == '\\' && i + 1 == n) {
+			emit(o, i, 1, TK_ESCAPE);
+			i++;
+		} else if (c == '<' && topen) {
+			angle++; /* template argument/parameter list */
+			emit(o, i, 1, dflt);
+			i++;
+		} else if (c == '>' && angle) {
+			angle--;
+			emit(o, i, 1, dflt);
+			i++;
+		} else if (c == '(') {
+			depth++;
+			if (ctrl_pending) {
+				ctrl_depth = depth;
+				ctrl_pending = false;
+			}
+			emit(o, i, 1, dflt);
+			i++;
+		} else if (c == ')') {
+			if (in_params)
+				in_params = false;
+			close_ctrl = ctrl_depth && depth == ctrl_depth;
+			if (close_ctrl)
+				ctrl_depth = 0;
+			if (depth)
+				depth--;
+			emit(o, i, 1, dflt);
+			i++;
+		} else if (c && strchr("+-*/%=&|^!~<>?:", c)) {
+			emit(o, i, 1, TK_OPERATOR);
+			i++;
+		} else {
+			emit(o, i, 1, dflt);
+			i++;
+		}
+		prev = newprev;
+	}
+
+	bool cont_pp = line_pp && n && s[n - 1] == '\\';
+	return C_STATE(CM_NORMAL, cont_pp, cont_pp ? kind : 0, if0_next);
+}
+
+/* Clear C++ markers at line starts in the head of a .h file. */
+static bool cpp_head(const char *h, size_t n)
+{
+	if (!h)
+		return false;
+	if (n > 8192)
+		n = 8192;
+	size_t i = 0;
+	bool cmt = false;
+	while (i < n) {
+		size_t e = i;
+		while (e < n && h[e] != '\n')
+			e++;
+		const char *l = h + i;
+		u32 ln = (u32)(e - i);
+		i = e + 1;
+		u32 a = skip_ws(l, ln, 0);
+		if (cmt) {
+			/* skip to the end of a block comment */
+			for (u32 k = a; k + 1 < ln; k++)
+				if (l[k] == '*' && l[k + 1] == '/')
+					cmt = false;
+			continue;
+		}
+		if (a + 1 < ln && l[a] == '/' && l[a + 1] == '*') {
+			cmt = true;
+			for (u32 k = a + 2; k + 1 < ln; k++)
+				if (l[k] == '*' && l[k + 1] == '/')
+					cmt = false;
+			continue;
+		}
+		const char *p = l + a;
+		u32 pl = ln - a, b = 0;
+		while (b < pl && is_cident((u8)p[b]))
+			b++;
+		u32 c = skip_ws(p, pl, b);
+		if (word_is(p, b, "namespace") && c < pl && (is_alpha((u8)p[c]) || p[c] == '_' || p[c] == '{'))
+			return true;
+		if (word_is(p, b, "template") && c < pl && p[c] == '<')
+			return true;
+		if ((word_is(p, b, "class") || word_is(p, b, "concept")) && c > b && c < pl && (is_alpha((u8)p[c]) || p[c] == '_'))
+			return true;
+		if ((word_is(p, b, "public") || word_is(p, b, "private") || word_is(p, b, "protected")) && c < pl &&
+		    p[c] == ':' && !(c + 1 < pl && p[c + 1] == ':'))
+			return true;
+		if (word_is(p, b, "using") && c > b && c < pl && is_alpha((u8)p[c]))
+			return true;
+		if (pl > 10 && p[0] == '#') {
+			/* #include <vector>: an extension-less standard header */
+			u32 q = skip_ws(p, pl, 1), r = q;
+			while (r < pl && is_alpha((u8)p[r]))
+				r++;
+			if (word_is(p + q, r - q, "include")) {
+				u32 t = skip_ws(p, pl, r);
+				if (t < pl && p[t] == '<') {
+					u32 z = t + 1;
+					while (z < pl && p[z] != '>' && p[z] != '.' && p[z] != '/')
+						z++;
+					if (z < pl && p[z] == '>' && z > t + 1)
+						return true;
+				}
+			}
+		}
+	}
+	return false;
+}
+
+/* ================================================================== */
+/* Rust                                                                */
+/*
+ * Follows VSCodium's rust.tmLanguage under Dark+/Light+:
+ *   keyword.control (if match loop return await while ...)  -> TK_CONTROL
+ *   storage.type, storage.modifier, keyword.other (fn let mut pub const
+ *   struct enum impl use as unsafe dyn crate where ...)      -> TK_STORAGE
+ *   entity.name.type (PascalCase, Some/None/Ok/Err, primitives, numeric
+ *   suffixes 5u8, lifetime names, Upper-case macros),
+ *   entity.name.namespace (a:: in paths)                    -> TK_TYPE
+ *   entity.name.function (fn name, calls f(, f::<T>(, macros name!)
+ *                                                            -> TK_FUNCTION
+ *   variable.other (lower-case names)                       -> TK_VARIABLE
+ *   variable.language (self Self super), true/false        -> TK_LANGCONST
+ * Plain: constant.other.caps (ALL_CAPS), fields after '.', the module
+ * name after mod, lower-case names in use paths, the quote of a lifetime.
+ * Attributes #[...] / #![...] colour only keywords, strings and types.
+ * Byte, raw and C strings (b"" br#""# c"" cr"") are strings; the grammar's
+ * raw strings take any number of '#'.
+ *
+ * State: bits 0-1 mode (0 code, 1 block comment, 2 string, 3 raw string),
+ * bits 2-9 comment depth or the raw string's '#' count, bit 10 inside an
+ * attribute with bits 11-15 its bracket depth, bit 16 inside a use (or
+ * extern crate) declaration. */
+
+enum { RS_CODE, RS_BLOCK, RS_STR, RS_RAW };
+enum { RK_CTRL = 1, RK_KW, RK_CONST, RK_SELF, RK_PRIM, RK_FN, RK_MOD, RK_USE, RK_EXTERN };
+static KwSet kw_rs;
+static const char rs_ctrl[] = "await break continue do else for if loop match return try while yield";
+static const char rs_kw[] = "let macro const static type enum trait struct abstract as async become box dyn "
+                            "move final gen impl in override priv ref typeof union unsafe unsized virtual "
+                            "where mut crate pub";
+static const char rs_prim[] = "bool char str f32 f64 i128 i16 i32 i64 i8 isize u128 u16 u32 u64 u8 usize";
+
+static void rs_build(void)
+{
+	kw_list(&kw_rs, rs_ctrl, RK_CTRL);
+	kw_list(&kw_rs, rs_kw, RK_KW);
+	kw_list(&kw_rs, "true false", RK_CONST);
+	kw_list(&kw_rs, "self Self super", RK_SELF);
+	kw_list(&kw_rs, rs_prim, RK_PRIM);
+	kw_add(&kw_rs, "fn", 2, RK_FN);
+	kw_add(&kw_rs, "mod", 3, RK_MOD);
+	kw_add(&kw_rs, "use", 3, RK_USE);
+	kw_add(&kw_rs, "extern", 6, RK_EXTERN);
+}
+
+static inline u32 rs_state(u32 mode, u32 cnt, bool attr, u32 adepth, bool use)
+{
+	return mode | (VX_MIN(cnt, 255u) << 2) | (attr ? (1u << 10) | (VX_MIN(adepth, 31u) << 11) : 0u) |
+	       (use ? 1u << 16 : 0u);
+}
+
+static inline bool rs_ident(u8 c) { return is_alpha(c) || is_digit(c) || c == '_' || c >= 0x80; }
+
+/* Escape at s[i] == '\\': \x7F, \u{10FFFF}, \n ... Returns its end. */
+static u32 rs_escape(const char *s, u32 n, u32 i)
+{
+	u32 j = i + 1;
+	if (j >= n)
+		return n;
+	if (s[j] == 'x') {
+		j++;
+		for (int k = 0; k < 2 && j < n && is_xdigit((u8)s[j]); k++)
+			j++;
+		return j;
+	}
+	if (s[j] == 'u' && j + 1 < n && s[j + 1] == '{') {
+		j += 2;
+		while (j < n && is_xdigit((u8)s[j]))
+			j++;
+		if (j < n && s[j] == '}')
+			j++;
+		return j;
+	}
+	return j + 1;
+}
+
+/* String body from i (span from st); strings may span lines. */
+static u32 rs_string(const char *s, u32 n, u32 i, u32 st, bool *closed, SynSpans *o)
+{
+	u32 run = st, j = i;
+	*closed = false;
+	while (j < n) {
+		if (s[j] == '\\') {
+			emit(o, run, j - run, TK_STRING);
+			u32 e = rs_escape(s, n, j);
+			emit(o, j, e - j, TK_ESCAPE);
+			j = run = e;
+			continue;
+		}
+		if (s[j] == '"') {
+			emit(o, run, j + 1 - run, TK_STRING);
+			*closed = true;
+			return j + 1;
+		}
+		j++;
+	}
+	emit(o, run, n - run, TK_STRING);
+	return n;
+}
+
+/* Raw string body from i up to '"' followed by `hashes` '#'. */
+static u32 rs_raw(const char *s, u32 n, u32 i, u32 st, u32 hashes, bool *closed, SynSpans *o)
+{
+	for (u32 j = i; j < n; j++) {
+		if (s[j] != '"')
+			continue;
+		u32 k = 0;
+		while (k < hashes && j + 1 + k < n && s[j + 1 + k] == '#')
+			k++;
+		if (k == hashes) {
+			emit(o, st, j + 1 + hashes - st, TK_STRING);
+			*closed = true;
+			return j + 1 + hashes;
+		}
+	}
+	emit(o, st, n - st, TK_STRING);
+	*closed = false;
+	return n;
+}
+
+/* Char literal or lifetime at the quote q (span from st, which may hold
+ * a b prefix). Returns the end. */
+static u32 rs_quote(const char *s, u32 n, u32 st, u32 q, SynSpans *o)
+{
+	if (q + 1 < n && s[q + 1] == '\\') {
+		u32 e = rs_escape(s, n, q + 1);
+		if (e < n && s[e] == '\'') {
+			emit(o, st, q + 1 - st, TK_STRING);
+			emit(o, q + 1, e - q - 1, TK_ESCAPE);
+			emit(o, e, 1, TK_STRING);
+			return e + 1;
+		}
+	}
+	if (q + 1 < n) {
+		u32 cp;
+		u32 l = utf8_decode(s + q + 1, n - q - 1, &cp);
+		if (q + 1 + l < n && s[q + 1 + l] == '\'' && s[q + 1] != '\'') {
+			emit(o, st, q + 2 + l - st, TK_STRING);
+			return q + 2 + l;
+		}
+	}
+	if (st == q && q + 1 < n && (is_alpha((u8)s[q + 1]) || s[q + 1] == '_')) {
+		/* lifetime: punctuation.definition.lifetime + entity.name.type.lifetime */
+		u32 e = q + 1;
+		while (e < n && rs_ident((u8)s[e]))
+			e++;
+		emit(o, q + 1, e - q - 1, TK_TYPE);
+		return e;
+	}
+	return q + 1;
+}
+
+/* Number with an optional type suffix (entity.name.type.numeric). */
+static u32 rs_number(const char *s, u32 n, u32 i, SynSpans *o)
+{
+	u32 j = i;
+	if (s[j] == '0' && j + 1 < n && (s[j + 1] == 'x' || s[j + 1] == 'o' || s[j + 1] == 'b')) {
+		u8 b = (u8)s[j + 1];
+		j += 2;
+		while (j < n && (s[j] == '_' || (b == 'x' ? is_xdigit((u8)s[j])
+		                                 : b == 'o' ? s[j] >= '0' && s[j] <= '7' : s[j] == '0' || s[j] == '1')))
+			j++;
+	} else {
+		while (j < n && (is_digit((u8)s[j]) || s[j] == '_'))
+			j++;
+		if (j < n && s[j] == '.' && !(j + 1 < n && (s[j + 1] == '.' || is_alpha((u8)s[j + 1]) || s[j + 1] == '_'))) {
+			j++;
+			while (j < n && (is_digit((u8)s[j]) || s[j] == '_'))
+				j++;
+		}
+		if (j < n && (s[j] | 32) == 'e') {
+			u32 k = j + 1;
+			if (k < n && (s[k] == '+' || s[k] == '-'))
+				k++;
+			if (k < n && is_digit((u8)s[k])) {
+				j = k;
+				while (j < n && (is_digit((u8)s[j]) || s[j] == '_'))
+					j++;
+			}
+		}
+	}
+	emit(o, i, j - i, TK_NUMBER);
+	u32 e = j;
+	while (e < n && rs_ident((u8)s[e]))
+		e++;
+	if (e > j && (s[j] == 'u' || s[j] == 'i' || s[j] == 'f') && kw_find(&kw_rs, s + j, e - j) == RK_PRIM)
+		emit(o, j, e - j, TK_TYPE);
+	return e;
+}
+
+static u32 lex_rust(u32 state, const char *s, u32 n, SynSpans *o)
+{
+	u32 mode = state & 3u, cnt = (state >> 2) & 0xFFu;
+	bool attr = (state & (1u << 10)) != 0, use = (state & (1u << 16)) != 0;
+	u32 adepth = (state >> 11) & 31u;
+	u32 i = 0;
+	bool closed;
+	if (mode == RS_BLOCK) {
+		u32 d = cnt ? cnt : 1;
+		i = kt_comment(s, n, 0, &d, o);
+		if (d)
+			return rs_state(RS_BLOCK, d, attr, adepth, use);
+	} else if (mode == RS_STR) {
+		i = rs_string(s, n, 0, 0, &closed, o);
+		if (!closed)
+			return state;
+	} else if (mode == RS_RAW) {
+		i = rs_raw(s, n, 0, 0, cnt, &closed, o);
+		if (!closed)
+			return state;
+	}
+	int expect = 0; /* 1 fn name, 2 mod name, 3 macro_rules! name */
+	while (i < n) {
+		u8 c = (u8)s[i];
+		if (is_space(c)) {
+			i++;
+			continue;
+		}
+		if (c == '/' && i + 1 < n && s[i + 1] == '/') {
+			emit(o, i, n - i, TK_COMMENT); /* doc comments /// //! too */
+			break;
+		}
+		if (c == '/' && i + 1 < n && s[i + 1] == '*') {
+			u32 d = 1;
+			emit(o, i, 2, TK_COMMENT);
+			i = kt_comment(s, n, i + 2, &d, o);
+			if (d)
+				return rs_state(RS_BLOCK, d, attr, adepth, use);
+			continue;
+		}
+		if (c == '"') {
+			i = rs_string(s, n, i + 1, i, &closed, o);
+			if (!closed)
+				return rs_state(RS_STR, 0, attr, adepth, use);
+			continue;
+		}
+		if (c == '\'') {
+			i = rs_quote(s, n, i, i, o);
+			continue;
+		}
+		if (is_digit(c)) {
+			i = rs_number(s, n, i, o);
+			continue;
+		}
+		if (rs_ident(c)) {
+			u32 e = i;
+			while (e < n && rs_ident((u8)s[e]))
+				e++;
+			u32 len = e - i;
+			const char *w = s + i;
+			/* literal prefixes: r"" r#""# br"" cr"" b"" c"" b'' */
+			if (e < n && (word_is(w, len, "r") || word_is(w, len, "br") || word_is(w, len, "cr"))) {
+				u32 h = e;
+				while (h < n && s[h] == '#')
+					h++;
+				if (h < n && s[h] == '"') {
+					i = rs_raw(s, n, h + 1, i, h - e, &closed, o);
+					if (!closed)
+						return rs_state(RS_RAW, h - e, attr, adepth, use);
+					continue;
+				}
+			}
+			if (e < n && s[e] == '"' && (word_is(w, len, "b") || word_is(w, len, "c"))) {
+				i = rs_string(s, n, e + 1, i, &closed, o);
+				if (!closed)
+					return rs_state(RS_STR, 0, attr, adepth, use);
+				continue;
+			}
+			if (e < n && s[e] == '\'' && word_is(w, len, "b")) {
+				i = rs_quote(s, n, i, e, o);
+				continue;
+			}
+			bool raw_id = false;
+			if (word_is(w, len, "r") && e + 1 < n && s[e] == '#' && (is_alpha((u8)s[e + 1]) || s[e + 1] == '_')) {
+				e++; /* r#type: a raw identifier */
+				while (e < n && rs_ident((u8)s[e]))
+					e++;
+				len = e - i;
+				raw_id = true;
+			}
+			bool upper = (unsigned)((u8)w[0] - 'A') < 26u ||
+			             (w[0] == '_' && len > 1 && (unsigned)((u8)w[1] - 'A') < 26u);
+			bool after_dot = i > 0 && s[i - 1] == '.' && !(i > 1 && s[i - 2] == '.');
+			int k = raw_id ? -1 : kw_find(&kw_rs, w, len);
+			u32 cls = TK_TEXT;
+			if (expect == 1) {
+				cls = TK_FUNCTION;
+			} else if (expect == 2) {
+				cls = TK_TEXT; /* entity.name.module */
+			} else if (expect == 3) {
+				cls = upper ? TK_TYPE : TK_FUNCTION;
+			} else if (k == RK_SELF || k == RK_CONST) {
+				cls = TK_LANGCONST;
+			} else if (!attr && e < n && s[e] == '!' && !(e + 1 < n && s[e + 1] == '=')) {
+				/* macro invocation, the '!' included */
+				cls = upper ? TK_TYPE : TK_FUNCTION;
+				if (word_is(w, len, "macro_rules"))
+					expect = 4;
+				e++;
+				len++;
+			} else if (word_is(w, len, "Some") || word_is(w, len, "None") || word_is(w, len, "Ok") ||
+			           word_is(w, len, "Err")) {
+				cls = TK_TYPE; /* entity.name.type.option / .result, even before ( */
+			} else if (!attr && k != RK_CTRL && k != RK_KW && k != RK_FN && k != RK_MOD && k != RK_USE &&
+			           k != RK_EXTERN &&
+			           ((e < n && s[e] == '(') || (e + 2 < n && s[e] == ':' && s[e + 1] == ':' && s[e + 2] == '<'))) {
+				cls = TK_FUNCTION;
+			} else if (k > 0) {
+				switch (k) {
+				case RK_CTRL: cls = TK_CONTROL; break;
+				case RK_PRIM: cls = TK_TYPE; break;
+				case RK_FN:
+					cls = TK_STORAGE;
+					expect = 5;
+					break;
+				case RK_MOD:
+					cls = TK_STORAGE;
+					expect = 6;
+					break;
+				case RK_USE:
+					cls = TK_STORAGE;
+					if (!attr && e < n && is_space((u8)s[e]))
+						use = true;
+					break;
+				case RK_EXTERN: {
+					cls = TK_STORAGE;
+					u32 a = skip_ws(s, n, e), b = a;
+					while (b < n && rs_ident((u8)s[b]))
+						b++;
+					if (word_is(s + a, b - a, "crate"))
+						use = true;
+					break;
+				}
+				default: cls = TK_STORAGE; break;
+				}
+			} else {
+				bool caps = len >= 2 && (unsigned)((u8)w[0] - 'A') < 26u && (unsigned)((u8)w[1] - 'A') < 26u;
+				bool lower_only = true;
+				for (u32 q = 0; q < len; q++) {
+					u8 ch = (u8)w[q];
+					if (caps && !((unsigned)(ch - 'A') < 26u || is_digit(ch) || ch == '_'))
+						caps = false;
+					if (!((unsigned)(ch - 'a') < 26u || is_digit(ch) || ch == '_'))
+						lower_only = false;
+				}
+				if (raw_id)
+					lower_only = true;
+				if (caps)
+					cls = TK_TEXT; /* constant.other.caps */
+				else if (upper)
+					cls = TK_TYPE;
+				else if (!attr && e + 1 < n && s[e] == ':' && s[e + 1] == ':')
+					cls = TK_TYPE; /* entity.name.namespace */
+				else if (attr || use || after_dot)
+					cls = TK_TEXT;
+				else if (lower_only)
+					cls = TK_VARIABLE;
+			}
+			/* fn/mod/macro_rules! name the next identifier */
+			expect = expect == 5 ? 1 : expect == 6 ? 2 : expect == 4 ? 3 : 0;
+			emit(o, i, len, cls);
+			i = e;
+			continue;
+		}
+		expect = 0;
+		if (c == '#' && i + 1 < n && (s[i + 1] == '[' || (s[i + 1] == '!' && i + 2 < n && s[i + 2] == '['))) {
+			i += s[i + 1] == '[' ? 2 : 3;
+			attr = true;
+			adepth = 1;
+			continue;
+		}
+		if (attr && c == '[') {
+			adepth++;
+			i++;
+			continue;
+		}
+		if (attr && c == ']') {
+			if (--adepth == 0)
+				attr = false;
+			i++;
+			continue;
+		}
+		if (c == ';') {
+			use = false;
+			i++;
+			continue;
+		}
+		if (c == '<' || c == '>') {
+			/* comparison only with spaces around; otherwise angle brackets */
+			if (i > 0 && is_space((u8)s[i - 1]) && i + 1 < n && (is_space((u8)s[i + 1]) || s[i + 1] == '='))
+				emit(o, i, 1, TK_OPERATOR);
+			i++;
+			continue;
+		}
+		if (c && strchr("+-*/%=!&|^~?:@.$", c))
+			emit(o, i, 1, TK_OPERATOR);
+		i++;
+	}
+	return rs_state(RS_CODE, 0, attr, adepth, use);
+}
+
 static u32 lex_any(int lang, u32 state, const char *s, u32 n, SynSpans *o)
 {
 	switch (lang) {
@@ -5356,6 +7415,11 @@ static u32 lex_any(int lang, u32 state, const char *s, u32 n, SynSpans *o)
 	case LANG_PYTHON: return lex_python(state, s, n, o);
 	case LANG_YAML: return lex_yaml(state, s, n, o);
 	case LANG_CODEOWNERS: return lex_codeowners(state, s, n, o);
+	case LANG_JAVA: return lex_java(state, s, n, o);
+	case LANG_KOTLIN: return lex_kotlin(state, s, n, o);
+	case LANG_TOML: return lex_toml(state, s, n, o);
+	case LANG_CPP: return lex_cpp(state, s, n, o);
+	case LANG_RUST: return lex_rust(state, s, n, o);
 	default: return 0;
 	}
 }
@@ -5388,6 +7452,10 @@ static void syn_build2(void)
 	kw_list(&kw_mkdir, mk_gnu_dirs, 1);
 	kw_list(&kw_bsddir, mk_bsd_dirs, 1);
 	py_build();
+	java_build();
+	kt_build();
+	cpp_build();
+	rs_build();
 }
 
 /* ================================================================== */
@@ -5423,6 +7491,11 @@ const char *syn_lang_name(int lang)
 	case LANG_PYTHON: return "Python";
 	case LANG_YAML: return "YAML";
 	case LANG_CODEOWNERS: return "CODEOWNERS";
+	case LANG_JAVA: return "Java";
+	case LANG_KOTLIN: return "Kotlin";
+	case LANG_TOML: return "TOML";
+	case LANG_CPP: return "C++";
+	case LANG_RUST: return "Rust";
 	default: return "Plain Text";
 	}
 }
@@ -5448,6 +7521,11 @@ const char *syn_lang_lsp_id(int lang)
 	case LANG_PYTHON: return "python";
 	case LANG_YAML: return "yaml";
 	case LANG_CODEOWNERS: return "codeowners";
+	case LANG_JAVA: return "java";
+	case LANG_KOTLIN: return "kotlin";
+	case LANG_TOML: return "toml";
+	case LANG_CPP: return "cpp";
+	case LANG_RUST: return "rust";
 	default: return NULL;
 	}
 }
@@ -5466,8 +7544,13 @@ const char *syn_line_comment(int lang)
 	case LANG_GIT_REBASE:
 	case LANG_PYTHON:
 	case LANG_YAML:
-	case LANG_CODEOWNERS: return "#";
-	case LANG_JSONC: return "//";
+	case LANG_CODEOWNERS:
+	case LANG_TOML: return "#";
+	case LANG_JSONC:
+	case LANG_JAVA:
+	case LANG_KOTLIN:
+	case LANG_CPP:
+	case LANG_RUST: return "//";
 	case LANG_ASM_INTEL:
 	case LANG_LISP: return ";";
 	case LANG_TROFF: return ".\\\"";
@@ -5666,7 +7749,8 @@ int syn_lang_for_path(const char *path, const char *head, size_t headlen)
 	    {".jshintrc", LANG_JSONC},        {".swcrc", LANG_JSONC},           {".jscsrc", LANG_JSONC},
 	    {"SConstruct", LANG_PYTHON},      {"SConscript", LANG_PYTHON},      {"CODEOWNERS", LANG_CODEOWNERS},
 	    {".clang-format", LANG_YAML},     {"_clang-format", LANG_YAML},     {".clang-tidy", LANG_YAML},
-	    {".clangd", LANG_YAML},
+	    {".clangd", LANG_YAML},           {"Cargo.lock", LANG_TOML},        {"Pipfile", LANG_TOML},
+	    {"poetry.lock", LANG_TOML},       {"uv.lock", LANG_TOML},           {"Gopkg.lock", LANG_TOML},
 	};
 	for (size_t i = 0; i < VX_COUNT(names); i++)
 		if (!strcmp(base, names[i].name))
@@ -5703,12 +7787,26 @@ int syn_lang_for_path(const char *path, const char *head, size_t headlen)
 		return bang;
 	for (size_t i = 0; i <= el; i++)
 		e[i] = (char)lower((u8)dot[1 + i]);
-	if (!strcmp(e, "c") || !strcmp(e, "h"))
+	if (!strcmp(e, "c"))
 		return LANG_C;
+	if (!strcmp(e, "h")) /* C unless the head has clear C++ markers */
+		return cpp_head(head, headlen) ? LANG_CPP : LANG_C;
+	static const char *const cpp[] = {"cpp", "cc", "cxx", "c++", "hpp", "hh", "hxx", "h++", "ipp", "tpp", "inl", "ixx", "cppm"};
+	for (size_t i = 0; i < VX_COUNT(cpp); i++)
+		if (!strcmp(e, cpp[i]))
+			return LANG_CPP;
+	if (!strcmp(e, "rs"))
+		return LANG_RUST;
 	if (!strcmp(e, "py") || !strcmp(e, "pyi") || !strcmp(e, "pyw") || !strcmp(e, "gyp") || !strcmp(e, "gypi"))
 		return LANG_PYTHON;
 	if (!strcmp(e, "yml") || !strcmp(e, "yaml"))
 		return LANG_YAML;
+	if (!strcmp(e, "java") || !strcmp(e, "jav"))
+		return LANG_JAVA;
+	if (!strcmp(e, "kt") || !strcmp(e, "kts"))
+		return LANG_KOTLIN;
+	if (!strcmp(e, "toml"))
+		return LANG_TOML;
 	if (!strcmp(e, "cmake"))
 		return LANG_CMAKE;
 	if (!strcmp(e, "mk") || !strcmp(e, "mak") || !strcmp(e, "make"))

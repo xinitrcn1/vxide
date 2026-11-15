@@ -71,6 +71,9 @@ typedef struct {
 /* Start a server (argv[0] looked up in PATH) for a project root. Returns
  * NULL if it cannot be spawned. The initialize request is sent at once. */
 Lsp *lsp_start(const char *root, char *const argv[]);
+/* Same, with settings (a JSON object) sent as initializationOptions and
+ * returned for every workspace/configuration item. */
+Lsp *lsp_start_ex(const char *root, char *const argv[], const char *settings);
 void lsp_stop(Lsp *l); /* shutdown + exit, then kills after a grace period */
 int lsp_fd(Lsp *l);    /* readable fd for poll(); -1 when dead */
 bool lsp_ready(Lsp *l);

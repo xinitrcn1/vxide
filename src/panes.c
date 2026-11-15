@@ -151,49 +151,157 @@ bool input_key(Input *in, const Event *e)
 	return true;
 }
 
-void input_click(Input *in, int font, int x0, int mx)
+/* ---- wrapping: long text makes the box taller instead of running under
+ * the icons on its right (VSCodium's search box behaves the same) ---- */
+
+#define WRAP_MAX 64
+
+typedef struct {
+	u32 start[WRAP_MAX + 1]; /* byte offset where each visual row starts */
+	u32 n;
+} Wrap;
+
+/* tw0: width of the first row (left of the icon strip), tw: later rows */
+static void input_wrap(const Input *in, int tw0, int tw, Wrap *wr)
 {
-	int x = x0 - in->scroll;
-	u32 i = 0;
-	while (i < in->n) {
+	wr->n = 1;
+	wr->start[0] = 0;
+	if (tw0 < PX(20))
+		tw0 = PX(20);
+	if (tw < PX(20))
+		tw = PX(20);
+	int pen = 0;
+	u32 last_space = UINT32_MAX;
+	for (u32 i = 0; i < in->n;) {
+		u32 cp;
+		u32 k = utf8_decode(in->b + i, in->n - i, &cp);
+		int a = font_glyphs.adv[font_glyph(FONT_UI, cp)];
+		if (pen + a > (wr->n == 1 ? tw0 : tw) && i > wr->start[wr->n - 1] && wr->n < WRAP_MAX) {
+			/* break after the last space of the row when there is one */
+			u32 brk = last_space != UINT32_MAX && last_space > wr->start[wr->n - 1] ? last_space + 1 : i;
+			wr->start[wr->n++] = brk;
+			pen = font_width(FONT_UI, in->b + brk, i - brk);
+			last_space = UINT32_MAX;
+		}
+		if (cp == ' ')
+			last_space = i;
+		pen += a;
+		i += k;
+	}
+	wr->start[wr->n] = in->n;
+}
+
+static int text_w(int w, int reserve) { return w - 2 * PX(6) - reserve; }
+#define WRAP_ARGS(w, reserve) text_w(w, reserve), text_w(w, 0)
+
+int input_height(Input *in, int w, int reserve)
+{
+	if (!in->b)
+		input_set(in, "", 0);
+	Wrap wr;
+	input_wrap(in, WRAP_ARGS(w, reserve), &wr);
+	int lh = font_m[FONT_UI].line;
+	return VX_MAX(PX(26), (int)wr.n * lh + PX(8));
+}
+
+/* Row of a byte offset (the caret belongs to the row it starts). */
+static u32 wrap_row(const Wrap *wr, u32 off)
+{
+	u32 r = 0;
+	while (r + 1 < wr->n && off >= wr->start[r + 1])
+		r++;
+	return r;
+}
+
+int input_draw_ex(Input *in, int x, int y, int w, int reserve, const char *ph, bool focused)
+{
+	if (!in->b)
+		input_set(in, "", 0);
+	int pad = PX(6);
+	int tw = text_w(w, reserve);
+	Wrap wr;
+	input_wrap(in, tw, text_w(w, 0), &wr);
+	int lh = font_m[FONT_UI].line;
+	int h = VX_MAX(PX(26), (int)wr.n * lh + PX(8));
+	draw_rect(x, y, w, h, COL(C_INPUT_BG));
+	draw_frame(x, y, w, h, focused ? COL(C_FOCUS_BORDER) : COL(C_INPUT_BORDER));
+	int ty0 = wr.n == 1 ? y + (h - lh) / 2 : y + PX(4);
+	draw_clip(x + pad, y, text_w(w, 0) + PX(1), h); /* later rows use the full width */
+	if (!in->n && ph && *ph)
+		draw_text_fit(FONT_UI, x + pad, ty0, ph, strlen(ph), tw, COL(C_INPUT_PLACEHOLDER));
+	u32 a = VX_MIN(in->cur, in->anchor), b = VX_MAX(in->cur, in->anchor);
+	for (u32 r = 0; r < wr.n; r++) {
+		u32 rs = wr.start[r], re = wr.start[r + 1];
+		int ty = ty0 + (int)r * lh;
+		if (b > a && a < re && b > rs) {
+			u32 sa = VX_MAX(a, rs), sb = VX_MIN(b, re);
+			int sx = font_width(FONT_UI, in->b + rs, sa - rs), ex = font_width(FONT_UI, in->b + rs, sb - rs);
+			draw_rect(x + pad + sx, ty, ex - sx, lh, COL(C_SELECTION));
+		}
+		draw_text(FONT_UI, x + pad, ty, in->b + rs, re - rs, COL(C_INPUT_FG));
+	}
+	if (focused) {
+		u32 r = wrap_row(&wr, in->cur);
+		int cx = font_width(FONT_UI, in->b + wr.start[r], in->cur - wr.start[r]);
+		draw_rect(x + pad + cx, ty0 + (int)r * lh, PX(1), lh, COL(C_INPUT_FG));
+	}
+	in->scroll = 0;
+	draw_noclip();
+	draw_clip(0, 0, app.w, app.h);
+	return h;
+}
+
+/* Click in a wrapped box; double click selects the word, triple all. */
+void input_click_ex(Input *in, int x, int y, int w, int reserve, int mx, int my, int clicks)
+{
+	if (!in->b)
+		input_set(in, "", 0);
+	int pad = PX(6);
+	Wrap wr;
+	input_wrap(in, WRAP_ARGS(w, reserve), &wr);
+	int lh = font_m[FONT_UI].line;
+	int h = VX_MAX(PX(26), (int)wr.n * lh + PX(8));
+	int ty0 = wr.n == 1 ? y + (h - lh) / 2 : y + PX(4);
+	int r = (my - ty0) / VX_MAX(lh, 1);
+	r = VX_CLAMP(r, 0, (int)wr.n - 1);
+	u32 rs = wr.start[r], re = wr.start[r + 1];
+	int px = x + pad;
+	u32 i = rs;
+	while (i < re) {
 		u32 nx = in_next(in, i);
-		int w = font_width(font, in->b + i, nx - i);
-		if (mx < x + w / 2)
+		int cw = font_width(FONT_UI, in->b + i, nx - i);
+		if (mx < px + cw / 2)
 			break;
-		x += w;
+		px += cw;
 		i = nx;
 	}
-	in->cur = in->anchor = i;
+	clicks = clicks > 3 ? (clicks - 1) % 3 + 1 : clicks;
+	if (clicks == 3) {
+		in->anchor = 0;
+		in->cur = in->n;
+	} else if (clicks == 2) {
+		u32 s0 = i, s1 = i;
+		while (s0 > 0 && is_word_byte((u8)in->b[s0 - 1]))
+			s0--;
+		while (s1 < in->n && is_word_byte((u8)in->b[s1]))
+			s1++;
+		in->anchor = s0;
+		in->cur = s1;
+	} else {
+		in->cur = in->anchor = i;
+	}
+}
+
+void input_click(Input *in, int font, int x0, int mx)
+{
+	(void)font;
+	input_click_ex(in, x0 - PX(6), 0, 100000, 0, mx, 0, 1);
 }
 
 void input_draw(Input *in, int x, int y, int w, int h, const char *ph, bool focused)
 {
-	if (!in->b)
-		input_set(in, "", 0);
-	draw_rect(x, y, w, h, COL(C_INPUT_BG));
-	draw_frame(x, y, w, h, focused ? COL(C_FOCUS_BORDER) : COL(C_INPUT_BORDER));
-	int pad = PX(6);
-	int tw = w - 2 * pad;
-	int ty = y + (h - font_m[FONT_UI].line) / 2;
-	int cx = font_width(FONT_UI, in->b, in->cur);
-	if (cx - in->scroll > tw)
-		in->scroll = cx - tw;
-	if (cx < in->scroll)
-		in->scroll = cx;
-	draw_clip(x + pad, y, tw + PX(1), h);
-	int tx = x + pad - in->scroll;
-	if (!in->n && ph && *ph)
-		draw_text(FONT_UI, x + pad, ty, ph, strlen(ph), COL(C_INPUT_PLACEHOLDER));
-	u32 a = VX_MIN(in->cur, in->anchor), b = VX_MAX(in->cur, in->anchor);
-	if (b > a) {
-		int sx = font_width(FONT_UI, in->b, a), ex = font_width(FONT_UI, in->b, b);
-		draw_rect(tx + sx, ty, ex - sx, font_m[FONT_UI].line, COL(C_SELECTION));
-	}
-	draw_text(FONT_UI, tx, ty, in->b, in->n, COL(C_INPUT_FG));
-	if (focused)
-		draw_rect(tx + cx, ty, PX(1), font_m[FONT_UI].line, COL(C_INPUT_FG));
-	draw_noclip();
-	draw_clip(0, 0, app.w, app.h);
+	(void)h;
+	input_draw_ex(in, x, y, w, 0, ph, focused);
 }
 
 /* ---- shared bits ------------------------------------------------------------- */
@@ -266,6 +374,26 @@ static void toggle_box(int bx, int by, const char *label, bool on, bool underlin
 
 static int ex_list_y(int y) { return y + PX(35) + PX(22); }
 
+/* The selection is scrolled into view only when it changes (or is
+ * revealed): scrolling away from it with the wheel or the scrollbar must
+ * stick. */
+static u32 ex_revealed = FS_NONE;
+static int ex_drag_dy = -1; /* scrollbar drag: grab offset in the slider */
+
+#define EX_SB_W PX(10)
+
+/* Slider of the explorer scrollbar; false when everything fits. */
+static bool ex_slider(int cy, int list_h, int *sy, int *sh)
+{
+	int total = (int)app.nrows * app.row_h;
+	if (total <= list_h || list_h <= 0)
+		return false;
+	*sh = VX_MAX((int)((i64)list_h * list_h / total), PX(20));
+	int maxs = total - list_h;
+	*sy = cy + (int)((i64)app.tree_scroll * (list_h - *sh) / maxs);
+	return true;
+}
+
 void explorer_reveal(u32 d)
 {
 	if (!app.docs.path[d])
@@ -276,7 +404,7 @@ void explorer_reveal(u32 d)
 	u32 n = fs_reveal(&app.tree, rel);
 	if (n != FS_NONE)
 		app.tree_sel = n;
-	/* scroll into view happens in draw */
+	ex_revealed = FS_NONE; /* scroll into view happens in draw */
 }
 
 static void ex_open(u32 node, bool preview)
@@ -308,8 +436,8 @@ void explorer_draw(int x, int y, int w, int h)
 	app.nrows = fs_rows(&app.tree, &app.rows, &app.rows_cap);
 	int rh = app.row_h;
 	int list_h = y + h - cy;
-	/* keep the selection visible */
-	for (u32 r = 0; r < app.nrows; r++)
+	/* bring a new selection into view */
+	for (u32 r = 0; r < app.nrows && app.tree_sel != ex_revealed; r++)
 		if (app.rows[r] == app.tree_sel) {
 			int ry = (int)r * rh;
 			if (ry < app.tree_scroll)
@@ -318,6 +446,7 @@ void explorer_draw(int x, int y, int w, int h)
 				app.tree_scroll = ry + rh - list_h;
 			break;
 		}
+	ex_revealed = app.tree_sel;
 	int maxs = VX_MAX((int)app.nrows * rh - list_h, 0);
 	app.tree_scroll = VX_CLAMP(app.tree_scroll, 0, maxs);
 	draw_clip(x, cy, w, list_h);
@@ -388,6 +517,14 @@ void explorer_draw(int x, int y, int w, int h)
 	draw_noclip();
 	if (app.tree_scroll > 0)
 		draw_rect(x, cy, w, PX(3), (COL(C_SCROLLBAR_SHADOW) & 0xFFFFFF00u) | 0x40u);
+	/* scrollbar: VSCodium shows the slider while the pointer is over the pane */
+	int sy, sh;
+	if (ex_slider(cy, list_h, &sy, &sh) && (hov_section || ex_drag_dy >= 0)) {
+		int sx = x + w - EX_SB_W;
+		bool over = in_rect(app.hover_x, app.hover_y, sx, sy, EX_SB_W, sh);
+		u32 c = ex_drag_dy >= 0 ? COL(C_SCROLL_SLIDER_ACTIVE) : over ? COL(C_SCROLL_SLIDER_HOVER) : COL(C_SCROLL_SLIDER);
+		draw_rect(sx, sy, EX_SB_W, sh, c);
+	}
 }
 
 static u32 row_index(u32 node)
@@ -406,6 +543,34 @@ bool explorer_event(const Event *e, int x, int y, int w, int h)
 		app.tree_scroll -= (int)(e->wy * rh * 3);
 		app.dirty = true;
 		return true;
+	}
+	{
+		/* scrollbar: drag the slider, or click the track to jump there */
+		int list_h = y + h - cy, sy, sh;
+		int maxs = VX_MAX((int)app.nrows * rh - list_h, 0);
+		if (e->type == EV_MUP)
+			ex_drag_dy = -1;
+		if (e->type == EV_MMOVE && ex_drag_dy >= 0 && app.mouse_down && ex_slider(cy, list_h, &sy, &sh)) {
+			int top = e->y - ex_drag_dy - cy;
+			app.tree_scroll = (int)((i64)top * maxs / VX_MAX(list_h - sh, 1));
+			app.tree_scroll = VX_CLAMP(app.tree_scroll, 0, maxs);
+			app.dirty = true;
+			return true;
+		}
+		if (e->type == EV_MDOWN && e->button == 1 && e->x >= x + w - EX_SB_W && e->y >= cy &&
+		    ex_slider(cy, list_h, &sy, &sh)) {
+			if (e->y < sy || e->y >= sy + sh) {
+				/* centre the slider on the click */
+				int top = e->y - sh / 2 - cy;
+				app.tree_scroll = (int)((i64)top * maxs / VX_MAX(list_h - sh, 1));
+				app.tree_scroll = VX_CLAMP(app.tree_scroll, 0, maxs);
+				ex_slider(cy, list_h, &sy, &sh);
+			}
+			ex_drag_dy = e->y - sy;
+			app.drag = 5; /* DRAG_SIDEBAR in ui.c: moves come here even off the pane */
+			app.dirty = true;
+			return true;
+		}
 	}
 	if (e->type == EV_MDOWN) {
 		if (e->y < cy && e->y >= cy - PX(22)) {
@@ -635,9 +800,14 @@ static void search_rows(void)
 
 /* Layout of the top part (inputs) and where the list starts. */
 typedef struct {
-	int find_y, repl_y, inc_y, exc_y, msg_y, list_y;
+	int find_y, repl_y, inc_y, exc_y, msg_y, list_y, dots_y;
+	int find_h, repl_h, inc_h, exc_h; /* boxes grow with wrapped text */
 	int ix, iw;
 } SLayout;
+
+/* Icon strips inside the boxes: Aa ab .* (search), AB (replace). */
+#define RES_FIND PX(70)
+#define RES_REPL PX(26)
 
 static SLayout search_layout(int x, int y, int w)
 {
@@ -646,17 +816,23 @@ static SLayout search_layout(int x, int y, int w)
 	L.iw = w - PX(24) - PX(12);
 	int cy = y + PX(35);
 	L.find_y = cy;
-	cy += PX(26) + PX(4);
+	L.find_h = input_height(&app.search_in, L.iw, RES_FIND);
+	cy += L.find_h + PX(4);
 	L.repl_y = cy;
+	L.repl_h = app.search_show_replace ? input_height(&app.search_repl_in, L.iw, RES_REPL) : 0;
 	if (app.search_show_replace)
-		cy += PX(26) + PX(4);
+		cy += L.repl_h + PX(4);
+	L.dots_y = cy - PX(4);
 	L.inc_y = L.exc_y = cy;
+	L.inc_h = L.exc_h = 0;
 	cy += PX(18); /* "..." row */
 	if (app.search_show_details) {
 		L.inc_y = cy + PX(18);
-		cy = L.inc_y + PX(26) + PX(4);
+		L.inc_h = input_height(&app.search_inc_in, L.iw, 0);
+		cy = L.inc_y + L.inc_h + PX(4);
 		L.exc_y = cy + PX(18);
-		cy = L.exc_y + PX(26) + PX(4);
+		L.exc_h = input_height(&app.search_exc_in, L.iw, 0);
+		cy = L.exc_y + L.exc_h + PX(4);
 	}
 	L.msg_y = cy;
 	L.list_y = cy + PX(24);
@@ -700,20 +876,20 @@ void search_draw(int x, int y, int w, int h)
 		draw_icon(ICON_COLLAPSE, x + w - PX(28), y + PX(10), COL(C_SIDEBAR_FG));
 	}
 	/* replace toggle chevron to the left of the boxes */
-	int th = app.search_show_replace ? PX(56) : PX(26);
+	int th = app.search_show_replace ? L.repl_y + L.repl_h - L.find_y : L.find_h;
 	draw_icon(app.search_show_replace ? ICON_CHEVRON_DOWN : ICON_CHEVRON_RIGHT, x + PX(5), L.find_y + (th - PX(16)) / 2,
 	          COL(C_SIDEBAR_FG));
 	bool sf = app.focus == FOCUS_SEARCH_INPUT;
-	input_draw(&app.search_in, L.ix, L.find_y, L.iw, PX(26), "Search", sf && app.search_box == 0);
+	input_draw_ex(&app.search_in, L.ix, L.find_y, L.iw, RES_FIND, "Search", sf && app.search_box == 0);
 	bool bad = app.search_m.err[0] != 0;
 	if (bad)
-		draw_frame(L.ix, L.find_y, L.iw, PX(26), COL(C_ERROR));
+		draw_frame(L.ix, L.find_y, L.iw, L.find_h, COL(C_ERROR));
 	int bx = L.ix + L.iw - PX(70);
 	toggle_box(bx, L.find_y + PX(3), "Aa", app.search_flags & SEARCH_CASE, false);
 	toggle_box(bx + PX(22), L.find_y + PX(3), "ab", app.search_flags & SEARCH_WORD, true);
 	toggle_box(bx + PX(44), L.find_y + PX(3), ".*", app.search_flags & SEARCH_REGEX, false);
 	if (app.search_show_replace) {
-		input_draw(&app.search_repl_in, L.ix, L.repl_y, L.iw - PX(26), PX(26), "Replace", sf && app.search_box == 1);
+		input_draw_ex(&app.search_repl_in, L.ix, L.repl_y, L.iw, RES_REPL, "Replace", sf && app.search_box == 1);
 		/* replace all button */
 		int rbx = L.ix + L.iw - PX(22);
 		bool on = app.results.n && app.search_repl_in.b;
@@ -721,13 +897,12 @@ void search_draw(int x, int y, int w, int h)
 		          on ? COL(C_SIDEBAR_FG) : COL(C_FG_DIM));
 	}
 	/* "..." toggle for include / exclude */
-	draw_text(FONT_UI_BOLD, x + w - PX(30), L.inc_y - (app.search_show_details ? PX(36) : 0) - PX(4) +
-	          (app.search_show_details ? 0 : 0), "\xE2\x80\xA6", 3, COL(C_SIDEBAR_FG));
+	draw_text(FONT_UI_BOLD, x + w - PX(30), L.dots_y, "\xE2\x80\xA6", 3, COL(C_SIDEBAR_FG));
 	if (app.search_show_details) {
 		draw_text(FONT_SMALL, L.ix, L.inc_y - PX(16), "files to include", 16, COL(C_SIDEBAR_FG));
-		input_draw(&app.search_inc_in, L.ix, L.inc_y, L.iw, PX(26), "e.g. *.c, src/**/include", sf && app.search_box == 2);
+		input_draw_ex(&app.search_inc_in, L.ix, L.inc_y, L.iw, 0, "e.g. *.c, src/**/include", sf && app.search_box == 2);
 		draw_text(FONT_SMALL, L.ix, L.exc_y - PX(16), "files to exclude", 16, COL(C_SIDEBAR_FG));
-		input_draw(&app.search_exc_in, L.ix, L.exc_y, L.iw, PX(26), "e.g. *.o, build/**", sf && app.search_box == 3);
+		input_draw_ex(&app.search_exc_in, L.ix, L.exc_y, L.iw, 0, "e.g. *.o, build/**", sf && app.search_box == 3);
 	}
 	const SearchResults *r = &app.results;
 	char msg[200];
@@ -1049,19 +1224,23 @@ bool search_event(const Event *e, int x, int y, int w, int h)
 			}
 			return true;
 		}
-		if (e->x < L.ix && e->y >= L.find_y && e->y < L.find_y + (app.search_show_replace ? PX(56) : PX(26))) {
+		if (e->x < L.ix && e->y >= L.find_y &&
+		    e->y < (app.search_show_replace ? L.repl_y + L.repl_h : L.find_y + L.find_h)) {
 			app.search_show_replace = !app.search_show_replace;
 			return true;
 		}
 		struct {
-			int y, box;
-		} boxes[4] = {{L.find_y, 0}, {L.repl_y, 1}, {L.inc_y, 2}, {L.exc_y, 3}};
+			int y, h, box, res;
+		} boxes[4] = {{L.find_y, L.find_h, 0, RES_FIND},
+		              {L.repl_y, L.repl_h, 1, RES_REPL},
+		              {L.inc_y, L.inc_h, 2, 0},
+		              {L.exc_y, L.exc_h, 3, 0}};
 		for (int k = 0; k < 4; k++) {
 			if (k == 1 && !app.search_show_replace)
 				continue;
 			if (k >= 2 && !app.search_show_details)
 				continue;
-			if (e->y < boxes[k].y || e->y >= boxes[k].y + PX(26) || e->x < L.ix)
+			if (e->y < boxes[k].y || e->y >= boxes[k].y + boxes[k].h || e->x < L.ix)
 				continue;
 			if (k == 0) {
 				int bx = L.ix + L.iw - PX(70);
@@ -1073,17 +1252,17 @@ bool search_event(const Event *e, int x, int y, int w, int h)
 					return true;
 				}
 			}
-			if (k == 1 && e->x >= L.ix + L.iw - PX(24)) {
+			if (k == 1 && e->x >= L.ix + L.iw - RES_REPL) {
 				search_replace(UINT32_MAX, UINT32_MAX);
 				return true;
 			}
 			app.search_box = k;
 			app.focus = FOCUS_SEARCH_INPUT;
-			input_click(search_box_input(k), FONT_UI, L.ix + PX(6), e->x);
+			input_click_ex(search_box_input(k), L.ix, boxes[k].y, L.iw, boxes[k].res, e->x, e->y, e->clicks);
 			return true;
 		}
 		/* "..." */
-		int dots_y = L.inc_y - (app.search_show_details ? PX(36) : 0) - PX(4);
+		int dots_y = L.dots_y;
 		if (e->x >= x + w - PX(34) && e->y >= dots_y && e->y < dots_y + PX(18)) {
 			app.search_show_details = !app.search_show_details;
 			search_changed();
@@ -1305,7 +1484,9 @@ static u32 sec_count(int sec)
 	return cnt;
 }
 
-static int scm_list_y(int y) { return y + PX(35) + PX(8) + PX(26) + PX(8) + PX(28) + PX(8); }
+static int commit_h(int w) { return input_height(&app.commit_in, w - PX(24), 0); }
+static int scm_side_w;
+static int scm_list_y(int y) { return y + PX(35) + PX(8) + commit_h(scm_side_w) + PX(8) + PX(28) + PX(8); }
 
 static char status_letter(u16 f, bool staged, u32 *color)
 {
@@ -1371,8 +1552,8 @@ void scm_draw(int x, int y, int w, int h)
 	cy += PX(8);
 	char ph[160];
 	snprintf(ph, sizeof ph, "Message (Ctrl+Enter to commit on '%s')", git_branch(app.git));
-	input_draw(&app.commit_in, x + PX(12), cy, w - PX(24), PX(26), ph, app.focus == FOCUS_SCM_INPUT);
-	cy += PX(26) + PX(8);
+	scm_side_w = w;
+	cy += input_draw_ex(&app.commit_in, x + PX(12), cy, w - PX(24), 0, ph, app.focus == FOCUS_SCM_INPUT) + PX(8);
 	/* commit button */
 	int bx = x + PX(12), bw = w - PX(24), bh = PX(28);
 	bool hov = in_rect(app.hover_x, app.hover_y, bx, cy, bw, bh);
@@ -1476,7 +1657,8 @@ bool scm_event(const Event *e, int x, int y, int w, int h)
 		return true;
 	}
 	int iy = y + PX(35) + PX(8);
-	int by = iy + PX(26) + PX(8);
+	scm_side_w = w;
+	int by = iy + commit_h(w) + PX(8);
 	int cy = scm_list_y(y);
 	int rh = app.row_h;
 	(void)h;
@@ -1485,9 +1667,9 @@ bool scm_event(const Event *e, int x, int y, int w, int h)
 		return true;
 	}
 	if (e->type == EV_MDOWN) {
-		if (e->y >= iy && e->y < iy + PX(26)) {
+		if (e->y >= iy && e->y < iy + commit_h(w)) {
 			app.focus = FOCUS_SCM_INPUT;
-			input_click(&app.commit_in, FONT_UI, x + PX(18), e->x);
+			input_click_ex(&app.commit_in, x + PX(12), iy, w - PX(24), 0, e->x, e->y, e->clicks);
 			return true;
 		}
 		if (e->y >= by && e->y < by + PX(28)) {
@@ -1830,14 +2012,112 @@ bool sidebar_over_input(int x, int y, int w, int mx, int my)
 		SLayout L = search_layout(x, y, w);
 		int ys[4] = {L.find_y, app.search_show_replace ? L.repl_y : -1000, app.search_show_details ? L.inc_y : -1000,
 		             app.search_show_details ? L.exc_y : -1000};
+		int hs[4] = {L.find_h, L.repl_h, L.inc_h, L.exc_h};
 		for (int k = 0; k < 4; k++)
-			if (my >= ys[k] && my < ys[k] + PX(26) && mx >= L.ix && mx < L.ix + L.iw - (k == 0 ? PX(70) : 0))
+			if (my >= ys[k] && my < ys[k] + hs[k] && mx >= L.ix && mx < L.ix + L.iw - (k == 0 ? RES_FIND : 0))
 				return true;
 		return false;
 	}
 	if (app.side_view == SIDE_SCM && app.git) {
 		int iy = y + PX(35) + PX(8);
-		return my >= iy && my < iy + PX(26) && mx >= x + PX(12) && mx < x + w - PX(12);
+		return my >= iy && my < iy + commit_h(w) && mx >= x + PX(12) && mx < x + w - PX(12);
 	}
 	return false;
+}
+
+/* ---- settings ------------------------------------------------------------------ */
+
+/* The few things that can be changed (the UI is not customisable as such):
+ * one row each, a square check box or a value that cycles on click. */
+enum { SET_THEME, SET_BLAME, SET_MINIMAP, SET_LSP, SET_COUNT };
+
+static void settings_row(int i, char *label, size_t lc, char *value, size_t vc, int *checked)
+{
+	*checked = -1;
+	value[0] = 0;
+	switch (i) {
+	case SET_THEME:
+		snprintf(label, lc, "Color Theme");
+		snprintf(value, vc, "%s", themes[app.theme].name);
+		break;
+	case SET_BLAME:
+		snprintf(label, lc, "Git blame on the cursor line");
+		*checked = app.blame_on;
+		break;
+	case SET_MINIMAP:
+		snprintf(label, lc, "Minimap");
+		*checked = app.minimap_on;
+		break;
+	case SET_LSP:
+		snprintf(label, lc, "Language servers (clangd, rust-analyzer)");
+		{
+			bool any = false, ready = true;
+			for (int sv = 0; sv < LSV_COUNT; sv++)
+				if (app.lsps[sv]) {
+					any = true;
+					ready &= app.lsps_ready[sv];
+				}
+			snprintf(value, vc, "%s", any ? (ready ? "running - restart" : "starting") : "stopped - start");
+		}
+		break;
+	}
+}
+
+static int settings_row_h(void) { return PX(44); }
+
+void settings_draw(int x, int y, int w, int h)
+{
+	(void)h;
+	int cy = view_title(x, y, w, "SETTINGS");
+	for (int i = 0; i < SET_COUNT; i++) {
+		char label[128], value[128];
+		int checked;
+		settings_row(i, label, sizeof label, value, sizeof value, &checked);
+		int ry = cy + i * settings_row_h();
+		bool hover = in_rect(app.hover_x, app.hover_y, x, ry, w, settings_row_h());
+		if (hover)
+			draw_rect(x, ry, w, settings_row_h(), COL(C_LIST_HOVER_BG));
+		int tx = x + PX(14);
+		if (checked >= 0) {
+			int bx = tx, by = ry + (settings_row_h() - PX(14)) / 2;
+			draw_frame(bx, by, PX(14), PX(14), COL(C_INPUT_BORDER));
+			if (checked)
+				draw_icon(ICON_CHECK, bx - PX(1), by - PX(1), COL(C_FG));
+			draw_text_fit(FONT_UI, tx + PX(22), ry + (settings_row_h() - font_m[FONT_UI].line) / 2, label,
+			              strlen(label), w - PX(44), COL(C_SIDEBAR_FG));
+		} else {
+			draw_text_fit(FONT_UI_BOLD, tx, ry + PX(4), label, strlen(label), w - PX(24), COL(C_SIDEBAR_FG));
+			draw_text_fit(FONT_UI, tx, ry + PX(4) + font_m[FONT_UI].line, value, strlen(value), w - PX(24),
+			              COL(C_LINK));
+		}
+	}
+}
+
+bool settings_event(const Event *e, int x, int y, int w, int h)
+{
+	(void)x;
+	(void)w;
+	(void)h;
+	if (e->type != EV_MDOWN)
+		return false;
+	int cy = y + PX(35);
+	if (e->y < cy)
+		return true;
+	int i = (e->y - cy) / settings_row_h();
+	switch (i) {
+	case SET_THEME:
+		run_command(CMD_TOGGLE_THEME);
+		break;
+	case SET_BLAME:
+		run_command(CMD_GIT_TOGGLE_BLAME);
+		break;
+	case SET_MINIMAP:
+		app.minimap_on = !app.minimap_on;
+		break;
+	case SET_LSP:
+		run_command(CMD_RESTART_LSP);
+		break;
+	}
+	app.dirty = true;
+	return true;
 }

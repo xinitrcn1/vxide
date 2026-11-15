@@ -3,7 +3,7 @@
 A project-based code editor in C11, built with BSD make, whose whole UI is
 drawn with Vulkan. Its look and its keyboard shortcuts follow VSCodium
 (Dark Modern / Light Modern themes, Dark+ / Light+ syntax colours). It
-talks to clangd over LSP and to git through libgit2.
+talks to clangd and rust-analyzer over LSP and to git through libgit2.
 
 ```
 make            # build/vxide
@@ -20,14 +20,15 @@ also skip `node_modules`, `bower_components` and git-ignored paths.
 
 FreeBSD 15 (or Linux) with: a Vulkan 1.1 driver, `vulkan-loader`/headers,
 `sdl3` (window and input only), `freetype2` (glyph rasters), `libgit2`,
-`glslangValidator` (shaders are compiled at build time), and clangd in
-`PATH` for language features. Fonts: Noto Sans for the UI and
+`glslangValidator` (shaders are compiled at build time), `capstone`
+(disassembly), and clangd / rust-analyzer in `PATH` for language features. Fonts: Noto Sans for the UI and
 DejaVu Sans Mono for code, with DejaVu Sans as the fallback.
 
 ## What it does
 
-- **Workbench**: activity bar, a side bar (Explorer, Search, Source
-  Control), up to three editor groups with tabs and breadcrumbs, a panel
+- **Workbench**: a row of top-level tabs (Project, Git, Search, Settings;
+  clicking the active one hides the side bar) over a side bar, up to three
+  editor groups with tabs that wrap into rows and breadcrumbs, a panel
   (Problems, Output) and a status bar. The side bar and panel can be
   resized by dragging their edges. Everything is square: solid rects, 1 px
   borders, glyphs, and icons drawn from distance fields at start-up.
@@ -36,7 +37,8 @@ DejaVu Sans Mono for code, with DejaVu Sans as the fallback.
   bracket matching, indent guides, current-line box, selection-occurrence
   highlight, minimap, a scrollbar with an overview ruler (git changes,
   errors, cursor), and preview tabs.
-- **Highlighting**: hand-written lexers for C23, x86 assembly (AT&T/GAS and
+- **Highlighting**: hand-written lexers for C23, C++26 (`.h` files with
+  clear C++ markers too), Rust, Java, Kotlin, TOML, x86 assembly (AT&T/GAS and
   Intel/NASM, detected from the file head), Lisp (CL, Scheme, Elisp,
   Clojure), shell (sh/bash/zsh, heredocs), Markdown (with fenced code
   highlighted in its own language), troff/man/mdoc and Perl (POD, `s{}{}`,
@@ -48,10 +50,23 @@ DejaVu Sans Mono for code, with DejaVu Sans as the fallback.
   scopes and the Dark+/Light+ rules. When clangd is running, its semantic
   tokens are overlaid the way the clangd extension does it (readonly
   variables as constants, macros, parameters, ...).
-- **LSP (clangd)**: diagnostics (squiggles, Problems, explorer and tab
+- **LSP**: clangd for C and C++, rust-analyzer for Rust (started with the
+  first `.rs` file). Diagnostics (squiggles, Problems, explorer and tab
   colours, F8), completion, hover, go to definition (F12 / Ctrl+click,
   with back/forward), semantic tokens. Positions use UTF-8 (UTF-16 is the
-  fallback). Set `VXIDE_CLANGD=clangd23` to use another server.
+  fallback). rust-analyzer never builds the target: check on save, build
+  scripts, proc-macro expansion and cache priming are off, so it only
+  reads sources and `cargo metadata` (a build would churn a slow disk).
+  `VXIDE_CLANGD` / `VXIDE_RUST_ANALYZER` pick other server binaries.
+- **Binary files** (read-only): a hex editor like HxD (offset, hex and
+  text columns with a shared selection, Tab switches column, a data
+  inspector for the bytes at the cursor in little or big endian, named
+  coloured tags from the context menu, Ctrl+G to an offset, Ctrl+C copies
+  hex). Executables (ELF, PE, Mach-O) get a subtab per section that has
+  bytes in the file, plus "File": code sections are disassembled with
+  capstone on a background thread (labels from symbols, branch targets
+  annotated; Enter or double-click follows a branch), data sections open
+  in the hex editor.
 - **Search**: the editor find widget and the Search view share one
   matcher: literal, case, whole word, and regex (Alt+C / Alt+W / Alt+R). The
   Search view has replace with a struck-out/inserted preview, Replace All
@@ -179,7 +194,8 @@ DejaVu Sans Mono for code, with DejaVu Sans as the fallback.
 | Ctrl+Space, Ctrl+K Ctrl+I | Suggest, hover |
 | F12, Ctrl+click, Ctrl+Alt+-, Ctrl+Shift+- | Definition, back, forward |
 | F8, Shift+F8 | Next/previous problem |
-| Ctrl+K Ctrl+T | Toggle dark/light theme (also the gear in the activity bar) |
+| Ctrl+K Ctrl+T | Toggle dark/light theme (also in Settings) |
+| Ctrl+, | Settings (theme, blame, minimap, language servers) |
 | Ctrl+Shift+P | Command palette (delete the `>` to search files); includes Transform to Upper/Lower/Title/Snake/Kebab Case |
 | Insert | Toggle overtype |
 | Ctrl+K Ctrl+Alt+S, Ctrl+K Ctrl+N, Ctrl+K Ctrl+R | Stage / unstage / revert selected ranges |
@@ -213,24 +229,25 @@ one quad buffer.
 | `src/fstree.c`, `src/search.c` | Explorer tree, file walk, fuzzy match, text search |
 | `src/ui.c` | Layout, input routing, keybindings, commands, tabs, status bar, quick input |
 | `src/editor.c` | Editor drawing and editing, find, completion, hover |
-| `src/panes.c` | Explorer, Search, Source Control, Problems, Output, input box |
+| `src/binfile.c`, `src/binview.c` | ELF/PE/Mach-O sections and symbols, capstone disassembly, data inspector; the hex editor and section subtabs |
+| `src/panes.c` | Explorer, Search, Source Control, Settings, Problems, Output, wrapping input box |
 
 ## Testing without a display
 
 `vxide --headless WxH --script FILE DIR` renders into an offscreen Vulkan
 image and runs a script of `open`, `key ctrl+shift+p`, `type text\n`,
-`click X Y`, `move`, `wheel`, `wait MS`, `waitlsp`, `expect text|line|file|problems ...`,
+`click X Y`, `dclick`, `rclick`, `drag X Y X2 Y2`, `move`, `wheel DY X Y`, `wait MS`, `waitlsp`, `expect text|line|file|problems ...`,
 `print` and `shot out.png`. `tests/t_ui.sh` uses it. To run the real
 windowed path without a display, set `SDL_VIDEO_DRIVER=offscreen` (NVIDIA
 supplies `VK_EXT_headless_surface`).
 
-Environment variables: `VXIDE_NO_LSP`, `VXIDE_CLANGD`, `VXIDE_THEME=light`,
+Environment variables: `VXIDE_NO_LSP`, `VXIDE_CLANGD`, `VXIDE_RUST_ANALYZER`, `VXIDE_THEME=light`,
 `VXIDE_GPU=<name substring>`, `VXIDE_VALIDATE` (Khronos validation layer),
 `VXIDE_LOG` (copy the Output log to stderr), `VXIDE_NO_BLAME`,
 `VXIDE_BLAME_LIBGIT2` (force the libgit2 blame).
 
 ## Not done yet
 
-No integrated terminal, folding, word wrap, rename or code actions, diff
-editor, or settings UI. There is no hunk staging, push/pull or stash. The
+No integrated terminal, folding, word wrap, rename or code actions. There
+is no push/pull. Binary files cannot be edited yet. The
 UI scale is a whole number (1x or 2x), and IME composition is untested.

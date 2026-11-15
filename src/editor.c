@@ -42,7 +42,7 @@ int ed_gutter_w(View *v)
 	return PX(18) + nd * app.char_w + PX(26);
 }
 
-static int minimap_w(int w) { return w > PX(400) ? VX_MIN(PX(100), w / 8) : 0; }
+static int minimap_w(int w) { return app.minimap_on && w > PX(400) ? VX_MIN(PX(100), w / 8) : 0; }
 #define SCROLL_W PX(14)
 
 static int glyph_adv(u32 cp)
@@ -503,6 +503,8 @@ static bool word_before(Text *t, u32 off) { return off > 0 && is_word_byte(text_
 
 void ed_text(View *v, const char *s, size_t n)
 {
+	if (app.docs.bin[v->doc] && v->diff_left == UINT32_MAX)
+		return;
 	Text *t = T(v);
 	box.on = false;
 	if (readonly_doc(v))
@@ -1625,6 +1627,8 @@ bool ed_command(View *v, int cmd)
 
 bool ed_key(View *v, const Event *e)
 {
+	if (app.docs.bin[v->doc] && v->diff_left == UINT32_MAX)
+		return binview_key(v, e);
 	int mods = e->mods & (MOD_CTRL | MOD_SHIFT | MOD_ALT);
 	u32 k = e->key;
 	if ((k == SDLK_BACKSPACE || k == SDLK_DELETE || k == SDLK_RETURN || k == SDLK_KP_ENTER || k == SDLK_TAB) &&
@@ -1913,7 +1917,7 @@ void ed_replace_all(View *v)
 
 /* ---- LSP features ----------------------------------------------------------- */
 
-static bool lsp_doc(View *v) { return app.lsp && app.lsp_ready && app.docs.lsp_open[v->doc]; }
+static bool lsp_doc(View *v) { return doc_lsp(v->doc) != NULL; }
 
 static void flush_change(View *v)
 {
@@ -1921,7 +1925,7 @@ static void flush_change(View *v)
 	u32 d = v->doc;
 	if (D->lsp_sent[d] != D->text[d].version) {
 		D->lsp_ver[d]++;
-		lsp_did_change(app.lsp, D->path[d], D->lsp_ver[d], text_flat(&D->text[d]), D->text[d].len);
+		lsp_did_change(doc_lsp(d), D->path[d], D->lsp_ver[d], text_flat(&D->text[d]), D->text[d].len);
 		D->lsp_sent[d] = D->text[d].version;
 	}
 }
@@ -1963,7 +1967,7 @@ void ed_completion_trigger(View *v, bool explicit_)
 	app.compl_doc = v->doc;
 	u32 line, col;
 	pos_of(t, h, &line, &col);
-	app.compl_req = lsp_completion(app.lsp, app.docs.path[v->doc], line, col);
+	app.compl_req = lsp_completion(doc_lsp(v->doc), app.docs.path[v->doc], line, col);
 }
 
 void ed_take_completion(const LspEvent *ev)
@@ -2077,7 +2081,7 @@ void ed_hover_request(View *v)
 	flush_change(v);
 	u32 line, col;
 	pos_of(T(v), off, &line, &col);
-	app.hover_req = lsp_hover(app.lsp, app.docs.path[v->doc], line, col);
+	app.hover_req = lsp_hover(doc_lsp(v->doc), app.docs.path[v->doc], line, col);
 }
 
 void ed_take_hover(const LspEvent *ev)
@@ -2099,7 +2103,7 @@ void ed_goto_definition(View *v)
 	flush_change(v);
 	u32 line, col;
 	pos_of(T(v), v->head[0], &line, &col);
-	app.def_req = lsp_definition(app.lsp, app.docs.path[v->doc], line, col);
+	app.def_req = lsp_definition(doc_lsp(v->doc), app.docs.path[v->doc], line, col);
 }
 
 void ed_take_definition(const LspEvent *ev)
@@ -2164,6 +2168,12 @@ void ed_mouse(View *v, const Event *e, int x, int y, int w, int h)
 {
 	if (v->diff_left != UINT32_MAX) {
 		diff_mouse(v, e, x, y, w, h);
+		return;
+	}
+	if (app.docs.bin[v->doc]) {
+		if (e->type == EV_MDOWN && e->button == 1)
+			app.drag = 3; /* DRAG_EDITOR in ui.c: drag-select */
+		binview_mouse(v, e, x, y, w, h);
 		return;
 	}
 	Text *t = T(v);
@@ -2377,7 +2387,7 @@ void ed_mouse(View *v, const Event *e, int x, int y, int w, int h)
 		app.hover_open = false;
 		app.hover_pending_off = (i32)off;
 		app.hover_doc = v->doc;
-		app.hover_due = vx_now_ns() + 300000000ull;
+		app.hover_due = vx_now_ns() + 150000000ull;
 		return;
 	}
 	return;
@@ -2491,10 +2501,16 @@ static int line_indent_cols(Text *t, u32 l, bool *blank)
 /* ---- find widget ------------------------------------------------------------ */
 
 
+static int fw_row1 = 33, fw_row2; /* set by fw_layout */
+
 static void fw_layout(int x, int y, int w, int *fx, int *fy, int *fwid, int *fh, int *ix, int *iw)
 {
 	*fwid = VX_MIN(PX(440), w - PX(40));
-	*fh = app.find_replace ? PX(66) : PX(33);
+	/* rows grow with wrapped text (the Aa ab .* strip stays on the right) */
+	int iw0 = *fwid - PX(24) - PX(140);
+	fw_row1 = VX_MAX(PX(33), input_height(&app.find_in, iw0, PX(70)) + PX(8));
+	fw_row2 = app.find_replace ? VX_MAX(PX(33), input_height(&app.repl_in, iw0, 0) + PX(8)) : 0;
+	*fh = fw_row1 + fw_row2;
 	*fx = x + w - *fwid - SCROLL_W - PX(14);
 	*fy = y;
 	*ix = *fx + PX(24);
@@ -2528,9 +2544,9 @@ static void find_widget_draw(int x, int y, int w)
 	draw_icon(app.find_replace ? ICON_CHEVRON_DOWN : ICON_CHEVRON_RIGHT, fx + PX(5), fy + PX(8), COL(C_FG));
 	bool find_focus = app.focus == FOCUS_FIND && !(app.find_flags & 0x100);
 	bool bad = app.find_m.err[0] != 0;
-	input_draw(&app.find_in, ix, fy + PX(4), iw, PX(25), "Find", find_focus);
+	input_draw_ex(&app.find_in, ix, fy + PX(4), iw, PX(70), "Find", find_focus);
 	if (bad)
-		draw_frame(ix, fy + PX(4), iw, PX(25), COL(C_ERROR));
+		draw_frame(ix, fy + PX(4), iw, fw_row1 - PX(8), COL(C_ERROR));
 	/* toggles inside the box: Aa, ab, .* */
 	int bx = ix + iw - PX(68);
 	toggle_box(bx, fy + PX(7), "Aa", app.find_flags & SEARCH_CASE, false);
@@ -2550,10 +2566,10 @@ static void find_widget_draw(int x, int y, int w)
 	draw_icon(ICON_CLOSE, fx + fwid - PX(24), fy + PX(8), COL(C_FG));
 	if (app.find_replace) {
 		bool rf = app.focus == FOCUS_FIND && (app.find_flags & 0x100);
-		input_draw(&app.repl_in, ix, fy + PX(36), iw, PX(25), "Replace", rf);
+		input_draw_ex(&app.repl_in, ix, fy + fw_row1 + PX(3), iw, 0, "Replace", rf);
 		/* replace / replace all buttons */
 		const char *b1 = "\xE2\x86\xB5", *b2 = "All";
-		int by = fy + PX(39);
+		int by = fy + fw_row1 + PX(6);
 		draw_frame(ix + iw + PX(6), by, PX(24), PX(19), COL(C_WIDGET_BORDER));
 		draw_text(FONT_UI, ix + iw + PX(12), by + (PX(19) - font_m[FONT_UI].line) / 2, b1, strlen(b1), COL(C_FG));
 		draw_frame(ix + iw + PX(34), by, PX(30), PX(19), COL(C_WIDGET_BORDER));
@@ -2578,7 +2594,7 @@ static bool find_widget_click(View *v, const Event *e)
 		return false;
 	int ix = fw_x + PX(24), iw = fw_w - PX(24) - PX(140);
 	int mx = e->x, my = e->y - fw_y;
-	bool row2 = my >= PX(33);
+	bool row2 = my >= fw_row1;
 	if (mx < ix) {
 		app.find_replace = !app.find_replace;
 		return true;
@@ -2595,7 +2611,7 @@ static bool find_widget_click(View *v, const Event *e)
 		if (mx < ix + iw) {
 			app.focus = FOCUS_FIND;
 			app.find_flags &= ~0x100;
-			input_click(&app.find_in, FONT_UI, ix + PX(6), mx);
+			input_click_ex(&app.find_in, ix, fw_y + PX(4), iw, PX(70), mx, e->y, e->clicks);
 			return true;
 		}
 		if (mx >= fw_x + fw_w - PX(70) && mx < fw_x + fw_w - PX(50))
@@ -2611,7 +2627,7 @@ static bool find_widget_click(View *v, const Event *e)
 	if (mx < ix + iw) {
 		app.focus = FOCUS_FIND;
 		app.find_flags |= 0x100;
-		input_click(&app.repl_in, FONT_UI, ix + PX(6), mx);
+		input_click_ex(&app.repl_in, ix, fw_y + fw_row1 + PX(3), iw, 0, mx, e->y, e->clicks);
 	} else if (mx < ix + iw + PX(32)) {
 		ed_replace_one(v);
 	} else if (mx < ix + iw + PX(66)) {
@@ -2624,6 +2640,10 @@ void ed_draw(Group *g, View *v, int x, int y, int w, int h, bool focused)
 {
 	if (v->diff_left != UINT32_MAX) {
 		diff_draw(g, v, x, y, w, h, focused);
+		return;
+	}
+	if (app.docs.bin[v->doc]) {
+		binview_draw(v, x, y, w, h, focused);
 		return;
 	}
 	if (v->doc == blame_rect_doc)
@@ -3047,7 +3067,7 @@ void ed_draw(Group *g, View *v, int x, int y, int w, int h, bool focused)
 static bool cursor_screen(View *v, int *cx, int *cy)
 {
 	Group *g = &app.groups[app.active_group];
-	int x = g->x, y = g->y + app.tabs_h + app.crumbs_h;
+	int x = g->x, y = g->y + group_head_h(g);
 	Text *t = T(v);
 	u32 l = text_line_of(t, v->head[0]);
 	i64 ly = (i64)l * app.line_h - v->scroll_y;

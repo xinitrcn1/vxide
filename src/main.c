@@ -301,7 +301,7 @@ static int run_script(const char *path)
 			u64 end = vx_now_ns() + (u64)(*arg ? atoi(arg) : 20000) * 1000000ull;
 			while (vx_now_ns() < end) {
 				ui_tick();
-				if (app.lsp_ready && problems_count(0) + app.docs.sn[0] > 0)
+				if ((app.lsps_ready[LSV_CLANGD] || app.lsps_ready[LSV_RUST]) && problems_count(0) + app.docs.sn[0] > 0)
 					break;
 				sleep_ms(10);
 			}
@@ -419,7 +419,8 @@ int main(int argc, char **argv)
 		const char *base = strrchr(root, '/');
 		snprintf(title, sizeof title, "%s - vxide", base && base[1] ? base + 1 : root);
 		win = SDL_CreateWindow(title, 1280, 800,
-		                       SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+		                       SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY |
+		                           SDL_WINDOW_MAXIMIZED);
 		if (!win) {
 			fprintf(stderr, "vxide: SDL_CreateWindow: %s\n", SDL_GetError());
 			return 1;

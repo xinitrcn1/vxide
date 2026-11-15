@@ -10,6 +10,7 @@ static u8 icon_px[ICON_COUNT];
 
 static float cov[32 * 32];
 static int S; /* canvas size */
+static float G = 1.0f; /* coordinate scale: the 24 px art drawn at other sizes */
 
 static float seg_dist(float px, float py, float ax, float ay, float bx, float by)
 {
@@ -34,6 +35,10 @@ static void put(int x, int y, float d)
 /* Line of width w between points (pixel-centre coordinates). */
 static void line(float ax, float ay, float bx, float by, float w)
 {
+	ax *= G;
+	ay *= G;
+	bx *= G;
+	by *= G;
 	for (int y = 0; y < S; y++)
 		for (int x = 0; x < S; x++)
 			put(x, y, seg_dist(x + 0.5f, y + 0.5f, ax, ay, bx, by) - w * 0.5f);
@@ -41,6 +46,9 @@ static void line(float ax, float ay, float bx, float by, float w)
 
 static void ring(float cx, float cy, float r, float w)
 {
+	cx *= G;
+	cy *= G;
+	r *= G;
 	for (int y = 0; y < S; y++)
 		for (int x = 0; x < S; x++) {
 			float dx = x + 0.5f - cx, dy = y + 0.5f - cy;
@@ -50,6 +58,9 @@ static void ring(float cx, float cy, float r, float w)
 
 static void disc(float cx, float cy, float r)
 {
+	cx *= G;
+	cy *= G;
+	r *= G;
 	for (int y = 0; y < S; y++)
 		for (int x = 0; x < S; x++) {
 			float dx = x + 0.5f - cx, dy = y + 0.5f - cy;
@@ -95,14 +106,11 @@ static void begin(int size)
 	memset(cov, 0, sizeof cov);
 }
 
-void icons_init(void)
+static void art_files(float W)
 {
 	const float PI = 3.14159265f;
-	const float W = 1.5f; /* stroke for 24 px icons */
-	const float w = 1.0f; /* stroke for 16 px icons */
-
-	/* Explorer: two pages, the front one with a folded corner. */
-	begin(24);
+	(void)PI;
+	begin((int)(24.0f * G + 0.5f));
 	line(8.5f, 3.5f, 15.5f, 3.5f, W);
 	line(15.5f, 3.5f, 19.5f, 7.5f, W);
 	line(19.5f, 7.5f, 19.5f, 17.5f, W);
@@ -112,33 +120,63 @@ void icons_init(void)
 	line(15.5f, 7.5f, 19.5f, 7.5f, W);
 	line(5.5f, 7.5f, 5.5f, 20.5f, W);
 	line(5.5f, 20.5f, 15.5f, 20.5f, W);
-	store(ICON_FILES);
+}
 
-	/* Search: lens and handle, handle to the lower left like codicons. */
-	begin(24);
+static void art_search(float W)
+{
+	const float PI = 3.14159265f;
+	(void)PI;
+	begin((int)(24.0f * G + 0.5f));
 	ring(14.0f, 10.0f, 5.5f, W);
 	line(10.0f, 14.0f, 4.5f, 19.5f, 2.0f);
-	store(ICON_SEARCH);
+}
 
-	/* Source control: three nodes and a branch. */
-	begin(24);
+static void art_scm(float W)
+{
+	const float PI = 3.14159265f;
+	(void)PI;
+	begin((int)(24.0f * G + 0.5f));
 	ring(7.5f, 5.5f, 2.2f, W);
 	ring(7.5f, 18.5f, 2.2f, W);
 	ring(16.5f, 8.5f, 2.2f, W);
 	line(7.5f, 7.8f, 7.5f, 16.2f, W);
 	arc(11.0f, 13.5f, 5.5f, -0.05f * PI, 0.55f * PI, W);
 	line(16.5f, 10.8f, 16.5f, 13.0f, W);
-	store(ICON_SCM);
+}
 
-	/* Gear: ring with eight teeth. */
-	begin(24);
+static void art_gear(float W)
+{
+	const float PI = 3.14159265f;
+	(void)PI;
+	begin((int)(24.0f * G + 0.5f));
 	ring(12, 12, 5.5f, W);
 	ring(12, 12, 2.0f, W);
 	for (int i = 0; i < 8; i++) {
 		float a = i * PI / 4;
 		line(12 + 5.5f * cosf(a), 12 + 5.5f * sinf(a), 12 + 8.5f * cosf(a), 12 + 8.5f * sinf(a), 2.4f);
 	}
-	store(ICON_GEAR);
+}
+
+void icons_init(void)
+{
+	const float PI = 3.14159265f;
+	const float w = 1.0f; /* stroke for 16 px icons */
+
+	/* the activity icons at 24 px, and at 16 px for the top-level tabs */
+	for (int pass = 0; pass < 2; pass++) {
+		int sz = pass ? 16 : 24;
+		G = (float)sz / 24.0f;
+		float W = pass ? 1.6f : 1.5f; /* strokes in 24 px units */
+		art_files(W);
+		store(pass ? ICON_FILES_S : ICON_FILES);
+		art_search(W);
+		store(pass ? ICON_SEARCH_S : ICON_SEARCH);
+		art_scm(W);
+		store(pass ? ICON_SCM_S : ICON_SCM);
+		art_gear(W);
+		store(pass ? ICON_GEAR_S : ICON_GEAR);
+	}
+	G = 1.0f;
 
 	begin(16);
 	line(6.0f, 4.0f, 10.0f, 8.0f, w + 0.2f);

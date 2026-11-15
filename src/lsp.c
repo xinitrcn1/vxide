@@ -28,6 +28,7 @@ struct Lsp {
 	bool utf8;
 	bool stopping;
 	char *root_uri;
+	char *settings; /* initializationOptions / workspace/configuration reply (JSON), or NULL */
 
 	JBuf out; /* framed bytes waiting to be written */
 	u32 out_off;
@@ -365,9 +366,14 @@ static void msg_begin_notify(Lsp *l, const char *method)
 	jb_raw(&l->msg, ",\"params\":");
 }
 
+/* Request ids are unique across every server, so a reply's id says which
+ * request it answers whichever server it came from. */
+static i32 g_next_id = 1;
+
 static i32 msg_begin_request(Lsp *l, const char *method, u8 kind, const char *path)
 {
-	i32 id = l->next_id++;
+	i32 id = g_next_id++;
+	l->next_id = g_next_id;
 	if (l->rq_n == l->rq_cap) {
 		u32 c = l->rq_cap ? l->rq_cap * 2 : 16;
 		l->rq_id = vx_realloc(l->rq_id, c * sizeof(i32));
@@ -423,7 +429,13 @@ static void send_initialize(Lsp *l, const char *root)
 	jb_raw(m, ",\"name\":");
 	const char *base = strrchr(root, '/');
 	jb_str(m, base && base[1] ? base + 1 : root);
-	jb_raw(m, "}],\"capabilities\":{"
+	jb_raw(m, "}],");
+	if (l->settings) {
+		jb_raw(m, "\"initializationOptions\":");
+		jb_raw(m, l->settings);
+		jb_raw(m, ",");
+	}
+	jb_raw(m, "\"capabilities\":{"
 	          "\"general\":{\"positionEncodings\":[\"utf-8\",\"utf-16\"]},"
 	          /* clangd < 16 reads its extension from capabilities */
 	          "\"offsetEncoding\":[\"utf-8\",\"utf-16\"],"
@@ -459,7 +471,9 @@ static void send_initialize(Lsp *l, const char *root)
 	send_msg(l, true);
 }
 
-Lsp *lsp_start(const char *root, char *const argv[])
+Lsp *lsp_start(const char *root, char *const argv[]) { return lsp_start_ex(root, argv, NULL); }
+
+Lsp *lsp_start_ex(const char *root, char *const argv[], const char *settings)
 {
 	if (!argv || !argv[0])
 		return NULL;
@@ -553,6 +567,7 @@ Lsp *lsp_start(const char *root, char *const argv[])
 	l->next_id = 1;
 	l->utf8 = false;
 	l->root_uri = lsp_path_to_uri(root ? root : ".");
+	l->settings = settings ? vx_strdup(settings) : NULL;
 	send_initialize(l, root ? root : ".");
 	return l;
 }
@@ -670,6 +685,11 @@ static u8 map_token_type(const Json *j, u32 t)
 		{"modifier", TK_STORAGE},  {"comment", TK_COMMENT},
 		{"string", TK_STRING},     {"number", TK_NUMBER},
 		{"operator", TK_OPERATOR},
+		/* rust-analyzer's own types */
+		{"builtinType", TK_TYPE}, {"typeAlias", TK_TYPE},
+		{"union", TK_TYPE},       {"selfTypeKeyword", TK_TYPE},
+		{"selfKeyword", TK_STORAGE}, {"lifetime", TK_STORAGE},
+		{"boolean", TK_STORAGE},  {"character", TK_STRING},
 	};
 	for (size_t i = 0; i < VX_COUNT(m); i++)
 		if (json_eq(j, t, m[i].name))
@@ -733,8 +753,11 @@ static void reply_server_request(Lsp *l, u32 id, u32 method)
 		u32 items = json_path(j, 0, "params.items");
 		u32 n = json_type(j, items) == JS_ARR ? j->size[items] : 0;
 		jb_raw(m, "[");
-		for (u32 i = 0; i < n; i++)
-			jb_raw(m, i ? ",null" : "null");
+		for (u32 i = 0; i < n; i++) {
+			if (i)
+				jb_raw(m, ",");
+			jb_raw(m, l->settings ? l->settings : "null");
+		}
 		jb_raw(m, "]");
 	} else if (json_eq(j, method, "workspace/workspaceFolders")) {
 		jb_raw(m, "[{\"uri\":");
@@ -1407,6 +1430,7 @@ void lsp_stop(Lsp *l)
 	free(l->in.b);
 	free(l->err.b);
 	free(l->root_uri);
+	free(l->settings);
 	free(l->scratch);
 	json_free(&l->js);
 	pool_free(&l->pool);

@@ -11,6 +11,11 @@ enum {
 	ICON_SEARCH,
 	ICON_SCM,
 	ICON_GEAR,
+	/* 16 px versions for the top-level tabs */
+	ICON_FILES_S,
+	ICON_SEARCH_S,
+	ICON_SCM_S,
+	ICON_GEAR_S,
 	/* 16 px */
 	ICON_CHEVRON_RIGHT,
 	ICON_CHEVRON_DOWN,

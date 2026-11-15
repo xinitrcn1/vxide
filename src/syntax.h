@@ -67,6 +67,11 @@ enum {
 	LANG_PYTHON,    /* Python 3 (.py .pyi, shebangs)                 */
 	LANG_YAML,      /* YAML 1.2 (.yml .yaml, .clang-format)          */
 	LANG_CODEOWNERS, /* CODEOWNERS (GitHub / GitLab)                 */
+	LANG_JAVA,      /* Java (.java)                                  */
+	LANG_KOTLIN,    /* Kotlin (.kt .kts)                             */
+	LANG_TOML,      /* TOML (.toml, Cargo.lock, Pipfile)             */
+	LANG_CPP,       /* C++26 (.cpp .cc .hpp ..., .h with C++ markers) */
+	LANG_RUST,      /* Rust (.rs)                                    */
 	LANG_COUNT /* Markdown keeps a fence language in 5 bits: <= 32  */
 };
 

@@ -134,7 +134,7 @@ void ctx_menu_editor(View *v, int x, int y, u32 off)
 {
 	app.ctx = CTX_EDITOR;
 	app.ctx_off = off;
-	bool lsp = app.lsp && app.lsp_ready && app.docs.lsp_open[v->doc];
+	bool lsp = doc_lsp(v->doc) != NULL;
 	bool sel = false;
 	for (u32 c = 0; c < v->nc; c++)
 		sel |= v->head[c] != v->anchor[c];
@@ -331,7 +331,7 @@ static void lsp_pos(View *v, u32 off, u32 *line, u32 *col)
 
 static bool lsp_ok(View *v)
 {
-	if (!(app.lsp && app.lsp_ready && app.docs.lsp_open[v->doc])) {
+	if (!doc_lsp(v->doc)) {
 		ui_status("No language server for this file");
 		return false;
 	}
@@ -339,7 +339,7 @@ static bool lsp_ok(View *v)
 	Docs *D = &app.docs;
 	if (D->lsp_sent[v->doc] != D->text[v->doc].version) {
 		D->lsp_ver[v->doc]++;
-		lsp_did_change(app.lsp, D->path[v->doc], D->lsp_ver[v->doc], text_flat(&D->text[v->doc]),
+		lsp_did_change(doc_lsp(v->doc), D->path[v->doc], D->lsp_ver[v->doc], text_flat(&D->text[v->doc]),
 		               D->text[v->doc].len);
 		D->lsp_sent[v->doc] = D->text[v->doc].version;
 	}
@@ -362,11 +362,11 @@ bool actions_command(int cmd)
 		lsp_pos(v, off, &line, &col);
 		const char *p = app.docs.path[v->doc];
 		if (cmd == CMD_GOTO_REFERENCES || cmd == CMD_FIND_ALL_REFERENCES)
-			app.refs_req = lsp_references(app.lsp, p, line, col);
+			app.refs_req = lsp_references(doc_lsp(v->doc), p, line, col);
 		else if (cmd == CMD_GOTO_DECLARATION)
-			app.decl_req = lsp_declaration(app.lsp, p, line, col);
+			app.decl_req = lsp_declaration(doc_lsp(v->doc), p, line, col);
 		else
-			app.decl_req = lsp_type_definition(app.lsp, p, line, col);
+			app.decl_req = lsp_type_definition(doc_lsp(v->doc), p, line, col);
 		return true;
 	}
 	case CMD_CHANGE_ALL_OCCURRENCES:

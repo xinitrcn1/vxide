@@ -3,6 +3,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "ui.h"
 #include "syntax.h"
+#include "binfile.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -12,7 +13,7 @@
 
 App app;
 
-enum { DRAG_NONE, DRAG_SIDE, DRAG_PANEL, DRAG_EDITOR, DRAG_GROUP };
+enum { DRAG_NONE, DRAG_SIDE, DRAG_PANEL, DRAG_EDITOR, DRAG_GROUP, DRAG_SIDEBAR /* = 5: a pane's scrollbar */ };
 
 /* ---- messages ----------------------------------------------------------- */
 
@@ -81,17 +82,82 @@ static const char *rel_of(const char *abs)
 	return abs;
 }
 
+/* Which server serves a language id: clangd C and C++, rust-analyzer Rust. */
+static int lsv_for(const char *id)
+{
+	if (!id)
+		return -1;
+	if (!strcmp(id, "c") || !strcmp(id, "cpp") || !strcmp(id, "objective-c") || !strcmp(id, "objective-cpp"))
+		return LSV_CLANGD;
+	if (!strcmp(id, "rust"))
+		return LSV_RUST;
+	return -1;
+}
+
+const char *lsv_name(int sv) { return sv == LSV_RUST ? "rust-analyzer" : "clangd"; }
+
+Lsp *doc_lsp(u32 d)
+{
+	int sv = app.docs.lsp_sv[d];
+	if (!app.docs.lsp_open[d] || sv < 0 || !app.lsps[sv] || !app.lsps_ready[sv])
+		return NULL;
+	return app.lsps[sv];
+}
+
+/* rust-analyzer without building anything: no cargo check on save, no
+ * build scripts or proc-macro servers (each compiles the target and its
+ * dependencies, which thrashes a slow disk), no cache priming of every
+ * crate at start. Analysis of the sources themselves stays on. */
+static const char k_rust_settings[] =
+    "{\"checkOnSave\":false,"
+    "\"check\":{\"workspace\":false},"
+    "\"cargo\":{\"buildScripts\":{\"enable\":false},\"autoreload\":true},"
+    "\"procMacro\":{\"enable\":false,\"attributes\":{\"enable\":false}},"
+    "\"cachePriming\":{\"enable\":false},"
+    "\"diagnostics\":{\"disabled\":[\"unresolved-proc-macro\",\"unresolved-macro-call\"]},"
+    "\"lru\":{\"capacity\":64}}";
+
+static void lsv_start(int sv)
+{
+	if (app.lsps[sv] || app.lsps_failed[sv] || getenv("VXIDE_NO_LSP"))
+		return;
+	app.lsps_ready[sv] = false;
+	if (sv == LSV_CLANGD) {
+		const char *cmd = getenv("VXIDE_CLANGD");
+		/* the background indexer reads every source file: keep it behind the
+		 * editor's own I/O (matters on a slow disk) */
+		char *argv[] = {(char *)(cmd ? cmd : "clangd"), "--log=error", "--background-index",
+		                "--background-index-priority=low", NULL};
+		app.lsps[sv] = lsp_start(app.root, argv);
+	} else {
+		const char *cmd = getenv("VXIDE_RUST_ANALYZER");
+		char *argv[] = {(char *)(cmd ? cmd : "rust-analyzer"), NULL};
+		app.lsps[sv] = lsp_start_ex(app.root, argv, k_rust_settings);
+	}
+	if (!app.lsps[sv]) {
+		app.lsps_failed[sv] = true; /* not installed: don't retry on every open */
+		ui_log("[lsp] could not start %s", lsv_name(sv));
+	} else {
+		ui_log("[lsp] started %s in %s", lsv_name(sv), app.root);
+	}
+}
+
 static void lsp_sync_open(u32 d)
 {
 	Docs *D = &app.docs;
-	if (!app.lsp || D->untitled[d] || D->lsp_open[d])
+	if (D->untitled[d] || D->lsp_open[d] || D->bin[d])
 		return;
 	const char *id = syn_lang_lsp_id(D->lang[d]);
-	if (!id || strcmp(id, "c") != 0)
-		return; /* clangd serves C here */
+	int sv = lsv_for(id);
+	D->lsp_sv[d] = (i8)sv;
+	if (sv < 0)
+		return;
+	lsv_start(sv); /* rust-analyzer starts with the first Rust file */
+	if (!app.lsps[sv])
+		return;
 	Text *t = &D->text[d];
 	D->lsp_ver[d] = 1;
-	lsp_did_open(app.lsp, D->path[d], id, D->lsp_ver[d], text_flat(t), t->len);
+	lsp_did_open(app.lsps[sv], D->path[d], id, D->lsp_ver[d], text_flat(t), t->len);
 	D->lsp_open[d] = true;
 	D->lsp_sent[d] = t->version;
 	D->sem_req[d] = -1;
@@ -130,7 +196,8 @@ u32 doc_open(const char *abs)
 	char head[512];
 	u32 hn = VX_MIN(t->len, (u32)sizeof head);
 	text_copy(t, 0, hn, head);
-	D->lang[d] = (u8)syn_lang_for_path(abs, head, hn);
+	D->bin[d] = bin_is_binary(head, hn);
+	D->lang[d] = D->bin[d] ? LANG_NONE : (u8)syn_lang_for_path(abs, head, hn);
 	D->untitled[d] = 0;
 	{
 		/* detectIndentation: lines indented with a tab vs spaces */
@@ -152,7 +219,8 @@ u32 doc_open(const char *abs)
 	D->gm_n[d] = 0;
 	D->gm_for[d] = UINT32_MAX;
 	D->gm_due_ns[d] = 0;
-	lsp_sync_open(d);
+	if (!D->bin[d])
+		lsp_sync_open(d);
 	return d;
 }
 
@@ -177,6 +245,7 @@ u32 doc_new_untitled(void)
 	D->path[d] = NULL;
 	D->rel[d] = vx_strdup(name);
 	D->lang[d] = LANG_NONE;
+	D->bin[d] = 0;
 	D->untitled[d] = 1;
 	D->refs[d] = 0;
 	D->lstate_ok[d] = 0;
@@ -184,6 +253,7 @@ u32 doc_new_untitled(void)
 	D->lstate[d][0] = 0;
 	D->dn[d] = D->sn[d] = D->gm_n[d] = 0;
 	D->lsp_open[d] = false;
+	D->lsp_sv[d] = -1;
 	return d;
 }
 
@@ -198,9 +268,12 @@ void doc_release(u32 d)
 	Docs *D = &app.docs;
 	if (--D->refs[d] > 0)
 		return;
-	if (D->lsp_open[d] && app.lsp)
-		lsp_did_close(app.lsp, D->path[d]);
+	if (D->lsp_open[d] && D->lsp_sv[d] >= 0 && app.lsps[D->lsp_sv[d]])
+		lsp_did_close(app.lsps[D->lsp_sv[d]], D->path[d]);
 	D->lsp_open[d] = false;
+	if (D->bin[d])
+		binview_doc_released(d);
+	D->bin[d] = 0;
 	text_free(&D->text[d]);
 	free(D->path[d]);
 	free(D->rel[d]);
@@ -237,8 +310,8 @@ bool doc_save(u32 d)
 		ui_status("Failed to save '%s'", D->rel[d]);
 		return false;
 	}
-	if (D->lsp_open[d] && app.lsp)
-		lsp_did_save(app.lsp, D->path[d]);
+	if (D->lsp_open[d] && D->lsp_sv[d] >= 0 && app.lsps[D->lsp_sv[d]])
+		lsp_did_save(app.lsps[D->lsp_sv[d]], D->path[d]);
 	app.git_ns = 0; /* refresh status soon */
 	git_marks_due(d, 0);
 	app.tree_scan_ns = 0;
@@ -380,6 +453,7 @@ void close_tab(u32 gi, u32 t)
 	u32 d = v->doc;
 	if (v->diff_left != UINT32_MAX)
 		diff_view_closed(v);
+	binview_closed(v);
 	free(v);
 	memmove(g->tab + t, g->tab + t + 1, (g->nt - t - 1) * sizeof(View *));
 	/* fix MRU: drop t, shift indices above it */
@@ -455,6 +529,7 @@ static u32 show_doc(u32 d, bool preview)
 		for (u32 t = 0; t < g->nt; t++)
 			if (g->tab[t]->preview && !text_dirty(&app.docs.text[g->tab[t]->doc])) {
 				View *v = g->tab[t];
+				binview_closed(v);
 				doc_release(v->doc);
 				memset(v, 0, sizeof *v);
 				v->diff_left = UINT32_MAX;
@@ -463,6 +538,8 @@ static u32 show_doc(u32 d, bool preview)
 				v->want_x[0] = -1;
 				v->preview = true;
 				app.docs.refs[d]++;
+				if (app.docs.bin[d])
+					binview_init(v);
 				activate_tab(app.active_group, t);
 				return t;
 			}
@@ -475,6 +552,8 @@ static u32 show_doc(u32 d, bool preview)
 	v->want_x[0] = -1;
 	v->preview = preview;
 	app.docs.refs[d]++;
+	if (app.docs.bin[d])
+		binview_init(v);
 	/* VSCodium opens new tabs to the right of the active one */
 	u32 at = g->nt ? g->active + 1 : 0;
 	memmove(g->tab + at + 1, g->tab + at, (g->nt - at) * sizeof(View *));
@@ -558,9 +637,11 @@ void open_rel(const char *rel, bool preview, u32 line, u32 col)
 
 void ui_layout(void)
 {
-	app.act_w = PX(48);
+	app.act_w = 0; /* the activity bar became the top-level tabs */
 	app.status_h = PX(22);
 	app.tabs_h = PX(35);
+	app.top_h = app.tabs_h;
+	app.subtabs_h = PX(28);
 	app.crumbs_h = PX(22);
 	app.row_h = PX(22);
 	int x = app.act_w;
@@ -575,14 +656,14 @@ void ui_layout(void)
 		bottom = app.panel_y;
 	}
 	app.ed_x = x;
-	app.ed_y = 0;
+	app.ed_y = app.top_h;
 	app.ed_w = app.w - x;
-	app.ed_h = bottom;
+	app.ed_h = bottom - app.top_h;
 	int gw = app.ed_w / (int)app.ngroups;
 	for (u32 i = 0; i < app.ngroups; i++) {
 		Group *g = &app.groups[i];
 		g->x = app.ed_x + (int)i * gw;
-		g->y = 0;
+		g->y = app.top_h;
 		g->w = i + 1 == app.ngroups ? app.ed_w - (int)i * gw : gw;
 		g->h = app.ed_h;
 	}
@@ -625,6 +706,7 @@ static const Binding bindings[] = {
     {C | S, SDLK_E, W_ANY, CMD_VIEW_EXPLORER, 0},
     {C | S, SDLK_F, W_ANY, CMD_VIEW_SEARCH, 0},
     {C | S, SDLK_G, W_ANY, CMD_VIEW_SCM, 0},
+    {C, SDLK_COMMA, W_ANY, CMD_VIEW_SETTINGS, 0},
     {C | S, SDLK_M, W_ANY, CMD_VIEW_PROBLEMS, 0},
     {C | S, SDLK_U, W_ANY, CMD_VIEW_OUTPUT, 0},
     {C, SDLK_BACKSLASH, W_ANY, CMD_SPLIT, 0},
@@ -718,6 +800,7 @@ static const char *cmd_titles[CMD_COUNT] = {
     [CMD_VIEW_EXPLORER] = "View: Show Explorer",
     [CMD_VIEW_SEARCH] = "View: Show Search",
     [CMD_VIEW_SCM] = "View: Show Source Control",
+    [CMD_VIEW_SETTINGS] = "Preferences: Open Settings",
     [CMD_VIEW_PROBLEMS] = "View: Focus Problems",
     [CMD_VIEW_OUTPUT] = "View: Toggle Output",
     [CMD_SPLIT] = "View: Split Editor",
@@ -738,6 +821,10 @@ static const char *cmd_titles[CMD_COUNT] = {
     [CMD_REDO] = "Redo",
     [CMD_CUT] = "Cut",
     [CMD_COPY] = "Copy",
+    [CMD_HEX_ADD_TAG] = "Hex: Tag Selection",
+    [CMD_HEX_REMOVE_TAG] = "Hex: Remove Tag",
+    [CMD_HEX_GOTO] = "Hex: Go to Offset",
+    [CMD_HEX_ENDIAN] = "Hex: Toggle Inspector Byte Order",
     [CMD_PASTE] = "Paste",
     [CMD_SELECT_ALL] = "Select All",
     [CMD_SELECT_LINE] = "Expand Line Selection",
@@ -1130,6 +1217,14 @@ static void quick_accept(void)
 		}
 		return;
 	}
+	if (kind == QUICK_PROMPT && app.quick_prompt_kind >= 200) {
+		char *s = vx_strndup(in->b ? in->b : "", in->n);
+		int pk = app.quick_prompt_kind;
+		quick_close();
+		binview_prompt_accept(pk, s);
+		free(s);
+		return;
+	}
 	if ((kind == QUICK_PROMPT || kind == QUICK_CONFIRM) && app.quick_prompt_kind >= 100) {
 		extern void gitui_prompt_accept(int kind, const char *text);
 		char *s = vx_strndup(in->b ? in->b : "", in->n);
@@ -1330,7 +1425,7 @@ static void quick_draw(void)
 	int x = (app.w - w) / 2;
 	int y = PX(4);
 	int pad = PX(6);
-	int ih = PX(26);
+	int ih = input_height(&app.quick_in, w - 2 * PX(6), 0); /* grows with long text */
 	int rh = PX(22);
 	u32 maxrows = 16;
 	bool listing = app.quick == QUICK_FILES || app.quick == QUICK_COMMANDS || app.quick == QUICK_PICK;
@@ -1357,7 +1452,7 @@ static void quick_draw(void)
 	                 : app.quick == QUICK_CONFIRM   ? ""
 	                                                : "";
 	if (app.quick != QUICK_CONFIRM) {
-		input_draw(&app.quick_in, x + pad, cy, w - 2 * pad, ih, ph, true);
+		input_draw_ex(&app.quick_in, x + pad, cy, w - 2 * pad, 0, ph, true);
 		cy += ih + pad;
 	}
 	if (msg_h) {
@@ -1549,23 +1644,23 @@ static void goto_problem(int dir)
 
 static void restart_lsp(void)
 {
-	if (app.lsp) {
-		lsp_stop(app.lsp);
-		app.lsp = NULL;
+	bool was[LSV_COUNT];
+	for (int sv = 0; sv < LSV_COUNT; sv++) {
+		was[sv] = app.lsps[sv] != NULL;
+		if (app.lsps[sv])
+			lsp_stop(app.lsps[sv]);
+		app.lsps[sv] = NULL;
+		app.lsps_ready[sv] = false;
+		app.lsps_failed[sv] = false;
 	}
-	app.lsp_ready = false;
 	for (u32 d = 0; d < app.docs.n; d++)
 		app.docs.lsp_open[d] = false;
-	const char *cmd = getenv("VXIDE_CLANGD");
-	/* the background indexer reads every source file: keep it behind the
-	 * editor's own I/O (matters on a slow disk) */
-	char *argv[] = {(char *)(cmd ? cmd : "clangd"), "--log=error", "--background-index",
-	                "--background-index-priority=low", NULL};
-	app.lsp = lsp_start(app.root, argv);
-	if (!app.lsp)
-		ui_log("[lsp] could not start %s", argv[0]);
-	else
-		ui_log("[lsp] started %s in %s", argv[0], app.root);
+	/* clangd always (C projects are the common case); the others again only
+	 * if they were running or a document wants them */
+	lsv_start(LSV_CLANGD);
+	for (int sv = 1; sv < LSV_COUNT; sv++)
+		if (was[sv])
+			lsv_start(sv);
 	for (u32 d = 0; d < app.docs.n; d++)
 		if (app.docs.path[d])
 			lsp_sync_open(d);
@@ -1575,7 +1670,11 @@ void run_command(int cmd)
 {
 	View *v = active_view();
 	app.dirty = true;
-	if (v && ed_command(v, cmd))
+	if (v && app.docs.bin[v->doc] && v->diff_left == UINT32_MAX) {
+		/* binary views are read-only: only their own commands, never text edits */
+		if (binview_command(cmd))
+			return;
+	} else if (v && ed_command(v, cmd))
 		return;
 	if (diff_command(v, cmd))
 		return;
@@ -1671,6 +1770,12 @@ void run_command(int cmd)
 	case CMD_TOGGLE_PANEL:
 		app.panel_visible = !app.panel_visible;
 		app.focus = app.panel_visible ? FOCUS_PANEL : FOCUS_EDITOR;
+		ui_layout();
+		break;
+	case CMD_VIEW_SETTINGS:
+		app.side_view = SIDE_SETTINGS;
+		app.side_visible = true;
+		app.focus = FOCUS_SIDEBAR;
 		ui_layout();
 		break;
 	case CMD_VIEW_EXPLORER:
@@ -1924,18 +2029,56 @@ static bool try_bindings(const Event *e)
 }
 
 /* Sidebar title + activity bar hit testing. */
-static int activity_hit(int y)
+static void sidebar_event(const Event *e, int x, int y, int w, int h)
 {
-	int i = y / PX(48);
-	return i < SIDE_COUNT ? i : -1;
+	if (app.side_view == SIDE_EXPLORER)
+		explorer_event(e, x, y, w, h);
+	else if (app.side_view == SIDE_SEARCH)
+		search_event(e, x, y, w, h);
+	else if (app.side_view == SIDE_SCM)
+		scm_event(e, x, y, w, h);
+	else
+		settings_event(e, x, y, w, h);
+}
+
+/* ---- top-level tabs (Project, Git, Search, Settings) -------------------- */
+
+static const struct {
+	int view, icon, cmd;
+	const char *label;
+} top_tabs[] = {
+    {SIDE_EXPLORER, ICON_FILES_S, CMD_VIEW_EXPLORER, "Project"},
+    {SIDE_SCM, ICON_SCM_S, CMD_VIEW_SCM, "Git"},
+    {SIDE_SEARCH, ICON_SEARCH_S, CMD_VIEW_SEARCH, "Search"},
+    {SIDE_SETTINGS, ICON_GEAR_S, CMD_VIEW_SETTINGS, "Settings"},
+};
+
+static int top_tab_w(int i)
+{
+	int w = PX(10) + PX(16) + PX(6) + font_width(FONT_SMALL, top_tabs[i].label, strlen(top_tabs[i].label)) + PX(12);
+	if (top_tabs[i].view == SIDE_SCM && app.git)
+		w += PX(26); /* room for the change count */
+	return w;
+}
+
+static int top_tab_hit(int mx)
+{
+	int x = 0;
+	for (int i = 0; i < (int)VX_COUNT(top_tabs); i++) {
+		int w = top_tab_w(i);
+		if (mx >= x && mx < x + w)
+			return i;
+		x += w;
+	}
+	return -1;
 }
 
 static void sidebar_area(int *x, int *y, int *w, int *h)
 {
 	*x = app.side_x;
-	*y = 0;
+	*y = app.top_h;
 	*w = app.side_w;
-	*h = app.h - app.status_h;
+	*h = app.h - app.status_h - app.top_h;
 }
 
 static void panel_area(int *x, int *y, int *w, int *h)
@@ -1949,7 +2092,7 @@ static void panel_area(int *x, int *y, int *w, int *h)
 static bool tabs_mouse(Group *g, u32 gi, const Event *e);
 static void doc_external_change(u32 d);
 static int tab_width(View *v);
-static int tabs_scroll_for(Group *g);
+static int tab_layout(Group *g, u32 want, int *ox, int *oy);
 
 /* Right click: a context menu for whatever is under the mouse. */
 static void context_click(int mx, int my)
@@ -1958,9 +2101,9 @@ static void context_click(int mx, int my)
 	if (my >= app.h - app.status_h || mx < app.act_w)
 		return;
 	if (app.side_visible && mx < app.side_x + app.side_w) {
-		int x = app.side_x, w = app.side_w, h = app.h - app.status_h;
+		int x = app.side_x, w = app.side_w, h = app.h - app.status_h - app.top_h;
 		if (app.side_view == SIDE_EXPLORER) {
-			int cy = PX(35) + PX(22);
+			int cy = app.top_h + PX(35) + PX(22);
 			u32 r = my >= cy ? (u32)((my - cy + app.tree_scroll) / app.row_h) : UINT32_MAX;
 			u32 node = r < app.nrows ? app.rows[r] : FS_NONE;
 			if (node != FS_NONE)
@@ -1969,7 +2112,7 @@ static void context_click(int mx, int my)
 			ctx_menu_explorer(mx, my, node);
 		} else if (app.side_view == SIDE_SCM) {
 			extern bool scm_context(int x, int y, int w, int h, int mx, int my);
-			scm_context(x, 0, w, h, mx, my);
+			scm_context(x, app.top_h, w, h, mx, my);
 		}
 		return;
 	}
@@ -1979,24 +2122,28 @@ static void context_click(int mx, int my)
 		Group *g = &app.groups[gi];
 		if (mx < g->x || mx >= g->x + g->w)
 			continue;
-		if (my < g->y + app.tabs_h) {
-			int x = g->x - tabs_scroll_for(g);
+		if (my < g->y + group_tabs_h(g)) {
 			for (u32 t = 0; t < g->nt; t++) {
 				int w = tab_width(g->tab[t]);
-				if (mx >= x && mx < x + w) {
+				int x, ty;
+				tab_layout(g, t, &x, &ty);
+				if (mx >= x && mx < x + w && my >= ty && my < ty + app.tabs_h) {
 					ctx_menu_tab(mx, my, gi, t);
 					return;
 				}
-				x += w;
 			}
 			return;
 		}
-		if (!g->nt || my < g->y + app.tabs_h + app.crumbs_h)
+		if (!g->nt || my < g->y + group_head_h(g))
 			return;
 		app.active_group = gi;
 		app.focus = FOCUS_EDITOR;
 		View *v = g->tab[g->active];
-		u32 off = ed_offset_at(v, mx, my, g->x, g->y + app.tabs_h + app.crumbs_h);
+		if (app.docs.bin[v->doc] && v->diff_left == UINT32_MAX) {
+			binview_context(v, mx, my);
+			return;
+		}
+		u32 off = ed_offset_at(v, mx, my, g->x, g->y + group_head_h(g));
 		/* like VSCodium: a right click outside the selection moves the cursor */
 		bool inside = false;
 		for (u32 c = 0; c < v->nc; c++) {
@@ -2019,7 +2166,9 @@ static int cursor_at(int mx, int my, int mods)
 		int w = VX_MIN(PX(600), app.w - PX(40));
 		int x = (app.w - w) / 2;
 		int iy = PX(4) + PX(6) + (app.quick_title[0] ? PX(22) : 0);
-		return (mx >= x && mx < x + w && my >= iy && my < iy + PX(26)) ? CURSOR_IBEAM : CURSOR_ARROW;
+		return (mx >= x && mx < x + w && my >= iy && my < iy + input_height(&app.quick_in, w - 2 * PX(6), 0))
+		           ? CURSOR_IBEAM
+		           : CURSOR_ARROW;
 	}
 	if (app.side_visible && abs(mx - (app.side_x + app.side_w)) <= PX(2) && my < app.h - app.status_h)
 		return CURSOR_EW;
@@ -2029,7 +2178,7 @@ static int cursor_at(int mx, int my, int mods)
 		return CURSOR_ARROW;
 	if (app.side_visible && mx < app.side_x + app.side_w) {
 		extern bool sidebar_over_input(int x, int y, int w, int mx, int my);
-		return sidebar_over_input(app.side_x, 0, app.side_w, mx, my) ? CURSOR_IBEAM : CURSOR_ARROW;
+		return sidebar_over_input(app.side_x, app.top_h, app.side_w, mx, my) ? CURSOR_IBEAM : CURSOR_ARROW;
 	}
 	if (app.panel_visible && my >= app.panel_y)
 		return CURSOR_ARROW;
@@ -2037,11 +2186,11 @@ static int cursor_at(int mx, int my, int mods)
 		Group *g = &app.groups[gi];
 		if (mx < g->x || mx >= g->x + g->w || !g->nt)
 			continue;
-		int ey = g->y + app.tabs_h + app.crumbs_h;
+		int ey = g->y + group_head_h(g);
 		if (my < ey)
 			return CURSOR_ARROW;
 		View *v = g->tab[g->active];
-		return ed_cursor_shape(v, mx, my, g->x, ey, g->w, g->h - app.tabs_h - app.crumbs_h, mods);
+		return ed_cursor_shape(v, mx, my, g->x, ey, g->w, g->h - group_head_h(g), mods);
 	}
 	return CURSOR_ARROW;
 }
@@ -2138,12 +2287,7 @@ void ui_event(const Event *e)
 		case FOCUS_SIDEBAR: {
 			int x, y, w, h;
 			sidebar_area(&x, &y, &w, &h);
-			if (app.side_view == SIDE_EXPLORER)
-				explorer_event(e, x, y, w, h);
-			else if (app.side_view == SIDE_SEARCH)
-				search_event(e, x, y, w, h);
-			else
-				scm_event(e, x, y, w, h);
+			sidebar_event(e, x, y, w, h);
 			return;
 		}
 		case FOCUS_PANEL: {
@@ -2184,12 +2328,7 @@ void ui_event(const Event *e)
 		case FOCUS_SIDEBAR: {
 			int x, y, w, h;
 			sidebar_area(&x, &y, &w, &h);
-			if (app.side_view == SIDE_SEARCH)
-				search_event(e, x, y, w, h);
-			else if (app.side_view == SIDE_SCM)
-				scm_event(e, x, y, w, h);
-			else
-				explorer_event(e, x, y, w, h);
+			sidebar_event(e, x, y, w, h);
 			return;
 		}
 		case FOCUS_EDITOR: {
@@ -2222,14 +2361,18 @@ void ui_event(const Event *e)
 			View *v = active_view();
 			Group *g = &app.groups[app.active_group];
 			if (v)
-				ed_mouse(v, e, g->x, g->y + app.tabs_h + app.crumbs_h, g->w,
-				         g->h - app.tabs_h - app.crumbs_h);
+				ed_mouse(v, e, g->x, g->y + group_head_h(g), g->w,
+				         g->h - group_head_h(g));
+		} else if (d == DRAG_SIDEBAR) {
+			int x, y, w, h;
+			sidebar_area(&x, &y, &w, &h);
+			sidebar_event(e, x, y, w, h);
 		}
 		return;
 	}
 	if (e->type == EV_MMOVE && app.drag) {
 		if (app.drag == DRAG_SIDE) {
-			app.side_w = VX_CLAMP(mx - app.side_x, PX(170), app.w - app.act_w - PX(200));
+			app.side_w = VX_CLAMP(mx - app.side_x, PX(100), app.w - PX(200));
 			ui_layout();
 		} else if (app.drag == DRAG_PANEL) {
 			app.panel_h = app.h - app.status_h - my;
@@ -2238,8 +2381,12 @@ void ui_event(const Event *e)
 			View *v = active_view();
 			Group *g = &app.groups[app.active_group];
 			if (v)
-				ed_mouse(v, e, g->x, g->y + app.tabs_h + app.crumbs_h, g->w,
-				         g->h - app.tabs_h - app.crumbs_h);
+				ed_mouse(v, e, g->x, g->y + group_head_h(g), g->w,
+				         g->h - group_head_h(g));
+		} else if (app.drag == DRAG_SIDEBAR) {
+			int x, y, w, h;
+			sidebar_area(&x, &y, &w, &h);
+			sidebar_event(e, x, y, w, h);
 		}
 		return;
 	}
@@ -2247,7 +2394,13 @@ void ui_event(const Event *e)
 		/* click inside the quick list selects; outside closes */
 		int w = VX_MIN(PX(600), app.w - PX(40));
 		int x = (app.w - w) / 2;
-		int top = PX(4) + PX(6) + (app.quick_title[0] ? PX(22) : 0) + PX(26) + PX(6);
+		int ih = input_height(&app.quick_in, w - 2 * PX(6), 0);
+		int iy = PX(4) + PX(6) + (app.quick_title[0] ? PX(22) : 0);
+		int top = iy + ih + PX(6);
+		if (my >= iy && my < iy + ih && app.quick != QUICK_CONFIRM) {
+			input_click_ex(&app.quick_in, x + PX(6), iy, w - 2 * PX(6), 0, mx, my, e->clicks);
+			return;
+		}
 		if (in_rect(mx, my, x, top, w, PX(22) * 16)) {
 			u32 r = (u32)((my - top) / PX(22)) + app.quick_top;
 			if (r < app.quick_n) {
@@ -2281,18 +2434,15 @@ void ui_event(const Event *e)
 		}
 		return;
 	}
-	if (mx < app.act_w) {
+	if (my < app.top_h) {
 		if (e->type == EV_MDOWN) {
-			int i = activity_hit(my);
+			int i = top_tab_hit(mx);
 			if (i >= 0) {
-				if (app.side_visible && app.side_view == i)
+				/* the active tab hides the side bar, like the activity bar did */
+				if (app.side_visible && app.side_view == top_tabs[i].view)
 					run_command(CMD_TOGGLE_SIDEBAR);
 				else
-					run_command(i == SIDE_EXPLORER ? CMD_VIEW_EXPLORER
-					            : i == SIDE_SEARCH ? CMD_VIEW_SEARCH
-					                               : CMD_VIEW_SCM);
-			} else if (my > app.h - app.status_h - PX(48)) {
-				run_command(CMD_TOGGLE_THEME);
+					run_command(top_tabs[i].cmd);
 			}
 		}
 		return;
@@ -2302,12 +2452,7 @@ void ui_event(const Event *e)
 		sidebar_area(&x, &y, &w, &h);
 		if (e->type == EV_MDOWN && app.focus != FOCUS_SEARCH_INPUT && app.focus != FOCUS_SCM_INPUT)
 			app.focus = FOCUS_SIDEBAR;
-		if (app.side_view == SIDE_EXPLORER)
-			explorer_event(e, x, y, w, h);
-		else if (app.side_view == SIDE_SEARCH)
-			search_event(e, x, y, w, h);
-		else
-			scm_event(e, x, y, w, h);
+		sidebar_event(e, x, y, w, h);
 		return;
 	}
 	if (app.panel_visible && my >= app.panel_y) {
@@ -2320,11 +2465,11 @@ void ui_event(const Event *e)
 		Group *g = &app.groups[gi];
 		if (!in_rect(mx, my, g->x, g->y, g->w, g->h))
 			continue;
-		if (my < g->y + app.tabs_h) {
+		if (my < g->y + group_tabs_h(g)) {
 			tabs_mouse(g, gi, e);
 			return;
 		}
-		if (my < g->y + app.tabs_h + app.crumbs_h)
+		if (my < g->y + group_head_h(g))
 			return;
 		if (g->nt == 0)
 			return;
@@ -2336,7 +2481,7 @@ void ui_event(const Event *e)
 		View *v = g->tab[g->active];
 		if (e->type == EV_MDOWN && e->button == 1)
 			app.drag = DRAG_EDITOR;
-		ed_mouse(v, e, g->x, g->y + app.tabs_h + app.crumbs_h, g->w, g->h - app.tabs_h - app.crumbs_h);
+		ed_mouse(v, e, g->x, g->y + group_head_h(g), g->w, g->h - group_head_h(g));
 		return;
 	}
 }
@@ -2362,6 +2507,10 @@ static const IconRule icon_rules[] = {
     {".toml", "t", 0x6D8086FF},  {".cmake", "C", 0x519ABAFF}, {".mk", "M", 0xE37933FF},
     {".jsonc", "{}", 0xCBCB41FF}, {".diff", "\xC2\xB1", 0x519ABAFF}, {".patch", "\xC2\xB1", 0x519ABAFF},  {".pl", "pl", 0x519ABAFF},  {".pm", "pm", 0x519ABAFF},
     {".bash", ">", 0x4D5A5EFF},  {".zsh", ">", 0x4D5A5EFF},  {".markdown", "M", 0x519ABAFF},  {".png", "\xE2\x96\xA3", 0xA074C4FF}, {".mk", "M", 0xE37933FF},
+    {".rs", "R", 0x6D8086FF},    {".java", "J", 0xCC3E44FF},  {".kt", "K", 0xA074C4FF},
+    {".kts", "K", 0xA074C4FF},   {".cc", "C", 0xA074C4FF},    {".cxx", "C", 0xA074C4FF},
+    {".hh", "h", 0xA074C4FF},    {".hxx", "h", 0xA074C4FF},   {".cppm", "C", 0xA074C4FF},
+    {".ixx", "C", 0xA074C4FF},
 };
 
 int file_icon_draw(const char *name, int x, int y, int h)
@@ -2426,34 +2575,59 @@ static int tab_width(View *v)
 	return PX(10) + PX(22) + font_width(FONT_UI, base, strlen(base)) + PX(4) + PX(28);
 }
 
-static int tabs_scroll_for(Group *g)
+/* Tabs wrap into rows (VSCodium's workbench.editor.wrapTabs). Position of
+ * tab `want` (or of the end when want == g->nt); returns the row count. */
+static int tab_layout(Group *g, u32 want, int *ox, int *oy)
 {
-	/* keep the active tab visible: shift left if needed */
-	int x = 0, ax0 = 0, ax1 = 0;
+	int x = g->x, row = 0;
 	for (u32 t = 0; t < g->nt; t++) {
 		int w = tab_width(g->tab[t]);
-		if (t == g->active) {
-			ax0 = x;
-			ax1 = x + w;
+		if (x + w > g->x + g->w && x > g->x) {
+			x = g->x;
+			row++;
+		}
+		if (t == want) {
+			*ox = x;
+			*oy = g->y + row * app.tabs_h;
 		}
 		x += w;
 	}
-	int scroll = 0;
-	if (ax1 > g->w)
-		scroll = ax1 - g->w;
-	if (ax0 < scroll)
-		scroll = ax0;
-	return scroll;
+	if (want >= g->nt) {
+		*ox = x;
+		*oy = g->y + row * app.tabs_h;
+	}
+	return row + 1;
 }
+
+/* Height of the tab rows plus the subtab row of a multi-part view
+ * (e.g. an executable's sections). */
+int group_tabs_h(Group *g)
+{
+	int ox, oy;
+	int rows = g->nt ? tab_layout(g, g->nt, &ox, &oy) : 1;
+	View *v = g->nt ? g->tab[g->active] : NULL;
+	return rows * app.tabs_h + (v && v->nparts > 1 ? view_subtabs_height(v, g->w) : 0);
+}
+
+int group_head_h(Group *g) { return group_tabs_h(g) + app.crumbs_h; }
+
 
 static bool tabs_mouse(Group *g, u32 gi, const Event *e)
 {
 	if (e->type != EV_MDOWN)
 		return false;
-	int x = g->x - tabs_scroll_for(g);
+	View *av = g->nt ? g->tab[g->active] : NULL;
+	int ox, oy;
+	int rows = g->nt ? tab_layout(g, g->nt, &ox, &oy) : 1;
+	if (av && av->nparts > 1 && e->y >= g->y + rows * app.tabs_h) {
+		view_subtab_click(av, e->x - g->x, e->y - (g->y + rows * app.tabs_h), g->w);
+		return true;
+	}
 	for (u32 t = 0; t < g->nt; t++) {
 		int w = tab_width(g->tab[t]);
-		if (e->x >= x && e->x < x + w) {
+		int x, ty;
+		tab_layout(g, t, &x, &ty);
+		if (e->x >= x && e->x < x + w && e->y >= ty && e->y < ty + app.tabs_h) {
 			bool close = e->x >= x + w - PX(28) || e->button == 2;
 			if (close) {
 				close_tab(gi, t);
@@ -2465,7 +2639,6 @@ static bool tabs_mouse(Group *g, u32 gi, const Event *e)
 			}
 			return true;
 		}
-		x += w;
 	}
 	if (e->clicks >= 2) {
 		app.active_group = gi;
@@ -2552,15 +2725,19 @@ static void doc_problem_counts(u32 d, u32 *errs, u32 *warns)
 
 static void draw_tabs(Group *g, u32 gi)
 {
-	int y = g->y;
-	draw_rect(g->x, y, g->w, app.tabs_h, COL(C_TABS_BG));
-	draw_rect(g->x, y + app.tabs_h - PX(1), g->w, PX(1), COL(C_TABS_BORDER));
-	draw_clip(g->x, y, g->w, app.tabs_h);
-	int x = g->x - tabs_scroll_for(g);
+	int ox, oy;
+	int rows = g->nt ? tab_layout(g, g->nt, &ox, &oy) : 1;
+	int area = rows * app.tabs_h;
+	draw_rect(g->x, g->y, g->w, area, COL(C_TABS_BG));
+	for (int r = 0; r < rows; r++)
+		draw_rect(g->x, g->y + (r + 1) * app.tabs_h - PX(1), g->w, PX(1), COL(C_TABS_BORDER));
+	draw_clip(g->x, g->y, g->w, area);
 	bool group_active = gi == app.active_group;
 	for (u32 t = 0; t < g->nt; t++) {
 		View *v = g->tab[t];
 		int w = tab_width(v);
+		int x, y;
+		tab_layout(g, t, &x, &y);
 		bool active = t == g->active;
 		bool hover = in_rect(app.hover_x, app.hover_y, x, y, w, app.tabs_h);
 		draw_rect(x, y, w, app.tabs_h - (active ? 0 : PX(1)), active ? COL(C_TAB_ACTIVE_BG) : COL(C_TAB_INACTIVE_BG));
@@ -2599,15 +2776,17 @@ static void draw_tabs(Group *g, u32 gi)
 			draw_icon(ICON_DOT, cx, cy, active ? COL(C_TAB_ACTIVE_FG) : COL(C_TAB_INACTIVE_FG));
 		else if (active || hover)
 			draw_icon(ICON_CLOSE, cx, cy, active ? COL(C_TAB_ACTIVE_FG) : COL(C_TAB_INACTIVE_FG));
-		x += w;
 	}
 	draw_noclip();
+	View *av = g->nt ? g->tab[g->active] : NULL;
+	if (av && av->nparts > 1)
+		view_subtabs_draw(av, g->x, g->y + area, g->w, view_subtabs_height(av, g->w));
 }
 
 static void draw_breadcrumbs(Group *g)
 {
 	View *v = g->nt ? g->tab[g->active] : NULL;
-	int y = g->y + app.tabs_h;
+	int y = g->y + group_tabs_h(g);
 	draw_rect(g->x, y, g->w, app.crumbs_h, COL(C_EDITOR_BG));
 	if (!v)
 		return;
@@ -2635,10 +2814,10 @@ static void draw_group(Group *g, u32 gi)
 {
 	draw_tabs(g, gi);
 	draw_breadcrumbs(g);
-	int y = g->y + app.tabs_h + app.crumbs_h;
-	int h = g->h - app.tabs_h - app.crumbs_h;
+	int y = g->y + group_head_h(g);
+	int h = g->h - group_head_h(g);
 	if (!g->nt) {
-		draw_rect(g->x, g->y + app.tabs_h, g->w, g->h - app.tabs_h, COL(C_EDITOR_BG));
+		draw_rect(g->x, g->y + group_tabs_h(g), g->w, g->h - group_tabs_h(g), COL(C_EDITOR_BG));
 		if (gi == 0 && app.ngroups == 1) {
 			/* empty editor hints, like the VSCodium watermark */
 			static const int cmds[] = {CMD_COMMANDS, CMD_QUICK_OPEN, CMD_VIEW_SEARCH, CMD_TOGGLE_PANEL,
@@ -2683,22 +2862,26 @@ static void draw_group(Group *g, u32 gi)
 
 /* ---- activity bar, sidebar, panel, status -------------------------------- */
 
-static void draw_activity_bar(void)
+static void draw_top_tabs(void)
 {
-	int h = app.h - app.status_h;
-	draw_rect(0, 0, app.act_w, h, COL(C_ACTBAR_BG));
-	draw_rect(app.act_w - PX(1), 0, PX(1), h, COL(C_ACTBAR_BORDER));
-	static const int icons[SIDE_COUNT] = {ICON_FILES, ICON_SEARCH, ICON_SCM};
-	for (int i = 0; i < SIDE_COUNT; i++) {
-		int y = i * PX(48);
-		bool active = app.side_visible && app.side_view == i;
-		bool hover = in_rect(app.hover_x, app.hover_y, 0, y, app.act_w, PX(48));
-		u32 c = active || hover ? COL(C_ACTBAR_FG) : COL(C_ACTBAR_FG_INACTIVE);
+	int h = app.top_h;
+	draw_rect(0, 0, app.w, h, COL(C_TABS_BG));
+	draw_rect(0, h - PX(1), app.w, PX(1), COL(C_TABS_BORDER));
+	int x = 0;
+	for (int i = 0; i < (int)VX_COUNT(top_tabs); i++) {
+		int w = top_tab_w(i);
+		bool active = app.side_visible && app.side_view == top_tabs[i].view;
+		bool hover = in_rect(app.hover_x, app.hover_y, x, 0, w, h);
+		draw_rect(x, 0, w, h - (active ? 0 : PX(1)), active ? COL(C_TAB_ACTIVE_BG) : COL(C_TAB_INACTIVE_BG));
 		if (active)
-			draw_rect(0, y, PX(2), PX(48), COL(C_ACTBAR_ACTIVE_BORDER));
-		draw_icon(icons[i], (app.act_w - PX(24)) / 2, y + PX(12), c);
-		if (i == SIDE_SCM && app.git) {
-			/* badge with the number of changes */
+			draw_rect(x, 0, w, PX(1), COL(C_TAB_ACTIVE_BORDER_TOP));
+		draw_rect(x + w - PX(1), 0, PX(1), h, COL(C_TAB_BORDER));
+		u32 fg = active || hover ? COL(C_TAB_ACTIVE_FG) : COL(C_TAB_INACTIVE_FG);
+		draw_icon(top_tabs[i].icon, x + PX(10), (h - PX(16)) / 2, fg);
+		const char *lb = top_tabs[i].label;
+		int tx = draw_text(FONT_SMALL, x + PX(32), (h - font_m[FONT_SMALL].line) / 2, lb, strlen(lb), fg);
+		if (top_tabs[i].view == SIDE_SCM && app.git) {
+			/* number of changes, like the activity bar badge */
 			const GitStatus *st = git_status(app.git);
 			u32 n = 0;
 			for (u32 k = 0; k < st->count; k++)
@@ -2707,20 +2890,15 @@ static void draw_activity_bar(void)
 			if (n) {
 				char b[16];
 				int bn = snprintf(b, sizeof b, "%u", n > 9999 ? 9999 : n);
-				int bw = VX_MAX(PX(16), font_width(FONT_SMALL, b, (size_t)bn) + PX(8));
-				int bx = app.act_w - PX(10) - bw + PX(6), by = y + PX(26);
-				draw_rect(bx, by, bw, PX(16), COL(C_BADGE_BG));
-				int tw = font_width(FONT_SMALL, b, (size_t)bn);
-				draw_text(FONT_SMALL, bx + (bw - tw) / 2, by + (PX(16) - font_m[FONT_SMALL].line) / 2, b,
-				          (size_t)bn, COL(C_BADGE_FG));
+				int bw = VX_MAX(PX(14), font_width(FONT_SMALL, b, (size_t)bn) + PX(6));
+				int bx = tx + PX(4), by = (h - PX(14)) / 2;
+				draw_rect(bx, by, bw, PX(14), COL(C_BADGE_BG));
+				draw_text(FONT_SMALL, bx + (bw - font_width(FONT_SMALL, b, (size_t)bn)) / 2,
+				          by + (PX(14) - font_m[FONT_SMALL].line) / 2, b, (size_t)bn, COL(C_BADGE_FG));
 			}
 		}
+		x += w;
 	}
-	/* theme toggle (gear position) at the bottom */
-	int gy = h - PX(48);
-	bool hover = in_rect(app.hover_x, app.hover_y, 0, gy, app.act_w, PX(48));
-	draw_icon(ICON_GEAR, (app.act_w - PX(24)) / 2, gy + PX(12),
-	          hover ? COL(C_ACTBAR_FG) : COL(C_ACTBAR_FG_INACTIVE));
 }
 
 static void draw_sidebar(void)
@@ -2734,10 +2912,12 @@ static void draw_sidebar(void)
 		explorer_draw(x, y, w - PX(1), h);
 	else if (app.side_view == SIDE_SEARCH)
 		search_draw(x, y, w - PX(1), h);
-	else
+	else if (app.side_view == SIDE_SCM)
 		scm_draw(x, y, w - PX(1), h);
+	else
+		settings_draw(x, y, w - PX(1), h);
 	draw_noclip();
-	if (app.drag == DRAG_SIDE || (abs(app.hover_x - (x + w)) <= PX(2) && app.hover_y < h))
+	if (app.drag == DRAG_SIDE || (abs(app.hover_x - (x + w)) <= PX(2) && app.hover_y >= y && app.hover_y < y + h))
 		draw_rect(x + w - PX(2), y, PX(4), h, COL(C_SASH_HOVER));
 }
 
@@ -2884,13 +3064,24 @@ static void draw_status(void)
 	/* right side */
 	int rx = app.w - PX(8);
 	View *v = active_view();
-	if (app.lsp) {
-		const char *s = app.lsp_ready ? "clangd" : "clangd (starting)";
-		rx = status_item(rx, y, s, strlen(s), true);
+	{
+		/* the server of the active document (clangd when none) */
+		int sv = v && app.docs.lsp_sv[v->doc] >= 0 ? app.docs.lsp_sv[v->doc] : LSV_CLANGD;
+		if (app.lsps[sv]) {
+			char s[64];
+			snprintf(s, sizeof s, "%s%s", lsv_name(sv), app.lsps_ready[sv] ? "" : " (starting)");
+			rx = status_item(rx, y, s, strlen(s), true);
+		}
 	}
 	if (v) {
 		Docs *D = &app.docs;
 		Text *t = &D->text[v->doc];
+		if (D->bin[v->doc] && v->diff_left == UINT32_MAX) {
+			char bs[256];
+			binview_status(v, bs, sizeof bs);
+			rx = status_item(rx, y, bs, strlen(bs), true);
+			return;
+		}
 		const char *ln = syn_lang_name(D->lang[v->doc]);
 		rx = status_item(rx, y, ln, strlen(ln), true);
 		if (app.overtype)
@@ -2941,7 +3132,7 @@ void ui_draw(void)
 	}
 	if (app.side_visible)
 		draw_sidebar();
-	draw_activity_bar();
+	draw_top_tabs();
 	if (app.panel_visible)
 		draw_panel();
 	draw_status();
@@ -3041,18 +3232,19 @@ extern void ed_take_completion(const LspEvent *ev);
 extern void ed_take_hover(const LspEvent *ev);
 extern void ed_take_definition(const LspEvent *ev);
 
-static void lsp_tick(void)
+static void lsp_tick_one(int sv)
 {
-	if (!app.lsp)
+	Lsp *L = app.lsps[sv];
+	if (!L)
 		return;
-	lsp_pump(app.lsp);
+	lsp_pump(L);
 	LspEvent ev;
-	while (lsp_next(app.lsp, &ev)) {
+	while (lsp_next(L, &ev)) {
 		app.dirty = true;
 		switch (ev.type) {
 		case LSP_EV_READY:
-			app.lsp_ready = true;
-			ui_log("[lsp] ready");
+			app.lsps_ready[sv] = true;
+			ui_log("[lsp] %s ready", lsv_name(sv));
 			break;
 		case LSP_EV_DIAGNOSTICS:
 			take_diags(&ev);
@@ -3076,8 +3268,8 @@ static void lsp_tick(void)
 			ui_log("[lsp] %s", ev.text ? ev.text : "");
 			break;
 		case LSP_EV_EXIT:
-			ui_log("[lsp] server exited");
-			app.lsp_ready = false;
+			ui_log("[lsp] %s exited", lsv_name(sv));
+			app.lsps_ready[sv] = false;
 			break;
 		default:
 			break;
@@ -3087,20 +3279,26 @@ static void lsp_tick(void)
 	u64 now = vx_now_ns();
 	Docs *D = &app.docs;
 	for (u32 d = 0; d < D->n; d++) {
-		if (!D->lsp_open[d])
+		if (!D->lsp_open[d] || D->lsp_sv[d] != sv)
 			continue;
 		Text *t = &D->text[d];
 		if (D->lsp_sent[d] != t->version && now - D->lsp_changed_ns[d] > 150000000ull) {
 			D->lsp_ver[d]++;
-			lsp_did_change(app.lsp, D->path[d], D->lsp_ver[d], text_flat(t), t->len);
+			lsp_did_change(L, D->path[d], D->lsp_ver[d], text_flat(t), t->len);
 			D->lsp_sent[d] = t->version;
 		}
-		if (app.lsp_ready && D->sem_req[d] < 0 && D->sem_for[d] != t->version &&
+		if (app.lsps_ready[sv] && D->sem_req[d] < 0 && D->sem_for[d] != t->version &&
 		    D->lsp_sent[d] == t->version && D->refs[d]) {
-			D->sem_req[d] = lsp_semantic_tokens(app.lsp, D->path[d]);
+			D->sem_req[d] = lsp_semantic_tokens(L, D->path[d]);
 			D->sem_for[d] = t->version;
 		}
 	}
+}
+
+static void lsp_tick(void)
+{
+	for (int sv = 0; sv < LSV_COUNT; sv++)
+		lsp_tick_one(sv);
 }
 
 /* Repo-relative path of a document inside the work tree, or NULL. */
@@ -3339,6 +3537,14 @@ void ui_tick(void)
 	app.now = vx_now_ns();
 	lsp_tick();
 	git_tick();
+	{
+		/* a background disassembly finished: show it */
+		static bool bin_was_busy;
+		bool busy = binview_busy();
+		if (bin_was_busy && !busy)
+			app.dirty = true;
+		bin_was_busy = busy;
+	}
 	blame_tick();
 	watch_tick();
 	if (bg_files_poll()) {
@@ -3381,8 +3587,11 @@ void ui_tick(void)
 
 u64 ui_wait_hint_ms(void)
 {
-	if (app.lsp && !app.lsp_ready)
-		return 30;
+	for (int sv = 0; sv < LSV_COUNT; sv++)
+		if (app.lsps[sv] && !app.lsps_ready[sv])
+			return 30;
+	if (binview_busy())
+		return 20;
 	return 250;
 }
 
@@ -3402,7 +3611,8 @@ bool ui_init(const char *root, int w, int h, int scale, bool headless)
 	if (th && strcmp(th, "light") == 0)
 		app.theme = THEME_LIGHT;
 	app.side_visible = true;
-	app.side_w = PX(300);
+	app.side_w = PX(150);
+	app.minimap_on = true;
 	app.panel_h = h / 3;
 	app.ngroups = 1;
 	app.compl_req = app.hover_req = app.def_req = -1;
@@ -3449,9 +3659,11 @@ void ui_shutdown(void)
 	for (u32 gi = 0; gi < app.ngroups; gi++)
 		while (app.groups[gi].nt)
 			close_tab(gi, app.groups[gi].nt - 1);
-	if (app.lsp)
-		lsp_stop(app.lsp);
-	app.lsp = NULL;
+	for (int sv = 0; sv < LSV_COUNT; sv++) {
+		if (app.lsps[sv])
+			lsp_stop(app.lsps[sv]);
+		app.lsps[sv] = NULL;
+	}
 	bg_shutdown();
 	blame_stop(app.blame);
 	app.blame = NULL;

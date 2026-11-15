@@ -4,11 +4,12 @@ CC?=		cc
 PKG_CONFIG?=	pkg-config
 GLSLANG?=	glslangValidator
 
-PKGS=		sdl3 freetype2 libgit2 vulkan
+PKGS=		sdl3 freetype2 libgit2 vulkan capstone
 PKG_CFLAGS!=	${PKG_CONFIG} --cflags ${PKGS}
 PKG_LIBS!=	${PKG_CONFIG} --libs ${PKGS}
 GIT_CFLAGS!=	${PKG_CONFIG} --cflags libgit2
 GIT_LIBS!=	${PKG_CONFIG} --libs libgit2
+CS_LIBS!=	${PKG_CONFIG} --libs capstone
 
 OPT?=		-O2 -g
 CFLAGS+=	-std=c11 -pedantic ${OPT} -Wall -Wextra -Wno-unused-parameter \
@@ -18,9 +19,9 @@ LDLIBS+=	${PKG_LIBS} -lm -lpthread
 B=		build
 
 # Core modules: no window or GPU, unit-tested on their own.
-CORE=		base text syntax theme fstree fswatch json lsp git gitops gitgraph githunk lgblame blame regex search png
+CORE=		base text syntax theme fstree fswatch json lsp git gitops gitgraph githunk lgblame blame regex search png binfile
 # Front end: window, Vulkan, fonts, UI.
-APP=		main gpu font icons draw ui editor panes menu actions gitui bgwork diffview
+APP=		main gpu font icons draw ui editor panes menu actions gitui bgwork diffview binview
 
 HDRS!=		ls src/*.h
 SHADERS=	${B}/ui_vert.h ${B}/ui_frag.h
@@ -28,7 +29,7 @@ SHADERS=	${B}/ui_vert.h ${B}/ui_frag.h
 CORE_OBJS=	${CORE:S/^/${B}\//:S/$/.o/}
 APP_OBJS=	${APP:S/^/${B}\//:S/$/.o/}
 
-TESTS=		t_text t_syntax t_json t_lsp t_git t_gitops t_gitgraph t_githunk t_blame t_fstree t_regex t_search
+TESTS=		t_text t_syntax t_json t_lsp t_git t_gitops t_gitgraph t_githunk t_blame t_fstree t_regex t_search t_binfile
 TEST_BINS=	${TESTS:S/^/${B}\//}
 
 all: ${B}/vxide
@@ -51,7 +52,7 @@ ${B}/vxide: ${CORE_OBJS} ${APP_OBJS}
 
 .for t in ${TESTS}
 ${B}/${t}: tests/${t}.c tests/tap.h ${CORE_OBJS}
-	${CC} ${CFLAGS} -Itests -o ${.TARGET} tests/${t}.c ${CORE_OBJS} ${GIT_LIBS} -lm -lpthread
+	${CC} ${CFLAGS} -Itests -o ${.TARGET} tests/${t}.c ${CORE_OBJS} ${GIT_LIBS} ${CS_LIBS} -lm -lpthread
 .endfor
 
 test: ${TEST_BINS} ${B}/vxide

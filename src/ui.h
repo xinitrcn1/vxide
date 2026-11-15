@@ -33,6 +33,8 @@ typedef struct Event {
 
 #define MAX_DOCS 256
 
+enum { LSV_CLANGD, LSV_RUST, LSV_COUNT };
+
 typedef struct {
 	u32 n;
 	Text text[MAX_DOCS];
@@ -42,6 +44,7 @@ typedef struct {
 	u8 untitled[MAX_DOCS];
 	u8 tabs[MAX_DOCS]; /* indentation uses tabs (detected) */
 	u8 readonly[MAX_DOCS]; /* virtual documents (diffs, commits) */
+	u8 bin[MAX_DOCS];      /* binary: hex editor / disassembly (binview.c) */
 	u32 refs[MAX_DOCS]; /* views showing it */
 
 	/* highlighter: lexer state at the start of each line */
@@ -51,6 +54,7 @@ typedef struct {
 
 	/* LSP sync */
 	bool lsp_open[MAX_DOCS];
+	i8 lsp_sv[MAX_DOCS]; /* LSV_* serving it, -1 none */
 	i32 lsp_ver[MAX_DOCS];
 	u32 lsp_sent[MAX_DOCS]; /* text version last sent */
 	u64 lsp_changed_ns[MAX_DOCS];
@@ -91,6 +95,8 @@ typedef struct {
 	/* diff editor: this view shows `doc` on the right and diff_left (a
 	 * read-only original) on the left; UINT32_MAX when not a diff */
 	u32 diff_left;
+	/* multi-part views (an executable's sections): subtabs under the tabs */
+	u32 nparts, part;
 	u8 diff_kind; /* DIFF_WORKTREE, DIFF_STAGED, DIFF_COMMIT */
 	char diff_rel[512];
 	u32 group;    /* undo group currently being extended */
@@ -111,7 +117,7 @@ typedef struct {
 /* ---- workbench ---------------------------------------------------------- */
 
 enum { DIFF_WORKTREE = 1, DIFF_STAGED, DIFF_COMMIT };
-enum { SIDE_EXPLORER, SIDE_SEARCH, SIDE_SCM, SIDE_COUNT };
+enum { SIDE_EXPLORER, SIDE_SEARCH, SIDE_SCM, SIDE_SETTINGS, SIDE_COUNT };
 enum { PANEL_PROBLEMS, PANEL_OUTPUT, PANEL_COUNT };
 enum {
 	FOCUS_EDITOR,
@@ -149,7 +155,8 @@ typedef struct {
 	u64 blink_t0;
 
 	/* metrics */
-	int act_w, side_w, status_h, tabs_h, crumbs_h, panel_h;
+	int act_w, top_h, side_w, status_h, tabs_h, subtabs_h, crumbs_h, panel_h;
+	bool minimap_on; /* settings */
 	int line_h, char_w, row_h;
 
 	/* layout results */
@@ -218,8 +225,11 @@ typedef struct {
 	u64 git_ns;
 
 	/* LSP */
-	Lsp *lsp;
-	bool lsp_ready;
+	/* language servers: clangd (C, C++) and rust-analyzer, started when
+	 * a document needs them */
+	Lsp *lsps[LSV_COUNT];
+	bool lsps_ready[LSV_COUNT];
+	bool lsps_failed[LSV_COUNT];
 	i32 compl_req, hover_req, def_req;
 	u32 compl_doc;
 	char compl_prefix[128];
@@ -334,6 +344,23 @@ void ui_clipboard_set(const char *s, size_t n);
 /* documents */
 u32 doc_open(const char *abs_path); /* returns doc index or UINT32_MAX */
 u32 doc_find(const char *abs_path);  /* open document for a path, or UINT32_MAX */
+int group_tabs_h(Group *g); /* tab rows (+ subtab row) */
+int group_head_h(Group *g); /* tabs + breadcrumbs */
+/* binview.c: subtabs of multi-part views */
+void view_subtabs_draw(View *v, int x, int y, int w, int h);
+void view_subtab_click(View *v, int rel_x, int rel_y, int w);
+int view_subtabs_height(View *v, int w);
+void binview_init(View *v);
+void binview_closed(View *v);
+void binview_doc_released(u32 d);
+void binview_draw(View *v, int x, int y, int w, int h, bool focused);
+bool binview_key(View *v, const Event *e);
+void binview_mouse(View *v, const Event *e, int x, int y, int w, int h);
+bool binview_command(int cmd);
+void binview_context(View *v, int x, int y);
+void binview_prompt_accept(int kind, const char *text);
+void binview_status(View *v, char *buf, size_t cap);
+bool binview_busy(void);
 u32 doc_new_untitled(void);
 void doc_release(u32 d);
 void doc_release_unref(u32 d);
@@ -345,6 +372,9 @@ int file_icon_draw(const char *name, int x, int y, int h);
 void open_file(const char *abs_path, bool preview, u32 line, u32 col);
 void open_rel(const char *rel, bool preview, u32 line, u32 col);
 View *active_view(void);
+/* The ready language server of a document that is open on it, else NULL. */
+Lsp *doc_lsp(u32 d);
+const char *lsv_name(int sv);
 void close_tab(u32 g, u32 t);
 
 /* editor.c */
@@ -404,6 +434,8 @@ void scm_refresh(void);
 void problems_draw(int x, int y, int w, int h);
 bool problems_event(const Event *e, int x, int y, int w, int h);
 void output_draw(int x, int y, int w, int h);
+void settings_draw(int x, int y, int w, int h);
+bool settings_event(const Event *e, int x, int y, int w, int h);
 bool output_event(const Event *e, int x, int y, int w, int h);
 u32 problems_count(int sev);
 
@@ -413,6 +445,11 @@ bool input_key(Input *in, const Event *e); /* edit keys; false if unhandled */
 void input_text(Input *in, const char *s, size_t n);
 void input_draw(Input *in, int x, int y, int w, int h, const char *placeholder, bool focused);
 void input_click(Input *in, int font, int x0, int mx);
+/* Wrapped boxes: reserve = width kept free on the right for icons; long
+ * text adds rows instead of running under them. */
+int input_height(Input *in, int w, int reserve);
+int input_draw_ex(Input *in, int x, int y, int w, int reserve, const char *ph, bool focused);
+void input_click_ex(Input *in, int x, int y, int w, int reserve, int mx, int my, int clicks);
 
 /* actions.c: context menus, picker results, the commands below CMD_QUIT */
 void ctx_menu_editor(View *v, int x, int y, u32 off);
@@ -459,6 +496,7 @@ enum {
 	CMD_VIEW_EXPLORER,
 	CMD_VIEW_SEARCH,
 	CMD_VIEW_SCM,
+	CMD_VIEW_SETTINGS,
 	CMD_VIEW_PROBLEMS,
 	CMD_VIEW_OUTPUT,
 	CMD_SPLIT,
@@ -599,6 +637,10 @@ enum {
 	CMD_CONFLICT_PREV,
 	CMD_DIFF_NEXT_CHANGE,
 	CMD_DIFF_PREV_CHANGE,
+	CMD_HEX_ADD_TAG,
+	CMD_HEX_REMOVE_TAG,
+	CMD_HEX_GOTO,
+	CMD_HEX_ENDIAN,
 	CMD_COUNT
 };
 

@@ -1088,10 +1088,10 @@ void gitui_draw_popups(void)
 	if (!app.git)
 		return;
 	u64 now = vx_now_ns();
-	if (app.side_visible && app.side_view == SIDE_SCM && hover_row < graph.n && now - hover_t0 > 500000000ull &&
+	if (app.side_visible && app.side_view == SIDE_SCM && hover_row < graph.n && now - hover_t0 > 250000000ull &&
 	    !menu_is_open() && !app.quick)
 		draw_card(graph.hash[hover_row], app.hover_x + PX(12), app.hover_y);
-	if (app.blame_hover && now - app.blame_hover_t > 300000000ull && !menu_is_open() && !app.quick)
+	if (app.blame_hover && now - app.blame_hover_t > 150000000ull && !menu_is_open() && !app.quick)
 		draw_card(app.blame_hover_hash, app.blame_hover_x, app.blame_hover_y);
 }
 
