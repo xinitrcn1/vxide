@@ -128,6 +128,23 @@ DejaVu Sans Mono for code, with DejaVu Sans as the fallback.
   marks in the overview ruler. "Profile: Go to Next / Previous Hot Line"
   walks them; "Profile: Annotate Source with Profile..." picks the
   profile; "Profile: Open Raw Report" shows gprof's or gcov's own text.
+- **Workflow** (CMake, run, debug): a side bar tab. CMake: configure
+  presets (CMakePresets.json with inherits / include / macros) or
+  ./build, Configure and Build, the cache options (booleans toggle,
+  values edit, advanced on demand). Run: an executable target from the
+  CMake File API or any program, with arguments, in the project's folder,
+  building first. Debug over DAP with lldb-dap (or gdb -i dap; VXIDE_DAP
+  picks one): breakpoints in the gutter (F9, conditions, kept in the
+  session and moved with the text), the execution line, step over / into
+  / out (F10 / F11 / Shift+F11), continue / pause / stop / restart (F5,
+  F6, Shift+F5, Ctrl+Shift+F5), the call stack of every thread (switch
+  threads, select frames), variables by scope including registers
+  (changed values marked), watch expressions, hardware watchpoints (break
+  on write / read / both; the slots in use; software ones with gdb), and
+  the debugger's value of the expression under the pointer in the hover
+  next to the language server's. On FreeBSD's lldb, expressions that
+  need the JIT (arithmetic, function calls) cannot be evaluated; plain
+  variables, members and elements can.
 - **Profiling** (FreeBSD): a top-level tab for hardware counters through
   hwpmc and pmcstat(8). It checks pmcstat first and, when the counters
   cannot be used, shows how to enable them (kldload hwpmc, loader.conf,
@@ -269,6 +286,8 @@ DejaVu Sans Mono for code, with DejaVu Sans as the fallback.
 | Ctrl+Space, Ctrl+K Ctrl+I | Suggest, hover |
 | F12, Ctrl+click, Ctrl+Alt+-, Ctrl+Shift+- | Definition, back, forward |
 | F8, Shift+F8 | Next/previous problem |
+| F5, Ctrl+F5, Shift+F5, Ctrl+Shift+F5 | Debug / continue, run without debugging, stop, restart |
+| F9, F10, F11, Shift+F11, F6 | Toggle breakpoint, step over, step into, step out, pause |
 | Ctrl+K Ctrl+T | Toggle dark/light theme (also in Settings) |
 | Ctrl+, | Settings (theme, blame, minimap, language servers) |
 | Ctrl+Shift+P | Command palette (delete the `>` to search files); includes Transform to Upper/Lower/Title/Snake/Kebab Case |
@@ -310,6 +329,7 @@ the script command `heap` measure it.
 | `src/ui.c` | Layout, input routing, keybindings, commands, tabs, status bar, quick input |
 | `src/editor.c` | Editor drawing and editing, find, completion, hover |
 | `src/binfile.c`, `src/binview.c` | ELF/PE/Mach-O sections and symbols, capstone disassembly, data inspector; the hex editor and section subtabs |
+| `src/dap.c`, `src/cmake.c`, `src/workflow.c` | DAP client and session model; CMake presets, cache and File API targets; the Workflow side bar and the editor's debug decorations |
 | `src/prof.c`, `src/profview.c` | Profile parsers (massif, jemalloc, gmon, gcov), addr2line, gprof propagation, call trees; the profile tabs and source heat colouring |
 | `src/panes.c` | Explorer, Search, Source Control, Settings workspace, Problems, Output, wrapping input box |
 | `src/man.c` | Manpages workspace: mandoc rendering, links, apropos Index |
