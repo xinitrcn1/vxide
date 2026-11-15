@@ -2112,6 +2112,7 @@ void ed_hover_request(View *v)
 	free(app.hover_text);
 	app.hover_text = NULL;
 	app.hover_open = true; /* diagnostics show even without a reply */
+	dbg_hover_request(v, off); /* the debugger's value, next to the language server's */
 	if (!lsp_doc(v))
 		return;
 	flush_change(v);
@@ -2253,6 +2254,18 @@ void ed_mouse(View *v, const Event *e, int x, int y, int w, int h)
 		drag_mode = 6;
 		app.drag = 3; /* DRAG_EDITOR in ui.c */
 		return;
+	}
+	if (e->type == EV_MDOWN && e->button == 1 && app.docs.path[v->doc]) {
+		/* the margin left of the line numbers: breakpoints */
+		int bx = x + profann_gutter_w(v->doc);
+		if (e->x >= bx && e->x < bx + PX(18)) {
+			i64 py = (i64)(e->y - y) + v->scroll_y;
+			u32 l = py < 0 ? 0 : (u32)(py / app.line_h);
+			if (l < text_lines(t) && dbg_gutter_click(v, l)) {
+				app.dirty = true;
+				return;
+			}
+		}
 	}
 	if (e->type == EV_MDOWN && e->button == 1 && app.git) {
 		/* a click on the git change bar in the gutter (VSCodium's quick diff peek) */
@@ -2764,6 +2777,7 @@ void ed_draw(Group *g, View *v, int x, int y, int w, int h, bool focused)
 	/* a profile's cost per line (profview.c), under everything else */
 	draw_clip(text_x, y, text_w, h);
 	profann_lines(d, first, last, text_x, text_w, y0, lh);
+	dbg_lines(d, first, last, text_x, text_w, y0, lh);
 	draw_clip(x, y, w - mm - SCROLL_W, h);
 	/* backgrounds: current line, selections, matches */
 	for (u32 l = first; l < last; l++) {
@@ -3017,6 +3031,7 @@ void ed_draw(Group *g, View *v, int x, int y, int w, int h, bool focused)
 	int nd = VX_MAX(digits(nl), 5);
 	int ann_w = profann_gutter_w(d);
 	profann_gutter(d, first, last, x, y0, lh);
+	dbg_gutter(d, first, last, x + ann_w, y0, lh); /* breakpoints, the execution point */
 	int num_r = x + ann_w + PX(18) + nd * app.char_w;
 	for (u32 l = first; l < last; l++) {
 		int ly = y0 + (int)(l - first) * lh;
@@ -3121,6 +3136,7 @@ void ed_draw(Group *g, View *v, int x, int y, int w, int h, bool focused)
 				draw_rect(sx + SCROLL_W - lane, my, lane, PX(3), sev == LSP_SEV_ERROR ? COL(C_ERROR) : COL(C_WARNING));
 			}
 			profann_ruler(d, sx + lane + PX(1), y, lane, h, nl);
+			dbg_ruler(d, sx + lane + PX(1), y, lane, h, nl);
 			int cy = y + (int)((i64)cur_line * h / VX_MAX((i64)nl, 1));
 			draw_rect(sx + PX(1), cy, SCROLL_W - PX(1), PX(2), (COL(C_CURSOR) & 0xFFFFFF00u) | 0xA0u);
 		}
@@ -3359,6 +3375,11 @@ void ed_draw_popups(View *v)
 			int y = py + pad;
 			int lines = 0;
 			bool any = false;
+			const char *dv = dbg_hover_text(v->doc, app.hover_off);
+			if (dv) {
+				wrap_draw(FONT_MONO, px + pad, &y, pw - 2 * pad, dv, strlen(dv), 0xE5B000FFu, pass == 1);
+				any = true;
+			}
 			for (u32 i = 0; i < D->dn[v->doc]; i++) {
 				bool on = D->d_line0[v->doc][i] <= l && D->d_line1[v->doc][i] >= l;
 				if (on && D->d_line0[v->doc][i] == l && D->d_line1[v->doc][i] == l)

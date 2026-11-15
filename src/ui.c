@@ -526,6 +526,7 @@ void doc_replace(u32 d, u32 pos, u32 del, const char *ins, u32 nins, u32 group)
 	if (D->lstate_ok[d] > L)
 		D->lstate_ok[d] = L;
 	shift_lines(d, L, L1 - L, added);
+	dbg_shift_lines(d, L, L1 - L, added); /* breakpoints move with their lines */
 	i64 delta = (i64)nins - (i64)del;
 	for (u32 g = 0; g < app.ngroups; g++)
 		for (u32 k = 0; k < app.groups[g].nt; k++) {
@@ -1112,9 +1113,16 @@ static const Binding bindings[] = {
     {C | A, SDLK_S, W_EDITOR, CMD_GIT_STAGE_RANGES, 1},
     {C, SDLK_N, W_EDITOR, CMD_GIT_UNSTAGE_RANGES, 1},
     {C, SDLK_R, W_EDITOR, CMD_GIT_REVERT_RANGES, 1},
-    {0, SDLK_F5, W_ANY, CMD_GODOT_RUN, 0},
-    {S, SDLK_F5, W_ANY, CMD_GODOT_STOP, 0},
-    {0, SDLK_F6, W_ANY, CMD_GODOT_RUN_SCENE, 0},
+    /* the debugger (in a Godot project with nothing else to run, Godot's) */
+    {0, SDLK_F5, W_ANY, CMD_DBG_START, 0},
+    {C, SDLK_F5, W_ANY, CMD_DBG_RUN, 0},
+    {S, SDLK_F5, W_ANY, CMD_DBG_STOP, 0},
+    {C | S, SDLK_F5, W_ANY, CMD_DBG_RESTART, 0},
+    {0, SDLK_F6, W_ANY, CMD_DBG_PAUSE, 0},
+    {0, SDLK_F9, W_EDITOR, CMD_DBG_TOGGLE_BP, 0},
+    {0, SDLK_F10, W_ANY, CMD_DBG_STEP_OVER, 0},
+    {0, SDLK_F11, W_ANY, CMD_DBG_STEP_INTO, 0},
+    {S, SDLK_F11, W_ANY, CMD_DBG_STEP_OUT, 0},
     {A, SDLK_F5, W_EDITOR, CMD_DIFF_NEXT_CHANGE, 0},
     {S | A, SDLK_F5, W_EDITOR, CMD_DIFF_PREV_CHANGE, 0},
     {S, SDLK_F12, W_EDITOR, CMD_GOTO_REFERENCES, 0},
@@ -1206,6 +1214,29 @@ static const char *cmd_titles[CMD_COUNT] = {
     [CMD_PROF_FIND] = "Profile: Highlight Functions in Flame Graph...",
     [CMD_MD_PREVIEW] = "Markdown: Toggle Preview",
     [CMD_VIEW_PMC] = "View: Show Profiling (hwpmc)",
+    [CMD_VIEW_WORKFLOW] = "View: Show Workflow (CMake, Run, Debug)",
+    [CMD_DBG_START] = "Debug: Start Debugging / Continue",
+    [CMD_DBG_RUN] = "Debug: Run Without Debugging",
+    [CMD_DBG_STOP] = "Debug: Stop",
+    [CMD_DBG_RESTART] = "Debug: Restart",
+    [CMD_DBG_PAUSE] = "Debug: Pause",
+    [CMD_DBG_STEP_OVER] = "Debug: Step Over",
+    [CMD_DBG_STEP_INTO] = "Debug: Step Into",
+    [CMD_DBG_STEP_OUT] = "Debug: Step Out",
+    [CMD_DBG_TOGGLE_BP] = "Debug: Toggle Breakpoint",
+    [CMD_DBG_BP_CONDITION] = "Debug: Edit Breakpoint Condition...",
+    [CMD_DBG_CLEAR_BPS] = "Debug: Remove All Breakpoints",
+    [CMD_DBG_ADD_WATCH] = "Debug: Add to Watch",
+    [CMD_DBG_WATCHPOINT] = "Debug: Break When Value Is Written (Watchpoint)",
+    [CMD_DBG_VAR_WATCH] = "Debug: Watch Variable",
+    [CMD_DBG_VAR_BREAK_W] = "Debug: Break on Write",
+    [CMD_DBG_VAR_BREAK_R] = "Debug: Break on Read",
+    [CMD_DBG_VAR_BREAK_RW] = "Debug: Break on Read or Write",
+    [CMD_DBG_VAR_COPY] = "Debug: Copy Value",
+    [CMD_CMAKE_CONFIGURE] = "CMake: Configure",
+    [CMD_CMAKE_BUILD] = "CMake: Build",
+    [CMD_CMAKE_PRESET] = "CMake: Select Configure Preset",
+    [CMD_CMAKE_TARGET] = "CMake: Select Target to Run / Debug",
     [CMD_PASTE] = "Paste",
     [CMD_SELECT_ALL] = "Select All",
     [CMD_SELECT_LINE] = "Expand Line Selection",
@@ -2089,6 +2120,8 @@ void run_command(int cmd)
 		return;
 	if (profview_command(cmd))
 		return;
+	if (workflow_command(cmd))
+		return;
 	if (actions_command(cmd))
 		return;
 	{
@@ -2461,7 +2494,8 @@ static bool in_rect(int x, int y, int rx, int ry, int rw, int rh)
 static bool focus_is_input(void)
 {
 	return app.focus == FOCUS_QUICK || app.focus == FOCUS_FIND ||
-	       app.focus == FOCUS_SEARCH_INPUT || app.focus == FOCUS_SCM_INPUT || app.focus == FOCUS_MAN_INPUT;
+	       app.focus == FOCUS_SEARCH_INPUT || app.focus == FOCUS_SCM_INPUT || app.focus == FOCUS_MAN_INPUT ||
+	       app.focus == FOCUS_SIDE_INPUT;
 }
 
 static int key_mods(int m) { return m & (MOD_CTRL | MOD_SHIFT | MOD_ALT); }
@@ -2518,7 +2552,8 @@ static void sidebar_event(const Event *e, int x, int y, int w, int h)
 		search_event(e, x, y, w, h);
 	else if (app.side_view == SIDE_SCM)
 		scm_event(e, x, y, w, h);
-	(void)0;
+	else if (app.side_view == SIDE_WORKFLOW)
+		workflow_event(e, x, y, w, h);
 }
 
 /* ---- tooltips ---------------------------------------------------------------
@@ -2606,6 +2641,7 @@ static const struct {
     {SIDE_EXPLORER, ICON_FILES_S, CMD_VIEW_EXPLORER, "Project"},
     {SIDE_SCM, ICON_SCM_S, CMD_VIEW_SCM, "Git"},
     {SIDE_SEARCH, ICON_SEARCH_S, CMD_VIEW_SEARCH, "Search"},
+    {SIDE_WORKFLOW, ICON_PLAY_S, CMD_VIEW_WORKFLOW, "Workflow"},
     {SIDE_MAN, ICON_BOOK_S, CMD_VIEW_MAN, "Manpages"},
     {SIDE_PMC, ICON_PULSE_S, CMD_VIEW_PMC, "Profiling"},
     {SIDE_SETTINGS, ICON_GEAR_S, CMD_VIEW_SETTINGS, "Settings"},
@@ -2699,6 +2735,13 @@ static void context_click(int mx, int my)
 		} else if (app.side_view == SIDE_SCM) {
 			extern bool scm_context(int x, int y, int w, int h, int mx, int my);
 			scm_context(x, app.top_h, w, h, mx, my);
+		} else if (app.side_view == SIDE_WORKFLOW) {
+			Event ev = {0};
+			ev.type = EV_MDOWN;
+			ev.button = 3;
+			ev.x = mx;
+			ev.y = my;
+			workflow_event(&ev, x, app.top_h, w, h);
 		}
 		return;
 	}
@@ -2898,6 +2941,7 @@ void ui_event(const Event *e)
 		}
 		case FOCUS_SEARCH_INPUT:
 		case FOCUS_SCM_INPUT:
+		case FOCUS_SIDE_INPUT:
 		case FOCUS_SIDEBAR: {
 			int x, y, w, h;
 			sidebar_area(&x, &y, &w, &h);
@@ -2954,6 +2998,7 @@ void ui_event(const Event *e)
 		}
 		case FOCUS_SEARCH_INPUT:
 		case FOCUS_SCM_INPUT:
+		case FOCUS_SIDE_INPUT:
 		case FOCUS_SIDEBAR: {
 			int x, y, w, h;
 			sidebar_area(&x, &y, &w, &h);
@@ -3556,7 +3601,9 @@ static void draw_top_tabs(void)
 		bool active = app.side_view == top_tabs[i].view && (ws || app.side_visible);
 		bool hover = in_rect(app.hover_x, app.hover_y, x, 0, w, h);
 		static const char *const tips[] = {"Project: Explorer (Ctrl+Shift+E)", "Git: Source Control (Ctrl+Shift+G)",
-		                                   "Search (Ctrl+Shift+F)", "Manpages: read and search manual pages",
+		                                   "Search (Ctrl+Shift+F)",
+		                                   "Workflow: CMake, run and debug (F5)",
+		                                   "Manpages: read and search manual pages",
 		                                   "Profiling: hardware counters with pmcstat (FreeBSD)", "Settings (Ctrl+,)"};
 		if (i < (int)VX_COUNT(tips))
 			ui_tip(x, 0, w, h, tips[i]);
@@ -3600,7 +3647,8 @@ static void draw_sidebar(void)
 		search_draw(x, y, w - PX(1), h);
 	else if (app.side_view == SIDE_SCM)
 		scm_draw(x, y, w - PX(1), h);
-	(void)0;
+	else if (app.side_view == SIDE_WORKFLOW)
+		workflow_draw(x, y, w - PX(1), h);
 	draw_noclip();
 	if (app.drag == DRAG_SIDE || (abs(app.hover_x - (x + w)) <= PX(2) && app.hover_y >= y && app.hover_y < y + h))
 		draw_rect(x + w - PX(2), y, PX(4), h, COL(C_SASH_HOVER));
@@ -4360,6 +4408,7 @@ void ui_tick(void)
 		static bool bin_was_busy;
 		profview_tick();
 		pmcview_tick();
+		workflow_tick();
 		binview_tick(); /* a disassembly search in progress */
 		bool busy = binview_busy();
 		if (bin_was_busy && !busy)
@@ -4415,7 +4464,7 @@ u64 ui_wait_hint_ms(void)
 	for (int sv = 0; sv < LSV_COUNT; sv++)
 		if (app.lsps[sv] && !app.lsps_ready[sv])
 			return 30;
-	if (binview_busy() || projtools_busy() || pmcview_busy())
+	if (binview_busy() || projtools_busy() || pmcview_busy() || workflow_busy())
 		return 20;
 	if (man_wait_hint() < 250)
 		return man_wait_hint();
@@ -4500,6 +4549,7 @@ void ui_shutdown(void)
 	session_save(); /* before the tabs close */
 	projtools_shutdown();
 	pmcview_shutdown();
+	workflow_shutdown();
 	temp_cleanup_all();
 	/* tabs first: closing a document still talks to the language server */
 	for (u32 gi = 0; gi < app.ngroups; gi++)

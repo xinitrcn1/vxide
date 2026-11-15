@@ -91,6 +91,10 @@ void pick_accept(int kind, u32 item)
 		if (v < loc_n)
 			open_file(loc_pool.b + loc_path[v], false, loc_line[v], loc_col[v]);
 		break;
+	case 420: /* workflow.c: configure preset, target */
+	case 421:
+		workflow_pick_accept(kind, v);
+		break;
 	case 401: /* profview.c: the profile that annotates sources */
 		profview_pick_accept(kind, v);
 		break;
@@ -196,6 +200,10 @@ void ctx_menu_editor(View *v, int x, int y, u32 off)
 	menu_item("Paste", CMD_PASTE, !ro);
 	menu_sep();
 	menu_item("Toggle Line Comment", CMD_TOGGLE_COMMENT, !ro);
+	menu_sep();
+	menu_item("Toggle Breakpoint", CMD_DBG_TOGGLE_BP, app.docs.path[v->doc] != NULL);
+	menu_item("Add to Watch", CMD_DBG_ADD_WATCH, true);
+	menu_item("Break When Written (Watchpoint)", CMD_DBG_WATCHPOINT, dbg_paused());
 	menu_sep();
 	menu_item("Command Palette...", CMD_COMMANDS, true);
 	(void)sel;

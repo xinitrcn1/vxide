@@ -1259,6 +1259,10 @@ static View *bin_active(BinDoc **bp, BinView **sp)
 
 void binview_prompt_accept(int kind, const char *text)
 {
+	if (kind >= 270) {
+		workflow_prompt_accept(kind, text);
+		return;
+	}
 	if (kind >= 250) {
 		profview_prompt_accept(kind, text);
 		return;

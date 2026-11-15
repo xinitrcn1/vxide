@@ -124,7 +124,7 @@ typedef struct {
 /* ---- workbench ---------------------------------------------------------- */
 
 enum { DIFF_WORKTREE = 1, DIFF_STAGED, DIFF_COMMIT };
-enum { SIDE_EXPLORER, SIDE_SEARCH, SIDE_SCM, SIDE_SETTINGS, SIDE_MAN, SIDE_PMC, SIDE_COUNT };
+enum { SIDE_EXPLORER, SIDE_SEARCH, SIDE_SCM, SIDE_SETTINGS, SIDE_MAN, SIDE_PMC, SIDE_WORKFLOW, SIDE_COUNT };
 enum { PANEL_PROBLEMS, PANEL_OUTPUT, PANEL_COUNT };
 enum {
 	FOCUS_EDITOR,
@@ -136,6 +136,7 @@ enum {
 	FOCUS_MAN_INPUT,
 	FOCUS_WORKSPACE, /* the Manpages page or the Settings page */
 	FOCUS_SCM_INPUT,
+	FOCUS_SIDE_INPUT, /* a text field in a side bar view (Workflow) */
 };
 enum { QUICK_NONE, QUICK_FILES, QUICK_COMMANDS, QUICK_GOTO_LINE, QUICK_PROMPT, QUICK_CONFIRM, QUICK_PICK };
 
@@ -410,6 +411,26 @@ void profview_tick(void);
 int profview_subtabs_height(View *v, int w);
 void profview_subtabs_draw(View *v, int x, int y, int w);
 void profview_subtab_click(View *v, int rel_x, int rel_y, int w);
+/* workflow.c: the Workflow side bar (CMake, run, debug over DAP) */
+void workflow_draw(int x, int y, int w, int h);
+void workflow_event(const Event *e, int x, int y, int w, int h);
+bool workflow_command(int cmd);
+void workflow_tick(void);
+bool workflow_busy(void);
+void workflow_shutdown(void);
+void workflow_session_save(void *file);    /* FILE * */
+bool workflow_session_line(const char *l); /* true when it was ours */
+void workflow_pick_accept(int kind, u32 val);
+void workflow_prompt_accept(int kind, const char *text);
+/* the editor: breakpoints in the gutter, the execution line, hover values */
+void dbg_gutter(u32 d, u32 first, u32 last, int x, int y0, int lh);
+bool dbg_gutter_click(View *v, u32 line); /* line 0-based; toggles */
+void dbg_lines(u32 d, u32 first, u32 last, int text_x, int text_w, int y0, int lh);
+void dbg_shift_lines(u32 d, u32 line, u32 removed, u32 added);
+void dbg_hover_request(View *v, u32 off);
+const char *dbg_hover_text(u32 d, u32 off); /* "expr = value", NULL when none */
+bool dbg_paused(void);
+void dbg_ruler(u32 d, int x, int y, int w, int h, u32 nl);
 /* pmcview.c: the Profiling workspace (FreeBSD hwpmc via pmcstat) */
 void pmcview_open(void);
 void pmcview_ws_draw(int x, int y, int w, int h);
@@ -832,6 +853,29 @@ enum {
 	CMD_PROF_FIND,
 	CMD_MD_PREVIEW,
 	CMD_VIEW_PMC,
+	CMD_VIEW_WORKFLOW,
+	CMD_DBG_START,      /* F5: start debugging / continue */
+	CMD_DBG_RUN,        /* Ctrl+F5: run without debugging */
+	CMD_DBG_STOP,       /* Shift+F5 */
+	CMD_DBG_RESTART,    /* Ctrl+Shift+F5 */
+	CMD_DBG_PAUSE,      /* F6 */
+	CMD_DBG_STEP_OVER,  /* F10 */
+	CMD_DBG_STEP_INTO,  /* F11 */
+	CMD_DBG_STEP_OUT,   /* Shift+F11 */
+	CMD_DBG_TOGGLE_BP,  /* F9 */
+	CMD_DBG_BP_CONDITION,
+	CMD_DBG_CLEAR_BPS,
+	CMD_DBG_ADD_WATCH,  /* the selection / word under the cursor */
+	CMD_DBG_WATCHPOINT, /* break when it is written */
+	CMD_DBG_VAR_WATCH,  /* from the Variables context menu */
+	CMD_DBG_VAR_BREAK_W,
+	CMD_DBG_VAR_BREAK_R,
+	CMD_DBG_VAR_BREAK_RW,
+	CMD_DBG_VAR_COPY,
+	CMD_CMAKE_CONFIGURE,
+	CMD_CMAKE_BUILD,
+	CMD_CMAKE_PRESET,
+	CMD_CMAKE_TARGET,
 	CMD_COUNT
 };
 
