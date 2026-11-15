@@ -112,4 +112,14 @@ FAKE
 	VXIDE_PMCSTAT="$tmp/fake-pmcstat" VXIDE_NO_LSP=1 "$vx" --headless 1100x700 --script tests/pmc.vx "$pm"
 	test "$(cat "$pm/ran")" = 'a|b c|'
 fi
+# Workflow: CMake configure + build, a debug session (cmake and lldb-dap / gdb)
+if command -v cmake >/dev/null 2>&1 && { command -v lldb-dap >/dev/null 2>&1 || command -v lldb-dap23 >/dev/null 2>&1 ||
+	command -v gdb >/dev/null 2>&1; }; then
+	wf="$tmp/wf"
+	mkdir -p "$wf/src"
+	printf 'cmake_minimum_required(VERSION 3.16)\nproject(wf C)\nadd_executable(demo src/main.c)\n' > "$wf/CMakeLists.txt"
+	printf '#include <stdio.h>\nstatic int counter;\nstatic int twice(int v)\n{\n\treturn v * 2;\n}\nint main(void)\n{\n\tint a = 1;\n\ta += 2;\n\tcounter = twice(a);\n\tcounter += 1;\n\tprintf("%%d\\n", counter);\n\treturn 0;\n}\n' > "$wf/src/main.c"
+	VXIDE_NO_LSP=1 "$vx" --headless 1200x800 --script tests/workflow.vx "$wf"
+	test -x "$wf/build/demo"
+fi
 echo "ui test ok"

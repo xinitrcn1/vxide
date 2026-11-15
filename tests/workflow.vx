@@ -1,0 +1,17 @@
+# Workflow (run by tests/t_ui.sh when cmake and a debug adapter are here):
+# a breakpoint, F5 configures + builds + stops there, F10 steps, F5 ends.
+open src/main.c
+key ctrl+g
+type 12
+key Return
+key F9
+key ctrl+Home
+key F5
+wait 12000
+expect file main.c
+expect line 12
+key F10
+wait 1500
+expect line 13
+key F5
+wait 2000
