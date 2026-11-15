@@ -1095,7 +1095,9 @@ static void blocks(Ctx *c, Ln *L, u32 n, bool tight)
 
 /* ---- layout cache ---------------------------------------------------------------------- */
 
-static int content_w(int w) { return VX_MIN(w - PX(64), PX(880)); }
+/* the whole width of the tab, less a small inset */
+#define SIDE_PAD PX(14)
+static int content_w(int w) { return VX_MAX(w - 2 * SIDE_PAD, PX(100)); }
 
 static Layout *layout_for(u32 d, int w)
 {
@@ -1261,7 +1263,11 @@ static u32 col_of(u16 c, u8 alpha)
 	return alpha ? (rgba & 0xFFFFFF00u) | alpha : rgba;
 }
 
-static int ox_of(int x, int w) { return x + VX_MAX((w - content_w(w)) / 2, PX(24)); }
+static int ox_of(int x, int w)
+{
+	(void)w;
+	return x + SIDE_PAD;
+}
 
 #define TOP_PAD PX(18)
 

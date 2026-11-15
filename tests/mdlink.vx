@@ -3,11 +3,11 @@
 open README.md
 key ctrl+shift+v
 wait 50
-click 246 210
+click 228 210
 expect file other.md
 expect part 1
 key ctrl+Tab
 expect file README.md
-click 330 210
+click 312 210
 expect file a.c
 expect part 0
