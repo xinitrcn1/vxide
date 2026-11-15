@@ -93,7 +93,7 @@ void session_save(void)
 			View *v = gview(g, t);
 			const char *p = app.docs.path[v->doc];
 			/* real files only: diffs, man pages and untitled buffers are not kept */
-			if (!p || v->diff_left != UINT32_MAX || app.docs.man[v->doc])
+			if (!p || v->diff_left != UINT32_MAX || app.docs.man[v->doc] || temp_tracked(p))
 				continue;
 			Text *tx = &app.docs.text[v->doc];
 			u32 head = VX_MIN(v->head[0], tx->len);

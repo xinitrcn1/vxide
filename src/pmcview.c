@@ -15,6 +15,7 @@
 #include "ui.h"
 #include "prof.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <stdarg.h>
 #include <fcntl.h>
@@ -87,6 +88,8 @@ static char *pmc_tool(void)
 	const char *e = getenv("VXIDE_PMCSTAT");
 	return (char *)(e && *e ? e : "pmcstat");
 }
+
+static void sweep_stale(void);
 
 /* ---- the check ------------------------------------------------------------------------ */
 
@@ -196,9 +199,60 @@ void pmcview_open(void)
 		S.mode = M_COUNT;
 		input_set(&S.rate, "65536", 5);
 	}
-	if (atomic_load(&S.chk) == 0)
+	if (atomic_load(&S.chk) == 0) {
 		check_start();
+		sweep_stale();
+	}
 	app.focus = FOCUS_WORKSPACE;
+}
+
+/* ---- temporary files --------------------------------------------------------------------- */
+
+static void pmc_base(char *b, size_t cap)
+{
+	const char *tmp = getenv("TMPDIR");
+	snprintf(b, cap, "%s/vxide-pmc-%d", tmp && *tmp ? tmp : "/tmp", (int)getuid());
+}
+
+static void rm_dir(const char *dir)
+{
+	DIR *dp = opendir(dir);
+	if (!dp)
+		return;
+	struct dirent *e;
+	while ((e = readdir(dp))) {
+		if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
+			continue;
+		char p[1200];
+		snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
+		unlink(p);
+	}
+	closedir(dp);
+	rmdir(dir);
+}
+
+/* Folders of vxide processes that are gone (crashed, killed): remove. */
+static void sweep_stale(void)
+{
+	char base[400];
+	pmc_base(base, sizeof base);
+	DIR *dp = opendir(base);
+	if (!dp)
+		return;
+	struct dirent *e;
+	while ((e = readdir(dp))) {
+		char *end;
+		long pid = strtol(e->d_name, &end, 10);
+		if (*end || pid <= 0 || pid == (long)getpid())
+			continue;
+		if (kill((pid_t)pid, 0) == 0 || errno == EPERM)
+			continue; /* still running */
+		char p[800];
+		snprintf(p, sizeof p, "%s/%s", base, e->d_name);
+		rm_dir(p);
+	}
+	closedir(dp);
+	rmdir(base); /* only when empty */
 }
 
 /* ---- arguments --------------------------------------------------------------------------- */
@@ -345,8 +399,11 @@ static void run_start(void)
 	} else {
 		/* one event: the log's samples are not told apart by event */
 		snprintf(S.event, sizeof S.event, "%s", first_selected());
-		const char *tmp = getenv("TMPDIR");
-		snprintf(S.rundir, sizeof S.rundir, "%s/vxide-pmc-%d", tmp && *tmp ? tmp : "/tmp", (int)getuid());
+		/* $TMPDIR/vxide-pmc-UID/PID: ours alone, removed when vxide exits */
+		char base[400];
+		pmc_base(base, sizeof base);
+		mkdir(base, 0700);
+		snprintf(S.rundir, sizeof S.rundir, "%s/%d", base, (int)getpid());
 		mkdir(S.rundir, 0700);
 		snprintf(S.log, sizeof S.log, "%s/%s-%ld.pmclog", S.rundir, S.progname, (long)time(NULL));
 		static char rate[32];
@@ -472,8 +529,9 @@ static void *post_main(void *arg)
 	free(o);
 	size_t tn = 0;
 	char *t = vx_read_file(tmp, &tn);
+	unlink(S.log); /* the raw log is not needed once converted */
 	if (!t || !tn) {
-		snprintf(S.post_err, sizeof S.post_err, "pmcstat -R could not convert %s", S.log);
+		snprintf(S.post_err, sizeof S.post_err, "pmcstat -R could not convert the samples");
 		free(t);
 		unlink(tmp);
 		atomic_store(&S.post, 2);
@@ -539,8 +597,10 @@ void pmcview_tick(void)
 						post_main(NULL);
 						S.post_th = pthread_self();
 					}
-				} else
+				} else {
 					out_printf("No samples were logged.\n");
+					unlink(S.log);
+				}
 			}
 			app.dirty = true;
 		}
@@ -552,8 +612,9 @@ void pmcview_tick(void)
 		if (S.post_err[0]) {
 			out_printf("%s\n", S.post_err);
 		} else {
-			out_printf("Profile: %s\n", S.post_path);
+			out_printf("Profile: %s (deleted when its tab closes)\n", S.post_path);
 			snprintf(S.last_profile, sizeof S.last_profile, "%s", S.post_path);
+			temp_track(S.post_path);
 			open_file(S.post_path, false, UINT32_MAX, 0); /* opens as a profile tab */
 		}
 		app.dirty = true;
@@ -567,6 +628,15 @@ void pmcview_shutdown(void)
 	if (S.running && S.pid > 0) {
 		kill(-S.pid, SIGTERM);
 		waitpid(S.pid, NULL, 0);
+	}
+	if (atomic_load(&S.post) == 1 && !pthread_equal(S.post_th, pthread_self()))
+		pthread_join(S.post_th, NULL);
+	/* everything this process wrote */
+	if (S.rundir[0]) {
+		rm_dir(S.rundir);
+		char base[400];
+		pmc_base(base, sizeof base);
+		rmdir(base);
 	}
 }
 

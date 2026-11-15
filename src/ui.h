@@ -436,6 +436,11 @@ void profann_gutter(u32 d, u32 first, u32 last, int x, int y0, int lh);
 void profann_lines(u32 d, u32 first, u32 last, int text_x, int text_w, int y0, int lh);
 void profann_ruler(u32 d, int x, int y, int w, int h, u32 nl);
 void profann_status(u32 d, char *buf, size_t cap);
+/* Temporary files vxide made (profiles): deleted when the document showing
+ * them closes, or when vxide exits. */
+void temp_track(const char *path);
+void temp_cleanup_all(void);
+bool temp_tracked(const char *path);
 u32 doc_new_untitled(void);
 void doc_release(u32 d);
 void doc_release_unref(u32 d);

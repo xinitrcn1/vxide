@@ -331,6 +331,54 @@ u32 doc_new_untitled(void)
 	return d;
 }
 
+/* ---- temporary files ----------------------------------------------------------- */
+
+static char *temps[64];
+
+void temp_track(const char *path)
+{
+	for (int i = 0; i < 64; i++)
+		if (!temps[i]) {
+			temps[i] = vx_strdup(path);
+			return;
+		}
+	unlink(temps[0]); /* full: the oldest goes now */
+	free(temps[0]);
+	memmove(temps, temps + 1, sizeof temps - sizeof temps[0]);
+	temps[63] = vx_strdup(path);
+}
+
+/* a document closed: its file goes if it was one of ours */
+static void temp_release(const char *path)
+{
+	if (!path)
+		return;
+	for (int i = 0; i < 64; i++)
+		if (temps[i] && !strcmp(temps[i], path)) {
+			unlink(temps[i]);
+			free(temps[i]);
+			temps[i] = NULL;
+		}
+}
+
+bool temp_tracked(const char *path)
+{
+	for (int i = 0; i < 64 && path; i++)
+		if (temps[i] && !strcmp(temps[i], path))
+			return true;
+	return false;
+}
+
+void temp_cleanup_all(void)
+{
+	for (int i = 0; i < 64; i++)
+		if (temps[i]) {
+			unlink(temps[i]);
+			free(temps[i]);
+			temps[i] = NULL;
+		}
+}
+
 void doc_release_unref(u32 d)
 {
 	app.docs.refs[d] = 1;
@@ -352,6 +400,7 @@ void doc_release(u32 d)
 	D->prof[d] = 0;
 	mdview_doc_changed(d);
 	text_free(&D->text[d]);
+	temp_release(D->path[d]);
 	free(D->path[d]);
 	free(D->rel[d]);
 	D->path[d] = NULL;
@@ -4451,6 +4500,7 @@ void ui_shutdown(void)
 	session_save(); /* before the tabs close */
 	projtools_shutdown();
 	pmcview_shutdown();
+	temp_cleanup_all();
 	/* tabs first: closing a document still talks to the language server */
 	for (u32 gi = 0; gi < app.ngroups; gi++)
 		while (app.groups[gi].nt)
