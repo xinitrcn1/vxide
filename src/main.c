@@ -428,11 +428,44 @@ static int run_script(const char *path)
 static void usage(void)
 {
 	fprintf(stderr, "usage: vxide [--scale N] [--light] [--headless WxH --script FILE] [DIR]\n");
+#ifdef VXIDE_UCAS
+	fprintf(stderr, "       vxide --ucas [ucas arguments]   (ucas's command line; also when run as \"ucas\")\n");
+#endif
 	exit(2);
 }
 
+#ifdef VXIDE_UCAS
+int ucas_main(int argc, char **argv); /* cmake/ucas.cmake: the only symbol of ucas's code */
+
+/* vxide is also ucas: run under the name "ucas" (a link, or the ucas tab's
+ * worker), or as `vxide --ucas ...`. ucas's reset re-executes this binary
+ * with the arguments it was given, so argv[0] stays "ucas" for it. */
+static bool maybe_ucas(int argc, char **argv, int *rc)
+{
+	const char *b = argc ? strrchr(argv[0], '/') : NULL;
+	b = b ? b + 1 : argc ? argv[0] : "";
+	if (!strcmp(b, "ucas")) {
+		*rc = ucas_main(argc, argv);
+		return true;
+	}
+	if (argc > 1 && !strcmp(argv[1], "--ucas")) {
+		argv[1] = "ucas";
+		*rc = ucas_main(argc - 1, argv + 1);
+		return true;
+	}
+	return false;
+}
+#endif
+
 int main(int argc, char **argv)
 {
+#ifdef VXIDE_UCAS
+	{
+		int rc;
+		if (maybe_ucas(argc, argv, &rc))
+			return rc;
+	}
+#endif
 	/* towupper/towlower for the case transforms need a UTF-8 ctype */
 	if (!setlocale(LC_CTYPE, "C.UTF-8"))
 		setlocale(LC_CTYPE, "");

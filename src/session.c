@@ -86,6 +86,7 @@ void session_save(void)
 	if (!f)
 		return;
 	workflow_session_save(f);
+	ucasview_session_save(f);
 	fprintf(f, "# vxide session\nview %d\nside %d\npanel %d %d\n", ui_workspace() ? SIDE_EXPLORER : app.side_view,
 	        app.side_visible, app.panel_visible, app.panel_view);
 	for (u32 gi = 0; gi < app.ngroups; gi++) {
@@ -122,6 +123,8 @@ void session_restore(void)
 	int view = -1;
 	while (fgets(line, sizeof line, f)) {
 		line[strcspn(line, "\r\n")] = 0;
+		if (ucasview_session_line(line))
+			continue;
 		if (workflow_session_line(line))
 			continue; /* breakpoints, watches, Workflow settings */
 		unsigned g, l, c;

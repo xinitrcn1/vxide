@@ -127,4 +127,11 @@ if command -v cmake >/dev/null 2>&1 && { command -v lldb-dap >/dev/null 2>&1 || 
 	printf 'wfflags\t1\t1\n' > "$st/sessions/$(printf '%s' "$wf" | tr / %)"
 	VXIDE_STATE_DIR="$st" VXIDE_NO_LSP=1 "$vx" --headless 1200x800 --script tests/workflow_main.vx "$wf"
 fi
+# the ucas tab, when ucas is built in: a plot's GIF saved into the project
+if "$vx" --ucas -e 'range (x: u2)' >/dev/null 2>&1; then
+	uc="$tmp/ucas"
+	mkdir -p "$uc"
+	VXIDE_NO_LSP=1 "$vx" --headless 1400x900 --script tests/ucas.vx "$uc"
+	head -c 6 "$uc/plot.gif" | grep -q GIF89a
+fi
 echo "ui test ok"

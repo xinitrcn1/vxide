@@ -1,0 +1,20 @@
+# The ucas tab (run by tests/t_ui.sh): a statement, a plot, its GIF saved
+# into the project; Esc cancels a long evaluation and the definitions stay.
+key ctrl+shift+p
+type View: Show ucas
+key Return
+wait 1500
+type f(x: u8) = x * 3
+key Return
+type bigint factor 1522605027922533360535618378132637429718068114961380688657908494580122963258952897654000350692006139
+key Return
+wait 1500
+key Escape
+wait 1000
+type plot f
+key Return
+wait 3000
+key ctrl+shift+p
+type ucas: Save the Picture
+key Return
+wait 200

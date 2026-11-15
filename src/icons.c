@@ -179,6 +179,16 @@ static void art_play(float W)
 	line(7.0f, 19.0f, 18.5f, 12.0f, W);
 }
 
+/* ucas: a sigma */
+static void art_sigma(float W)
+{
+	begin((int)(24.0f * G + 0.5f));
+	line(18.0f, 5.0f, 6.0f, 5.0f, W);
+	line(6.0f, 5.0f, 12.5f, 12.0f, W);
+	line(12.5f, 12.0f, 6.0f, 19.0f, W);
+	line(6.0f, 19.0f, 18.0f, 19.0f, W);
+}
+
 static void art_gear(float W)
 {
 	const float PI = 3.14159265f;
@@ -217,6 +227,8 @@ void icons_init(void)
 			store(ICON_PULSE_S);
 			art_play(W);
 			store(ICON_PLAY_S);
+			art_sigma(W);
+			store(ICON_SIGMA_S);
 		}
 	}
 	G = 1.0f;

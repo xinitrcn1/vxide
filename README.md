@@ -34,6 +34,12 @@ FreeBSD 15 (or Linux) with: a Vulkan 1.1 driver, `vulkan-loader`/headers,
 (disassembly), and clangd / rust-analyzer in `PATH` for language features. Fonts: Noto Sans for the UI and
 DejaVu Sans Mono for code, with DejaVu Sans as the fallback.
 
+The first configure fetches [ucas](https://github.com/scarletnx/ucas) with
+[CPM](https://github.com/cpm-cmake/CPM.cmake) (git and network needed once;
+set `CPM_SOURCE_CACHE` to share the download between build folders), and
+`awk`, `ld -r` and `objcopy` build it into vxide. `-DVXIDE_UCAS=OFF` leaves it
+out (and the ucas tab says so).
+
 ## What it does
 
 - **Workbench**: a row of top-level tabs. Project, Git and Search show
@@ -56,8 +62,9 @@ DejaVu Sans Mono for code, with DejaVu Sans as the fallback.
   highlighted in its own language), troff/man/mdoc and Perl (POD, `s{}{}`,
   regexes, heredocs), CMake, Make (BSD and GNU; recipe lines highlighted as
   shell), JSON / JSON with Comments, ignore files (.gitignore and friends),
-  diff/patch, git commit messages, git-rebase-todo, Python, YAML and
-  CODEOWNERS. Languages are also
+  diff/patch, git commit messages, git-rebase-todo, Python, YAML,
+  CODEOWNERS, GLSL (`.glsl .comp .frag .vert` ..., the C lexer with GLSL's
+  words) and SPIR-V assembly (`.spvasm`). Languages are also
   detected from shebangs and file heads. They were checked against VSCodium's own `c.tmLanguage.json`
   scopes and the Dark+/Light+ rules. When clangd is running, its semantic
   tokens are overlaid the way the clangd extension does it (readonly
@@ -156,6 +163,50 @@ DejaVu Sans Mono for code, with DejaVu Sans as the fallback.
   cycle); Sample mode records callchains and opens them as a profile
   (flame graph, callers, hot lines with source heat). `VXIDE_PMCSTAT`
   picks another pmcstat.
+- **ucas** (computer algebra): a top-level tab with its own workspace, a
+  REPL on [ucas](https://github.com/scarletnx/ucas), which is built into the
+  vxide binary (`vxide --ucas ...`, or vxide run under the name `ucas`, is
+  ucas's whole command line). Each input gets ucas's answer with how far it
+  is established (symbolic, exhaustive, proved by SAT, or numeric: not a
+  proof), its checks, notes and conditions; an ambiguity's readings are
+  buttons that run it again. Plots, surfaces, contour and vector fields,
+  integrals and solids of revolution, shader runs on images come back as
+  pictures: inline, and the chosen one large in the View, animations
+  playing (pause, seek, Save writes the GIF into the project). The Session
+  side lists the functions defined (click: insert the name) and the active
+  cost model. Enter runs (an open bracket goes on, indented, as ucas reads
+  it), Shift+Enter starts another statement, Up/Down walk the history (kept
+  with the project), Esc cancels a running evaluation and keeps the
+  definitions, Ctrl+L clears. The transcript's text (inputs, code blocks,
+  answers, errors) can be selected: drag (past the edge scrolls), double
+  click a word, triple click a line, Shift+click extends; Ctrl+C copies
+  it, and Ctrl+A with an empty input box selects the whole transcript. A line that reads as English goes through
+  ucas's translator first, as in its own REPL; `?` asks for that.
+  Code goes in fenced blocks after the statement it is for, as in ucas's own
+  files: `simplify` + a ```` ```glsl ```` (or ```` ```comp ````, ```` ```frag ```` ...),
+  ```` ```spv ```` or ```` ```c ```` block (shader simplification proved by SAT,
+  or the C frontend), `animate exec of this` + a shader, `c optimize` + C; a
+  block alone means `simplify`. The code is coloured by the editor's own
+  lexers as it is typed (Enter in an open block adds a line; Enter after the
+  closing ```` ``` ```` runs it) and in the transcript, as are the SPIR-V
+  instructions, diffs and C in ucas's answers; the files it returns
+  (`simplified.glsl`, `simplified.spvasm` ...) can be shown inline, opened
+  in an editor tab or saved. In an editor, "ucas: Run Selection or Line in
+  the ucas Tab" sends code there; from a GLSL, SPIR-V or C file it is sent as
+  `simplify` and a block of that language.
+  ucas runs as a child of vxide speaking its JSON frontend, so a crash or a
+  long search never stalls the editor; every request runs under
+  `timeout_s`, and Cancel stops only the forked evaluation (a small patch,
+  `cmake/ucas-library.patch`, adds that and the library entry point).
+  `cmake/ucas-adamfit.patch` adds `adamfit F in a..b`: thousands of
+  expression shapes fitted by Adam, ranked by 0.8 x cost + 0.5 x error
+  (both weights options), the closest ones' error proved (certified,
+  enumerated, or by SAT) or stated for its sample; F can be a function of
+  a ```c or ```glsl block (`adamfit NAME x in 0..1`), sampled natively, of
+  up to 4 parameters, and integer results get fixed-point forms
+  `(C x + B) >> s`; while it runs, the cell shows the candidates as ucas finds
+  them and its progress (`auto` reports only the closest at the end). The
+  patches are applied once, in order, by `cmake/ucas_patch.cmake`.
 - **Markdown preview**: Markdown tabs have Edit and Preview subtabs
   (Ctrl+Shift+V): headings, emphasis, code (highlighted by the fence's
   language), lists and task lists, quotes, tables, links (anchors, files,
@@ -312,7 +363,7 @@ the script command `heap` measure it.
 | File | Role |
 |---|---|
 | `src/gpu.c` | Vulkan: one render pass, one pipeline, one instanced draw per frame; swapchain or offscreen target |
-| `shaders/ui.*` | A quad is a solid rect, an atlas coverage rect (`texelFetch`) or a squiggle |
+| `shaders/ui.*` | A quad is a solid rect, an atlas coverage rect (`texelFetch`), a squiggle, or a picture: an RGBA atlas made on first use, placed per frame by a small uniform table and sampled by pixel position (plots, animations) |
 | `src/font.c`, `src/icons.c` | FreeType glyph cache in an R8 atlas (shelf packer, open hashing); icons from SDF primitives |
 | `src/draw.c` | Quad list with CPU clipping (atlas origins move with the cut) |
 | `src/text.c` | mmap piece table, line-start index, undo log (SoA) |
@@ -337,6 +388,8 @@ the script command `heap` measure it.
 | `src/man.c` | Manpages workspace: mandoc rendering, links, apropos Index |
 | `src/projtools.c` | Qt and Godot: tools, project detection, run/stop with output |
 | `src/imgload.c` | PNG / JPEG decoding for the background image |
+| `cmake/ucas.cmake`, `cmake/CPM.cmake` | ucas fetched by CPM, its sources read from its Makefile, linked into one object whose only global is `ucas_main` |
+| `src/ucasproto.c`, `src/ucasview.c`, `src/ucasimg.c` | ucas's JSON frontend (requests, responses, base64); the ucas tab (worker process, transcript, View, Session); its GIFs and PNGs decoded by ucas's stb_image |
 
 ## Testing without a display
 

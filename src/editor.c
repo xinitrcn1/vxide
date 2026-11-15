@@ -1060,6 +1060,14 @@ static char *selection_text(View *v, size_t *n, bool *whole_line)
 	return p.b;
 }
 
+/* The selections (or the cursors' lines when nothing is selected), joined;
+ * malloc'd. */
+char *ed_selection_text(View *v, size_t *n)
+{
+	bool whole;
+	return selection_text(v, n, &whole);
+}
+
 static void copy_sel(View *v, bool cut)
 {
 	size_t n;

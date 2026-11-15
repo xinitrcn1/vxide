@@ -124,7 +124,7 @@ typedef struct {
 /* ---- workbench ---------------------------------------------------------- */
 
 enum { DIFF_WORKTREE = 1, DIFF_STAGED, DIFF_COMMIT };
-enum { SIDE_EXPLORER, SIDE_SEARCH, SIDE_SCM, SIDE_SETTINGS, SIDE_MAN, SIDE_PMC, SIDE_WORKFLOW, SIDE_COUNT };
+enum { SIDE_EXPLORER, SIDE_SEARCH, SIDE_SCM, SIDE_SETTINGS, SIDE_MAN, SIDE_PMC, SIDE_WORKFLOW, SIDE_UCAS, SIDE_COUNT };
 enum { PANEL_PROBLEMS, PANEL_OUTPUT, PANEL_COUNT };
 enum {
 	FOCUS_EDITOR,
@@ -442,6 +442,19 @@ void pmcview_ws_event(const Event *e, int x, int y, int w, int h);
 void pmcview_tick(void);
 bool pmcview_busy(void);
 void pmcview_shutdown(void);
+/* ucasview.c: the ucas workspace, a REPL on ucas (built into this binary) */
+char *ed_selection_text(View *v, size_t *n); /* editor.c: selections or cursor lines, malloc'd */
+void ucasview_open(void);
+void ucasview_ws_draw(int x, int y, int w, int h);
+void ucasview_ws_event(const Event *e, int x, int y, int w, int h);
+void ucasview_tick(void);
+bool ucasview_busy(void);
+u64 ucasview_wait_hint(void); /* ms until the next animation frame, or a big number */
+void ucasview_run_text(const char *src, size_t n); /* from an editor: run in the tab */
+bool ucasview_command(int cmd);
+void ucasview_shutdown(void);
+void ucasview_session_save(void *file);    /* FILE * */
+bool ucasview_session_line(const char *l); /* true when it was ours */
 /* mdview.c: Markdown tabs have two parts, Edit and Preview */
 void mdview_sync(View *v);       /* nparts = 2 for Markdown documents */
 bool mdview_preview(View *v);    /* the preview is showing */
@@ -857,6 +870,11 @@ enum {
 	CMD_PROF_FIND,
 	CMD_MD_PREVIEW,
 	CMD_VIEW_PMC,
+	CMD_VIEW_UCAS,
+	CMD_UCAS_RUN_SELECTION,
+	CMD_UCAS_CANCEL,
+	CMD_UCAS_RESTART,
+	CMD_UCAS_SAVE_PICTURE,
 	CMD_VIEW_WORKFLOW,
 	CMD_DBG_START,      /* F5: start debugging / continue */
 	CMD_DBG_RUN,        /* Ctrl+F5: run without debugging */
