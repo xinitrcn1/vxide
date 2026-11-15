@@ -425,11 +425,28 @@ void explorer_draw(int x, int y, int w, int h)
 	int cy = view_title(x, y, w, "EXPLORER");
 	char name[256];
 	upper(name, fs_name(&app.tree, 0), sizeof name);
-	cy = section_header(x, cy, w, name, true, false);
 	bool hov_section = in_rect(app.hover_x, app.hover_y, x, y, w, h);
+	{
+		/* the folder name gives way to the actions while they show (truncated
+		 * with an ellipsis instead of running under the icons) */
+		int room = hov_section ? w - PX(24) * 4 - PX(28) : w - PX(28);
+		char fit[256];
+		size_t n = strlen(name);
+		snprintf(fit, sizeof fit, "%s", name);
+		if (font_width(FONT_SMALL_BOLD, fit, n) > room) {
+			while (n > 1 && font_width(FONT_SMALL_BOLD, fit, n) + font_width(FONT_SMALL_BOLD, "\xE2\x80\xA6", 3) > room)
+				n--;
+			snprintf(fit + n, sizeof fit - n, "\xE2\x80\xA6");
+		}
+		cy = section_header(x, cy, w, fit, true, false);
+	}
 	if (hov_section) {
 		/* actions: new file, new folder, refresh, collapse */
 		static const int icons[] = {ICON_NEW_FILE, ICON_NEW_FOLDER, ICON_REFRESH, ICON_COLLAPSE};
+		static const char *const tips[] = {"New File...", "New Folder...", "Refresh Explorer",
+		                                   "Collapse Folders in Explorer"};
+		for (int i = 0; i < 4; i++)
+			ui_tip(x + w - PX(24) * (4 - i) - PX(4), cy - PX(22), PX(22), PX(22), tips[i]);
 		for (int i = 0; i < 4; i++)
 			draw_icon(icons[i], x + w - PX(24) * (4 - i) - PX(4), cy - PX(22) + PX(3), COL(C_SECTION_HEADER_FG));
 	}
@@ -803,6 +820,8 @@ typedef struct {
 	int find_y, repl_y, inc_y, exc_y, msg_y, list_y, dots_y;
 	int find_h, repl_h, inc_h, exc_h; /* boxes grow with wrapped text */
 	int ix, iw;
+	int res;          /* the find box's icon reserve (0 when the toggles are below it) */
+	int tog_x, tog_y; /* Aa / ab / .* */
 } SLayout;
 
 /* Icon strips inside the boxes: Aa ab .* (search), AB (replace). */
@@ -816,8 +835,19 @@ static SLayout search_layout(int x, int y, int w)
 	L.iw = w - PX(24) - PX(12);
 	int cy = y + PX(35);
 	L.find_y = cy;
-	L.find_h = input_height(&app.search_in, L.iw, RES_FIND);
+	/* a narrow side bar would leave the text a few characters: the toggles
+	 * then get their own row under the box instead of wrapping every word */
+	bool narrow = L.iw - RES_FIND < PX(110);
+	L.res = narrow ? 0 : RES_FIND;
+	L.find_h = input_height(&app.search_in, L.iw, L.res);
+	L.tog_x = L.ix + L.iw - PX(70);
+	L.tog_y = L.find_y + PX(3);
 	cy += L.find_h + PX(4);
+	if (narrow) {
+		L.tog_x = L.ix + L.iw - PX(66);
+		L.tog_y = cy;
+		cy += PX(24);
+	}
 	L.repl_y = cy;
 	L.repl_h = app.search_show_replace ? input_height(&app.search_repl_in, L.iw, RES_REPL) : 0;
 	if (app.search_show_replace)
@@ -874,20 +904,26 @@ void search_draw(int x, int y, int w, int h)
 		draw_icon(ICON_REFRESH, x + w - PX(76), y + PX(10), COL(C_SIDEBAR_FG));
 		draw_icon(ICON_CLOSE, x + w - PX(52), y + PX(10), COL(C_SIDEBAR_FG));
 		draw_icon(ICON_COLLAPSE, x + w - PX(28), y + PX(10), COL(C_SIDEBAR_FG));
+		ui_tip(x + w - PX(80), y + PX(6), PX(24), PX(24), "Refresh");
+		ui_tip(x + w - PX(56), y + PX(6), PX(24), PX(24), "Clear Search Results");
+		ui_tip(x + w - PX(32), y + PX(6), PX(24), PX(24), "Collapse All");
 	}
 	/* replace toggle chevron to the left of the boxes */
 	int th = app.search_show_replace ? L.repl_y + L.repl_h - L.find_y : L.find_h;
 	draw_icon(app.search_show_replace ? ICON_CHEVRON_DOWN : ICON_CHEVRON_RIGHT, x + PX(5), L.find_y + (th - PX(16)) / 2,
 	          COL(C_SIDEBAR_FG));
 	bool sf = app.focus == FOCUS_SEARCH_INPUT;
-	input_draw_ex(&app.search_in, L.ix, L.find_y, L.iw, RES_FIND, "Search", sf && app.search_box == 0);
+	input_draw_ex(&app.search_in, L.ix, L.find_y, L.iw, L.res, "Search", sf && app.search_box == 0);
 	bool bad = app.search_m.err[0] != 0;
 	if (bad)
 		draw_frame(L.ix, L.find_y, L.iw, L.find_h, COL(C_ERROR));
-	int bx = L.ix + L.iw - PX(70);
-	toggle_box(bx, L.find_y + PX(3), "Aa", app.search_flags & SEARCH_CASE, false);
-	toggle_box(bx + PX(22), L.find_y + PX(3), "ab", app.search_flags & SEARCH_WORD, true);
-	toggle_box(bx + PX(44), L.find_y + PX(3), ".*", app.search_flags & SEARCH_REGEX, false);
+	int bx = L.tog_x;
+	toggle_box(bx, L.tog_y, "Aa", app.search_flags & SEARCH_CASE, false);
+	toggle_box(bx + PX(22), L.tog_y, "ab", app.search_flags & SEARCH_WORD, true);
+	toggle_box(bx + PX(44), L.tog_y, ".*", app.search_flags & SEARCH_REGEX, false);
+	ui_tip(bx, L.tog_y, PX(20), PX(20), "Match Case (Alt+C)");
+	ui_tip(bx + PX(22), L.tog_y, PX(20), PX(20), "Match Whole Word (Alt+W)");
+	ui_tip(bx + PX(44), L.tog_y, PX(20), PX(20), "Use Regular Expression (Alt+R)");
 	if (app.search_show_replace) {
 		input_draw_ex(&app.search_repl_in, L.ix, L.repl_y, L.iw, RES_REPL, "Replace", sf && app.search_box == 1);
 		/* replace all button */
@@ -978,7 +1014,22 @@ void search_draw(int x, int y, int w, int h)
 		u32 ml = VX_MIN(r->len[v], n - mc0);
 		int tx = x + PX(40);
 		int maxx = right - PX(4);
-		tx = draw_text_fit(FONT_UI, tx, ty, t, mc0, maxx - tx, COL(C_SIDEBAR_FG));
+		/* the match must be visible: drop leading blanks, and when the text
+		 * before it would take over a quarter of the row, keep only its end
+		 * behind an ellipsis (VSCodium's search results do the same) */
+		u32 st = 0;
+		while (st < mc0 && (t[st] == ' ' || t[st] == '\t'))
+			st++;
+		int room = maxx - tx;
+		if (font_width(FONT_UI, t + st, mc0 - st) > room / 4) {
+			while (st < mc0 && font_width(FONT_UI, t + st, mc0 - st) > room / 4 - PX(10)) {
+				st++;
+				while (st < mc0 && ((u8)t[st] & 0xC0) == 0x80)
+					st++;
+			}
+			tx = draw_text(FONT_UI, tx, ty, "\xE2\x80\xA6", 3, COL(C_DESCRIPTION_FG));
+		}
+		tx = draw_text_fit(FONT_UI, tx, ty, t + st, mc0 - st, maxx - tx, COL(C_SIDEBAR_FG));
 		int ma = tx;
 		tx = draw_text_fit(FONT_UI, tx, ty, t + mc0, ml, VX_MAX(maxx - tx, 0), COL(C_SIDEBAR_FG));
 		if (replacing) {
@@ -1231,10 +1282,18 @@ bool search_event(const Event *e, int x, int y, int w, int h)
 		}
 		struct {
 			int y, h, box, res;
-		} boxes[4] = {{L.find_y, L.find_h, 0, RES_FIND},
+		} boxes[4] = {{L.find_y, L.find_h, 0, L.res},
 		              {L.repl_y, L.repl_h, 1, RES_REPL},
 		              {L.inc_y, L.inc_h, 2, 0},
 		              {L.exc_y, L.exc_h, 3, 0}};
+		if (!L.res && e->y >= L.tog_y && e->y < L.tog_y + PX(22) && e->x >= L.tog_x && e->x < L.tog_x + PX(66)) {
+			/* the toggles on their own row (narrow side bar) */
+			int which = (e->x - L.tog_x) / PX(22);
+			app.search_flags ^= which == 0 ? SEARCH_CASE : which == 1 ? SEARCH_WORD : SEARCH_REGEX;
+			search_run();
+			app.focus = FOCUS_SEARCH_INPUT;
+			return true;
+		}
 		for (int k = 0; k < 4; k++) {
 			if (k == 1 && !app.search_show_replace)
 				continue;
@@ -1242,8 +1301,8 @@ bool search_event(const Event *e, int x, int y, int w, int h)
 				continue;
 			if (e->y < boxes[k].y || e->y >= boxes[k].y + boxes[k].h || e->x < L.ix)
 				continue;
-			if (k == 0) {
-				int bx = L.ix + L.iw - PX(70);
+			if (k == 0 && L.res) {
+				int bx = L.tog_x;
 				if (e->x >= bx && e->x < bx + PX(66)) {
 					int which = (e->x - bx) / PX(22);
 					app.search_flags ^= which == 0 ? SEARCH_CASE : which == 1 ? SEARCH_WORD : SEARCH_REGEX;
@@ -1530,8 +1589,18 @@ extern void gitui_status_line(int x, int y, int w);
 
 void scm_draw(int x, int y, int w, int h)
 {
-	int cy = view_title(x, y, w, "SOURCE CONTROL");
+	int cy = y + PX(35);
+	{
+		/* the title stops short of the action icons (narrow side bar) */
+		const char *t = "SOURCE CONTROL";
+		int room = (app.git ? w - PX(84) : w) - PX(20);
+		draw_text_fit(FONT_SMALL, x + PX(20), y + (PX(35) - font_m[FONT_SMALL].line) / 2, t, strlen(t), room,
+		              COL(C_SIDEBAR_TITLE_FG));
+	}
 	if (app.git) {
+		ui_tip(x + w - PX(82), y + PX(6), PX(24), PX(24), "Commit (Ctrl+Enter)");
+		ui_tip(x + w - PX(58), y + PX(6), PX(24), PX(24), "Refresh");
+		ui_tip(x + w - PX(32), y + PX(6), PX(26), PX(24), "More Actions...");
 		/* "..." opens the git actions menu, like VSCodium's view title */
 		draw_text(FONT_UI_BOLD, x + w - PX(28), y + (PX(35) - font_m[FONT_UI_BOLD].line) / 2 - PX(3),
 		          "\xE2\x80\xA6", 3, COL(C_SIDEBAR_FG));
@@ -2014,7 +2083,7 @@ bool sidebar_over_input(int x, int y, int w, int mx, int my)
 		             app.search_show_details ? L.exc_y : -1000};
 		int hs[4] = {L.find_h, L.repl_h, L.inc_h, L.exc_h};
 		for (int k = 0; k < 4; k++)
-			if (my >= ys[k] && my < ys[k] + hs[k] && mx >= L.ix && mx < L.ix + L.iw - (k == 0 ? RES_FIND : 0))
+			if (my >= ys[k] && my < ys[k] + hs[k] && mx >= L.ix && mx < L.ix + L.iw - (k == 0 ? L.res : 0))
 				return true;
 		return false;
 	}
@@ -2064,7 +2133,7 @@ static const char *const st_label[ST_COUNT] = {
     "Godot Headless Language Server",
 };
 static const char *const st_desc[ST_COUNT] = {
-    "Dark Modern or Light Modern, with the Dark+ / Light+ syntax colours.",
+    "Dark Modern, Dark Modern Darker (near-black, higher contrast) or Light Modern, with the Dark+ / Light+ syntax colours.",
     "Show the minimap next to the editor scrollbar.",
     "A PNG or JPEG drawn over the editor area, scaled to cover it. The opacity below keeps the code readable.",
     "How strongly the background image shows through (0-100 %).",
@@ -2118,7 +2187,7 @@ void settings_load(void)
 		*eq = 0;
 		const char *k = line, *v = eq + 1;
 		if (!strcmp(k, "theme"))
-			app.theme = !strcmp(v, "light") ? THEME_LIGHT : THEME_DARK;
+			app.theme = !strcmp(v, "light") ? THEME_LIGHT : !strcmp(v, "darker") ? THEME_DARKER : THEME_DARK;
 		else if (!strcmp(k, "minimap"))
 			app.minimap_on = atoi(v) != 0;
 		else if (!strcmp(k, "blame"))
@@ -2159,7 +2228,7 @@ void settings_save(void)
 	if (!f)
 		return;
 	fprintf(f, "# vxide settings\ntheme=%s\nminimap=%d\nblame=%d\nvim=%d\nbackground=%s\nbackground_opacity=%d\n",
-	        app.theme == THEME_LIGHT ? "light" : "dark", app.minimap_on, app.blame_on, app.vim_on, app.bg_path,
+	        app.theme == THEME_LIGHT ? "light" : app.theme == THEME_DARKER ? "darker" : "dark", app.minimap_on, app.blame_on, app.vim_on, app.bg_path,
 	        app.bg_opacity);
 	if (fclose(f) == 0)
 		rename(tmp, p);
@@ -2185,7 +2254,7 @@ static void st_value(int i, char *val, size_t vc, char *btn, size_t bc, int *che
 	switch (i) {
 	case ST_THEME:
 		snprintf(val, vc, "%s", themes[app.theme].name);
-		snprintf(btn, bc, "Switch to %s", themes[app.theme == THEME_DARK ? THEME_LIGHT : THEME_DARK].name);
+		snprintf(btn, bc, "Change... (Ctrl+K Ctrl+T)");
 		break;
 	case ST_MINIMAP: *checked = app.minimap_on; break;
 	case ST_VIM: *checked = app.vim_on; break;

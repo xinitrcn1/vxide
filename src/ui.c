@@ -191,6 +191,24 @@ static void lsv_start(int sv)
 	}
 }
 
+static void lsp_sync_open(u32 d);
+
+/* Change Language Mode: re-highlight, and move the document to the
+ * language server of its new language. */
+void doc_set_lang(u32 d, int lang)
+{
+	Docs *D = &app.docs;
+	if (D->lsp_open[d] && D->lsp_sv[d] >= 0 && app.lsps[D->lsp_sv[d]])
+		lsp_did_close(app.lsps[D->lsp_sv[d]], D->path[d]);
+	D->lsp_open[d] = false;
+	D->lang[d] = (u8)lang;
+	D->lstate_ok[d] = 0;
+	D->sn[d] = 0;
+	if (D->path[d])
+		lsp_sync_open(d);
+	app.dirty = true;
+}
+
 static void lsp_sync_open(u32 d)
 {
 	Docs *D = &app.docs;
@@ -505,6 +523,155 @@ static void activate_tab(u32 gi, u32 t)
 	if (v)
 		explorer_reveal(v->doc);
 	app.dirty = true;
+}
+
+/* Files whose changes would be lost: real or untitled, edited, not a
+ * virtual page (diff, man page, binary). */
+static bool doc_unsaved(u32 d)
+{
+	Docs *D = &app.docs;
+	return (D->path[d] || D->untitled[d]) && !D->readonly[d] && !D->man[d] && !D->bin[d] &&
+	       text_dirty(&D->text[d]);
+}
+
+/* Unsaved documents shown in the groups; *first = one of them. */
+static u32 unsaved_count(u32 *first, char *names, size_t cap)
+{
+	u32 n = 0;
+	size_t k = 0;
+	if (names && cap)
+		names[0] = 0;
+	for (u32 d = 0; d < app.docs.n; d++)
+		if (app.docs.refs[d] && doc_unsaved(d)) {
+			if (!n && first)
+				*first = d;
+			if (names && n < 5 && k < cap)
+				k += (size_t)snprintf(names + k, cap - k, "%s%s", n ? "\n" : "", app.docs.rel[d]);
+			n++;
+		}
+	if (names && n > 5 && k < cap)
+		snprintf(names + k, cap - k, "\n...and %u more", n - 5);
+	return n;
+}
+
+static void ask_save_one(u32 kind, u32 d)
+{
+	const char *rel = app.docs.rel[d];
+	const char *base = strrchr(rel, '/');
+	char t[300];
+	snprintf(t, sizeof t, "Do you want to save the changes you made to %s?", base ? base + 1 : rel);
+	dialog_open((int)kind, d, t, "Your changes will be lost if you don't save them.");
+}
+
+static bool ask_save_many(int kind)
+{
+	char names[1024];
+	u32 first = 0;
+	u32 n = unsaved_count(&first, names, sizeof names);
+	if (!n)
+		return false;
+	if (n == 1) {
+		ask_save_one((u32)kind, first);
+		return true;
+	}
+	char t[160], detail[1200];
+	snprintf(t, sizeof t, "Do you want to save the changes to the following %u files?", n);
+	snprintf(detail, sizeof detail, "%s\n\nYour changes will be lost if you don't save them.", names);
+	dialog_open(kind, 0, t, detail);
+	return true;
+}
+
+void request_quit(void)
+{
+	if (!ask_save_many(DLG_QUIT))
+		app.running = false;
+}
+
+/* Save every unsaved named file; false if an untitled one is left. */
+static bool save_all_named(void)
+{
+	bool ok = true;
+	for (u32 d = 0; d < app.docs.n; d++)
+		if (app.docs.refs[d] && doc_unsaved(d)) {
+			if (app.docs.untitled[d])
+				ok = false;
+			else if (!doc_save(d))
+				ok = false;
+		}
+	return ok;
+}
+
+static bool find_view_of(u32 d, u32 *gi, u32 *t)
+{
+	for (u32 g = 0; g < app.ngroups; g++)
+		for (u32 i = 0; i < app.groups[g].nt; i++)
+			if (app.groups[g].tab[i]->doc == d && app.groups[g].tab[i]->diff_left == UINT32_MAX) {
+				*gi = g;
+				*t = i;
+				return true;
+			}
+	return false;
+}
+
+static void close_all_tabs(void)
+{
+	for (u32 gi = app.ngroups; gi-- > 0;)
+		for (u32 t = app.groups[gi].nt; t-- > 0;)
+			if (!doc_unsaved(app.groups[gi].tab[t]->doc) || app.docs.refs[app.groups[gi].tab[t]->doc] > 1)
+				close_tab(gi, t);
+	/* what is left was chosen to be discarded, or could not be saved */
+}
+
+void dialog_result(int kind, u32 arg, int choice)
+{
+	if (choice == 2)
+		return; /* Cancel */
+	u32 gi, t;
+	switch (kind) {
+	case DLG_CLOSE_TAB:
+		if (choice == 0) {
+			if (app.docs.untitled[arg]) {
+				doc_save(arg); /* asks for a path; the tab stays until then */
+				return;
+			}
+			if (!doc_save(arg))
+				return; /* keep it: the save failed */
+		}
+		if (find_view_of(arg, &gi, &t))
+			close_tab(gi, t);
+		break;
+	case DLG_CLOSE_ALL:
+		if (choice == 0)
+			save_all_named();
+		else
+			for (u32 d = 0; d < app.docs.n; d++)
+				if (app.docs.refs[d] && doc_unsaved(d))
+					app.docs.text[d].saved_upos = app.docs.text[d].upos; /* discard: close quietly */
+		close_all_tabs();
+		break;
+	case DLG_QUIT:
+		if (choice == 0 && !save_all_named()) {
+			ui_status("Untitled files still have unsaved changes: save them (Ctrl+S) or choose Don't Save");
+			return;
+		}
+		app.running = false;
+		break;
+	}
+}
+
+/* Close a tab, asking first when it is the last view of unsaved changes. */
+void close_tab_safe(u32 gi, u32 t)
+{
+	Group *g = &app.groups[gi];
+	if (t >= g->nt)
+		return;
+	u32 d = g->tab[t]->doc;
+	if (g->tab[t]->diff_left == UINT32_MAX && doc_unsaved(d) && app.docs.refs[d] == 1) {
+		activate_tab(gi, t);
+		ask_save_one(DLG_CLOSE_TAB, d);
+		return;
+	}
+	close_tab(gi, t);
 }
 
 void close_tab(u32 gi, u32 t)
@@ -860,6 +1027,9 @@ static const char *cmd_titles[CMD_COUNT] = {
     [CMD_SAVE_ALL] = "File: Save All Files",
     [CMD_NEW_FILE] = "File: New Untitled Text File",
     [CMD_CLOSE_EDITOR] = "View: Close Editor",
+    [CMD_REVERT_AND_CLOSE] = "View: Revert and Close Editor",
+    [CMD_CHANGE_LANGUAGE] = "Change Language Mode",
+    [CMD_TOGGLE_INDENT_STYLE] = "Indent Using Tabs / Spaces (toggle)",
     [CMD_CLOSE_ALL] = "View: Close All Editors",
     [CMD_NEXT_EDITOR] = "View: Open Next Editor",
     [CMD_PREV_EDITOR] = "View: Open Previous Editor",
@@ -930,9 +1100,10 @@ static const char *cmd_titles[CMD_COUNT] = {
     [CMD_PREV_PROBLEM] = "Go to Previous Problem in Files (Error, Warning, Info)",
     [CMD_TRIGGER_SUGGEST] = "Trigger Suggest",
     [CMD_SHOW_HOVER] = "Show or Focus Hover",
-    [CMD_TOGGLE_THEME] = "Preferences: Toggle between Light/Dark Themes",
+    [CMD_TOGGLE_THEME] = "Preferences: Color Theme",
     [CMD_THEME_DARK] = "Preferences: Color Theme: Dark Modern",
     [CMD_THEME_LIGHT] = "Preferences: Color Theme: Light Modern",
+    [CMD_THEME_DARKER] = "Preferences: Color Theme: Dark Modern Darker",
     [CMD_GIT_REFRESH] = "Git: Refresh",
     [CMD_GIT_COMMIT] = "Git: Commit Staged",
     [CMD_GIT_STAGE_ALL] = "Git: Stage All Changes",
@@ -1041,6 +1212,8 @@ const char *command_keys(int cmd)
 
 static void quick_close(void)
 {
+	if (app.quick == QUICK_PICK && app.pick_kind == 301)
+		app.theme = app.theme_before; /* a cancelled preview; an accept sets it again */
 	app.quick_accept_pending = false;
 	app.quick = QUICK_NONE;
 	app.focus = active_view() ? FOCUS_EDITOR : FOCUS_SIDEBAR;
@@ -1173,12 +1346,14 @@ static void quick_update(void)
 			app.quick_mask[n] = m;
 			n++;
 		}
-		/* stable sort by score when filtering, keep table order otherwise */
+		/* recently used first (VSCodium's "recently used" group), then by
+		 * match score when filtering, else in table order */
 		for (u32 i = 0; i < n; i++) {
 			app.quick_items[i] = tmp[i];
-			app.quick_score[i] = nq ? score[i] : 0;
+			int rank = command_recent_rank((int)tmp[i]);
+			app.quick_score[i] = (nq ? score[i] : 0) + (rank >= 0 ? 100000 - rank : 0);
 		}
-		if (nq) {
+		{
 			u32 *idx = vx_alloc(n * sizeof(u32) + 4);
 			for (u32 i = 0; i < n; i++)
 				idx[i] = i;
@@ -1458,6 +1633,7 @@ static void quick_accept(void)
 	if (kind == QUICK_PICK) {
 		pick_accept(app.pick_kind, item);
 	} else if (kind == QUICK_COMMANDS) {
+		command_used((int)item);
 		run_command((int)item);
 	} else if (item & 0x80000000u) {
 		u32 d = item & 0x7FFFFFFFu;
@@ -1514,6 +1690,8 @@ static bool quick_key(const Event *e)
 
 static void quick_draw(void)
 {
+	if (app.quick == QUICK_PICK && app.pick_kind == 301 && app.quick_sel < app.quick_n)
+		app.theme = (int)app.pick_val[app.quick_items[app.quick_sel]]; /* live preview */
 	int w = VX_MIN(PX(600), app.w - PX(40));
 	int x = (app.w - w) / 2;
 	int y = PX(4);
@@ -1609,9 +1787,21 @@ static void quick_draw(void)
 				tx = draw_text((k < 63 && (mask >> k) & 1) ? FONT_UI_BOLD : FONT_UI, tx, ty, t + k, 1, c);
 			}
 			const char *keys = command_keys((int)item);
+			int kx = x + w - pad - PX(8);
 			if (keys) {
 				int kw = font_width(FONT_UI, keys, strlen(keys));
-				draw_text(FONT_UI, x + w - pad - PX(8) - kw, ty, keys, strlen(keys), COL(C_DESCRIPTION_FG));
+				kx -= kw;
+				draw_text(FONT_UI, kx, ty, keys, strlen(keys), COL(C_DESCRIPTION_FG));
+			}
+			/* group labels, as in VSCodium */
+			bool recent = command_recent_rank((int)item) >= 0;
+			bool prev_recent = i > 0 && command_recent_rank((int)app.quick_items[i - 1]) >= 0;
+			const char *grp = recent && i == 0 ? "recently used" : !recent && prev_recent ? "other commands" : NULL;
+			if (grp) {
+				int gw = font_width(FONT_SMALL, grp, strlen(grp));
+				draw_text(FONT_SMALL, kx - gw - PX(16), ty + PX(1), grp, strlen(grp), COL(C_DESCRIPTION_FG));
+				if (!recent)
+					draw_rect(x + PX(1), ry, w - PX(2), PX(1), COL(C_WIDGET_BORDER));
 			}
 		} else {
 			const char *path;
@@ -1809,7 +1999,7 @@ void run_command(int cmd)
 	case CMD_CLOSE_EDITOR: {
 		Group *g = &app.groups[app.active_group];
 		if (g->nt)
-			close_tab(app.active_group, g->active);
+			close_tab_safe(app.active_group, g->active);
 		else if (app.ngroups > 1) {
 			memmove(app.groups + app.active_group, app.groups + app.active_group + 1,
 			        (app.ngroups - app.active_group - 1) * sizeof(Group));
@@ -1820,10 +2010,31 @@ void run_command(int cmd)
 		break;
 	}
 	case CMD_CLOSE_ALL:
-		for (u32 gi = app.ngroups; gi-- > 0;)
-			while (app.groups[gi].nt)
-				close_tab(gi, app.groups[gi].nt - 1);
+		if (!ask_save_many(DLG_CLOSE_ALL))
+			close_all_tabs();
 		break;
+	case CMD_CHANGE_LANGUAGE:
+		if (v) {
+			extern void language_pick(u32 d);
+			language_pick(v->doc);
+		}
+		break;
+	case CMD_TOGGLE_INDENT_STYLE:
+		if (v) {
+			app.docs.tabs[v->doc] = !app.docs.tabs[v->doc];
+			ui_status("Indent using %s", app.docs.tabs[v->doc] ? "tabs" : "spaces");
+		}
+		break;
+	case CMD_REVERT_AND_CLOSE: {
+		Group *g = &app.groups[app.active_group];
+		if (g->nt) {
+			u32 d = g->tab[g->active]->doc;
+			if (app.docs.refs[d] == 1)
+				app.docs.text[d].saved_upos = app.docs.text[d].upos; /* nothing to keep */
+			close_tab(app.active_group, g->active);
+		}
+		break;
+	}
 	case CMD_NEXT_EDITOR:
 	case CMD_PREV_EDITOR: {
 		Group *g = &app.groups[app.active_group];
@@ -2008,16 +2219,16 @@ void run_command(int cmd)
 	case CMD_PREV_PROBLEM:
 		goto_problem(-1);
 		break;
-	case CMD_TOGGLE_THEME:
-		app.theme = app.theme == THEME_DARK ? THEME_LIGHT : THEME_DARK;
-		ui_status("Color Theme: %s", themes[app.theme].name);
-		settings_save();
+	case CMD_TOGGLE_THEME: {
+		extern void theme_pick(void);
+		theme_pick(); /* Ctrl+K Ctrl+T: VSCodium's theme picker, previewing as you move */
 		break;
+	}
 	case CMD_THEME_DARK:
-		app.theme = THEME_DARK;
-		break;
 	case CMD_THEME_LIGHT:
-		app.theme = THEME_LIGHT;
+	case CMD_THEME_DARKER:
+		app.theme = cmd == CMD_THEME_DARK ? THEME_DARK : cmd == CMD_THEME_LIGHT ? THEME_LIGHT : THEME_DARKER;
+		settings_save();
 		break;
 	case CMD_GIT_REFRESH:
 		app.git_ns = 0;
@@ -2098,7 +2309,7 @@ void run_command(int cmd)
 		restart_lsp();
 		break;
 	case CMD_QUIT:
-		app.running = false;
+		request_quit();
 		break;
 	case CMD_TOGGLE_OVERTYPE:
 		app.overtype = !app.overtype;
@@ -2178,6 +2389,74 @@ static void sidebar_event(const Event *e, int x, int y, int w, int h)
 	(void)0;
 }
 
+/* ---- tooltips ---------------------------------------------------------------
+ * Controls that are only an icon (or a truncated name) say what they do
+ * after the pointer rests on them (600 ms, like VSCodium's hover delay for
+ * the workbench). Drawing code calls ui_tip() for each such control; the
+ * one under the pointer is shown at the end of the frame. */
+
+static struct {
+	int x, y, w, h;
+	char t[512];
+} tip, tip_last;
+static bool tip_have;
+static u64 tip_since, tip_due;
+
+void ui_tip(int x, int y, int w, int h, const char *text)
+{
+	if (!text || !*text || !in_rect(app.hover_x, app.hover_y, x, y, w, h))
+		return;
+	tip_have = true;
+	tip.x = x;
+	tip.y = y;
+	tip.w = w;
+	tip.h = h;
+	snprintf(tip.t, sizeof tip.t, "%s", text);
+}
+
+static void tip_draw(void)
+{
+	if (!tip_have || app.mouse_down || menu_is_open() || app.quick || dialog_active()) {
+		tip_last.t[0] = 0;
+		tip_due = 0;
+		return;
+	}
+	u64 now = vx_now_ns();
+	if (strcmp(tip.t, tip_last.t) != 0 || tip.x != tip_last.x || tip.y != tip_last.y) {
+		tip_last = tip; /* another control: start over */
+		tip_since = now;
+	}
+	if (now < tip_since + 600000000ull) {
+		tip_due = tip_since + 600000000ull;
+		return;
+	}
+	tip_due = 0;
+	int pad = PX(6);
+	int tw = font_width(FONT_UI, tip.t, strlen(tip.t));
+	int w = VX_MIN(tw + 2 * pad, app.w - PX(8)), h = font_m[FONT_UI].line + 2 * pad;
+	int x = VX_CLAMP(tip.x + tip.w / 2 - w / 2, PX(4), app.w - w - PX(4));
+	int y = tip.y + tip.h + PX(4);
+	if (y + h > app.h - PX(2))
+		y = tip.y - h - PX(4); /* above when there is no room below (status bar) */
+	draw_rect(x + PX(2), y + PX(2), w, h, COL(C_WIDGET_SHADOW));
+	draw_rect(x, y, w, h, COL(C_WIDGET_BG));
+	draw_frame(x, y, w, h, COL(C_WIDGET_BORDER));
+	draw_text_fit(FONT_UI, x + pad, y + pad, tip.t, strlen(tip.t), w - 2 * pad, COL(C_FG));
+}
+
+/* the empty editor's hints (VSCodium's watermark), clickable */
+static const int welcome_cmds[] = {CMD_COMMANDS, CMD_QUICK_OPEN, CMD_VIEW_SEARCH, CMD_TOGGLE_PANEL,
+                                   CMD_TOGGLE_THEME, CMD_VIEW_MAN,  CMD_VIEW_SETTINGS};
+static const char *const welcome_labels[] = {"Show All Commands", "Go to File", "Find in Files", "Toggle Panel",
+                                             "Color Theme",       "Manpages",   "Settings"};
+static int welcome_y[8], welcome_n, welcome_x0, welcome_x1;
+
+/* Status bar items that do something when clicked (rects from the last draw). */
+static struct {
+	int x, w, cmd;
+} st_hit[24];
+static int st_hit_n;
+
 /* ---- top-level tabs (Project, Git, Search, Settings) -------------------- */
 
 static const struct {
@@ -2191,11 +2470,32 @@ static const struct {
     {SIDE_SETTINGS, ICON_GEAR_S, CMD_VIEW_SETTINGS, "Settings"},
 };
 
+static u32 scm_badge_count(void)
+{
+	if (!app.git)
+		return 0;
+	const GitStatus *st = git_status(app.git);
+	u32 n = 0;
+	for (u32 k = 0; k < st->count; k++)
+		if (!(st->flags[k] & GS_IGNORED))
+			n++;
+	return n;
+}
+
+static int badge_w(u32 n, char *b, size_t cap)
+{
+	int bn = snprintf(b, cap, "%u", n > 9999 ? 9999 : n);
+	return VX_MAX(PX(14), font_width(FONT_SMALL, b, (size_t)bn) + PX(6));
+}
+
 static int top_tab_w(int i)
 {
 	int w = PX(10) + PX(16) + PX(6) + font_width(FONT_SMALL, top_tabs[i].label, strlen(top_tabs[i].label)) + PX(12);
-	if (top_tabs[i].view == SIDE_SCM && app.git)
-		w += PX(26); /* room for the change count */
+	u32 n = top_tabs[i].view == SIDE_SCM ? scm_badge_count() : 0;
+	if (n) {
+		char b[16];
+		w += badge_w(n, b, sizeof b) + PX(4); /* only as wide as the count */
+	}
 	return w;
 }
 
@@ -2345,6 +2645,14 @@ void ui_event(const Event *e)
 {
 	app.dirty = true;
 	app.blink_t0 = vx_now_ns();
+	if (dialog_active() && e->type != EV_RESIZE && e->type != EV_QUIT && e->type != EV_FOCUS) {
+		if (e->type == EV_MMOVE) {
+			app.hover_x = e->x;
+			app.hover_y = e->y;
+		}
+		dialog_event(e);
+		return;
+	}
 	if (menu_is_open() && menu_event(e)) {
 		app.cursor = CURSOR_ARROW;
 		return;
@@ -2356,7 +2664,7 @@ void ui_event(const Event *e)
 		return;
 	}
 	if (e->type == EV_QUIT) {
-		app.running = false;
+		request_quit(); /* the window's close button asks too */
 		return;
 	}
 	if (e->type == EV_FOCUS) {
@@ -2607,11 +2915,12 @@ void ui_event(const Event *e)
 		}
 	}
 	if (my >= app.h - app.status_h) {
-		if (e->type == EV_MDOWN) {
-			/* status bar: problems item toggles the panel */
-			if (mx < PX(260) && mx > PX(100))
-				run_command(CMD_VIEW_PROBLEMS);
-		}
+		if (e->type == EV_MDOWN && e->button == 1)
+			for (int i = 0; i < st_hit_n; i++)
+				if (mx >= st_hit[i].x && mx < st_hit[i].x + st_hit[i].w) {
+					run_command(st_hit[i].cmd);
+					break;
+				}
 		return;
 	}
 	if (my < app.top_h) {
@@ -2663,8 +2972,15 @@ void ui_event(const Event *e)
 		}
 		if (my < g->y + group_head_h(g))
 			return;
-		if (g->nt == 0)
+		if (g->nt == 0) {
+			if (e->type == EV_MDOWN && e->button == 1 && gi == 0 && mx >= welcome_x0 && mx < welcome_x1)
+				for (int i = 0; i < welcome_n; i++)
+					if (my >= welcome_y[i] && my < welcome_y[i] + PX(26)) {
+						run_command(welcome_cmds[i]);
+						break;
+					}
 			return;
+		}
 		if (e->type == EV_MDOWN) {
 			app.active_group = gi;
 			if (app.focus != FOCUS_FIND)
@@ -2829,7 +3145,7 @@ static bool tabs_mouse(Group *g, u32 gi, const Event *e)
 		if (e->x >= x && e->x < x + w && e->y >= ty && e->y < ty + app.tabs_h) {
 			bool close = e->x >= x + w - PX(28) || e->button == 2;
 			if (close) {
-				close_tab(gi, t);
+				close_tab_safe(gi, t);
 			} else {
 				activate_tab(gi, t);
 				app.focus = FOCUS_EDITOR;
@@ -2945,6 +3261,14 @@ static void draw_tabs(Group *g, u32 gi)
 		draw_rect(x + w - PX(1), y, PX(1), app.tabs_h, COL(C_TAB_BORDER));
 		char lb[600];
 		const char *base = view_label(v, lb, sizeof lb);
+		{
+			/* the whole path (tabs only show the name), and whether it is saved */
+			char tt[700];
+			const char *full = app.docs.path[v->doc] ? app.docs.path[v->doc] : app.docs.rel[v->doc];
+			snprintf(tt, sizeof tt, "%s%s", full,
+			         text_dirty(&app.docs.text[v->doc]) && !app.docs.readonly[v->doc] ? " - unsaved changes" : "");
+			ui_tip(x, y, w, app.tabs_h, tt);
+		}
 		const char *iname = v->diff_left != UINT32_MAX ? v->diff_rel : app.docs.rel[v->doc];
 		const char *isl = strrchr(iname, '/');
 		int tx = file_icon_draw(isl ? isl + 1 : iname, x + PX(10), y, app.tabs_h);
@@ -3019,17 +3343,22 @@ static void draw_group(Group *g, u32 gi)
 		draw_rect(g->x, g->y + group_tabs_h(g), g->w, g->h - group_tabs_h(g), COL(C_EDITOR_BG));
 		if (gi == 0 && app.ngroups == 1) {
 			/* empty editor hints, like the VSCodium watermark */
-			static const int cmds[] = {CMD_COMMANDS, CMD_QUICK_OPEN, CMD_VIEW_SEARCH, CMD_TOGGLE_PANEL,
-			                           CMD_TOGGLE_THEME};
-			static const char *labels[] = {"Show All Commands", "Go to File", "Find in Files",
-			                               "Toggle Panel", "Toggle Light/Dark Theme"};
-			int cy = g->y + g->h / 2 - PX(60);
-			for (size_t i = 0; i < VX_COUNT(cmds); i++) {
-				const char *k = command_keys(cmds[i]);
-				int lw = font_width(FONT_UI, labels[i], strlen(labels[i]));
+			/* each row is a link: hover shows it, a click runs it */
+			int cy = g->y + g->h / 2 - PX(80);
+			welcome_n = 0;
+			for (size_t i = 0; i < VX_COUNT(welcome_cmds); i++) {
+				const char *k = command_keys(welcome_cmds[i]);
+				const char *lab = welcome_labels[i];
+				int lw = font_width(FONT_UI, lab, strlen(lab));
 				int mid = g->x + g->w / 2;
-				u32 c = COL(C_FG_DIM);
-				draw_text(FONT_UI, mid - lw - PX(8), cy, labels[i], strlen(labels[i]), c);
+				int rx = mid - lw - PX(16), rw = (g->x + g->w / 2 + PX(200)) - rx;
+				bool hov = in_rect(app.hover_x, app.hover_y, rx, cy - PX(4), rw, PX(26));
+				welcome_y[welcome_n] = cy - PX(4);
+				welcome_x0 = mid - PX(260);
+				welcome_x1 = mid + PX(220);
+				welcome_n++;
+				u32 c = hov ? COL(C_FG) : COL(C_FG_DIM);
+				draw_text(FONT_UI, mid - lw - PX(8), cy, lab, strlen(lab), hov ? COL(C_LINK) : c);
 				if (k) {
 					/* key caps: square boxes */
 					int kx = mid + PX(8);
@@ -3069,8 +3398,15 @@ static void draw_top_tabs(void)
 	int x = 0;
 	for (int i = 0; i < (int)VX_COUNT(top_tabs); i++) {
 		int w = top_tab_w(i);
-		bool active = app.side_visible && app.side_view == top_tabs[i].view;
+		/* a workspace is shown whatever the side bar does */
+		bool ws = top_tabs[i].view == SIDE_MAN || top_tabs[i].view == SIDE_SETTINGS;
+		bool active = app.side_view == top_tabs[i].view && (ws || app.side_visible);
 		bool hover = in_rect(app.hover_x, app.hover_y, x, 0, w, h);
+		static const char *const tips[] = {"Project: Explorer (Ctrl+Shift+E)", "Git: Source Control (Ctrl+Shift+G)",
+		                                   "Search (Ctrl+Shift+F)", "Manpages: read and search manual pages",
+		                                   "Settings (Ctrl+,)"};
+		if (i < (int)VX_COUNT(tips))
+			ui_tip(x, 0, w, h, tips[i]);
 		draw_rect(x, 0, w, h - (active ? 0 : PX(1)), active ? COL(C_TAB_ACTIVE_BG) : COL(C_TAB_INACTIVE_BG));
 		if (active)
 			draw_rect(x, 0, w, PX(1), COL(C_TAB_ACTIVE_BORDER_TOP));
@@ -3079,17 +3415,13 @@ static void draw_top_tabs(void)
 		draw_icon(top_tabs[i].icon, x + PX(10), (h - PX(16)) / 2, fg);
 		const char *lb = top_tabs[i].label;
 		int tx = draw_text(FONT_SMALL, x + PX(32), (h - font_m[FONT_SMALL].line) / 2, lb, strlen(lb), fg);
-		if (top_tabs[i].view == SIDE_SCM && app.git) {
+		if (top_tabs[i].view == SIDE_SCM) {
 			/* number of changes, like the activity bar badge */
-			const GitStatus *st = git_status(app.git);
-			u32 n = 0;
-			for (u32 k = 0; k < st->count; k++)
-				if (!(st->flags[k] & GS_IGNORED))
-					n++;
+			u32 n = scm_badge_count();
 			if (n) {
 				char b[16];
-				int bn = snprintf(b, sizeof b, "%u", n > 9999 ? 9999 : n);
-				int bw = VX_MAX(PX(14), font_width(FONT_SMALL, b, (size_t)bn) + PX(6));
+				int bw = badge_w(n, b, sizeof b);
+				int bn = (int)strlen(b);
 				int bx = tx + PX(4), by = (h - PX(14)) / 2;
 				draw_rect(bx, by, bw, PX(14), COL(C_BADGE_BG));
 				draw_text(FONT_SMALL, bx + (bw - font_width(FONT_SMALL, b, (size_t)bn)) / 2,
@@ -3199,16 +3531,30 @@ static void draw_panel(void)
 		draw_rect(x, y - PX(2), w, PX(4), COL(C_SASH_HOVER));
 }
 
-static int status_item(int x, int y, const char *s, size_t n, bool right)
+/* A status bar item; clicking it runs cmd (0 = informational only, so no
+ * hover highlight: highlighting promises a click). */
+static int status_item_ex(int x, int y, const char *s, size_t n, bool right, int cmd, const char *tipt)
 {
 	int w = font_width(FONT_UI, s, n) + PX(10);
 	if (right)
 		x -= w;
 	bool hover = in_rect(app.hover_x, app.hover_y, x, y, w, app.status_h);
-	if (hover)
+	if (hover && cmd)
 		draw_rect(x, y, w, app.status_h, COL(C_STATUS_HOVER_BG));
+	if (cmd && st_hit_n < (int)VX_COUNT(st_hit)) {
+		st_hit[st_hit_n].x = x;
+		st_hit[st_hit_n].w = w;
+		st_hit[st_hit_n].cmd = cmd;
+		st_hit_n++;
+	}
+	ui_tip(x, y, w, app.status_h, tipt);
 	draw_text(FONT_UI, x + PX(5), y + (app.status_h - font_m[FONT_UI].line) / 2, s, n, COL(C_STATUS_FG));
 	return right ? x : x + w;
+}
+
+static int status_item(int x, int y, const char *s, size_t n, bool right)
+{
+	return status_item_ex(x, y, s, n, right, 0, NULL);
 }
 
 static void draw_status(void)
@@ -3218,10 +3564,10 @@ static void draw_status(void)
 	draw_rect(0, y, app.w, PX(1), COL(C_STATUS_BORDER));
 	int x = PX(4);
 	int iy = y + (app.status_h - PX(16)) / 2;
+	st_hit_n = 0;
 	if (app.git) {
 		bool hov = in_rect(app.hover_x, app.hover_y, x, y, PX(120), app.status_h);
 		(void)hov;
-		draw_icon(ICON_BRANCH, x + PX(5), iy, COL(C_STATUS_FG));
 		char b[160];
 		const GitStatus *st = git_status(app.git);
 		bool dirty = false;
@@ -3230,7 +3576,20 @@ static void draw_status(void)
 			                    GS_INDEX_DELETED | GS_WT_RENAMED | GS_INDEX_RENAMED))
 				dirty = true;
 		int n = snprintf(b, sizeof b, "%s%s", git_branch(app.git), dirty ? "*" : "");
-		x = status_item(x + PX(18), y, b, (size_t)n, false);
+		{
+			/* the icon and the name are one item */
+			char tt[200];
+			snprintf(tt, sizeof tt, "%s%s (Checkout Branch/Tag...)", git_branch(app.git), dirty ? "*" : "");
+			int x0 = x;
+			x = status_item_ex(x + PX(18), y, b, (size_t)n, false, CMD_GIT_CHECKOUT, tt);
+			if (st_hit_n) {
+				st_hit[st_hit_n - 1].x = x0;
+				st_hit[st_hit_n - 1].w = x - x0;
+			}
+			if (in_rect(app.hover_x, app.hover_y, x0, y, PX(18), app.status_h))
+				draw_rect(x0, y, PX(18), app.status_h, COL(C_STATUS_HOVER_BG));
+			draw_icon(ICON_BRANCH, x0 + PX(5), iy, COL(C_STATUS_FG));
+		}
 		u32 ahead, behind;
 		git_ahead_behind(app.git, &ahead, &behind);
 		if (ahead || behind) {
@@ -3253,6 +3612,15 @@ static void draw_status(void)
 		              COL(C_STATUS_FG)) + PX(6);
 		if (in_rect(app.hover_x, app.hover_y, x0, y, x - x0, app.status_h))
 			draw_rect(x0, y, x - x0, app.status_h, COL(C_STATUS_HOVER_BG));
+		if (st_hit_n < (int)VX_COUNT(st_hit)) {
+			st_hit[st_hit_n].x = x0;
+			st_hit[st_hit_n].w = x - x0;
+			st_hit[st_hit_n].cmd = CMD_VIEW_PROBLEMS;
+			st_hit_n++;
+		}
+		char pt[96];
+		snprintf(pt, sizeof pt, e || w ? "Errors: %u, Warnings: %u (Ctrl+Shift+M)" : "No Problems (Ctrl+Shift+M)", e, w);
+		ui_tip(x0, y, x - x0, app.status_h, pt);
 	}
 	if (app.vim_on) {
 		/* the vim mode first; a status message follows it */
@@ -3275,7 +3643,7 @@ static void draw_status(void)
 		if (app.lsps[sv]) {
 			char s[64];
 			snprintf(s, sizeof s, "%s%s", lsv_name(sv), app.lsps_ready[sv] ? "" : " (starting)");
-			rx = status_item(rx, y, s, strlen(s), true);
+			rx = status_item_ex(rx, y, s, strlen(s), true, CMD_VIEW_OUTPUT, "Language server: show its log (Output)");
 		}
 	}
 	if (v) {
@@ -3288,14 +3656,14 @@ static void draw_status(void)
 			return;
 		}
 		const char *ln = D->man[v->doc] ? "Manual Page" : syn_lang_name(D->lang[v->doc]);
-		rx = status_item(rx, y, ln, strlen(ln), true);
+		rx = status_item_ex(rx, y, ln, strlen(ln), true, D->man[v->doc] ? 0 : CMD_CHANGE_LANGUAGE, D->man[v->doc] ? NULL : "Select Language Mode");
 		if (app.overtype)
-			rx = status_item(rx, y, "OVR", 3, true);
+			rx = status_item_ex(rx, y, "OVR", 3, true, CMD_TOGGLE_OVERTYPE, "Overtype: typing replaces characters (Insert)");
 		const char *eol = t->crlf ? "CRLF" : "LF";
-		rx = status_item(rx, y, eol, strlen(eol), true);
-		rx = status_item(rx, y, "UTF-8", 5, true);
-		rx = D->tabs[v->doc] ? status_item(rx, y, "Tab Size: 4", 11, true)
-		                     : status_item(rx, y, "Spaces: 4", 9, true);
+		rx = status_item_ex(rx, y, eol, strlen(eol), true, 0, t->crlf ? "End of Line Sequence: CRLF" : "End of Line Sequence: LF");
+		rx = status_item_ex(rx, y, "UTF-8", 5, true, 0, "Encoding");
+		rx = D->tabs[v->doc] ? status_item_ex(rx, y, "Tab Size: 4", 11, true, CMD_TOGGLE_INDENT_STYLE, "Indent Using Tabs (click: Spaces)")
+		                     : status_item_ex(rx, y, "Spaces: 4", 9, true, CMD_TOGGLE_INDENT_STYLE, "Indent Using Spaces (click: Tabs)");
 		char b[96];
 		u32 head = v->head[0];
 		u32 l = text_line_of(t, head);
@@ -3320,7 +3688,7 @@ static void draw_status(void)
 			n = snprintf(b, sizeof b, "Ln %u, Col %u (%u selected)", l + 1, col + 1, sel);
 		else
 			n = snprintf(b, sizeof b, "Ln %u, Col %u", l + 1, col + 1);
-		rx = status_item(rx, y, b, (size_t)n, true);
+		rx = status_item_ex(rx, y, b, (size_t)n, true, CMD_GOTO_LINE, "Go to Line/Column (Ctrl+G)");
 	}
 }
 
@@ -3376,6 +3744,7 @@ static void background_overlay(Group *g)
 void ui_draw(void)
 {
 	draw_begin(app.w, app.h);
+	tip_have = false;
 	background_place();
 	if (ui_workspace()) {
 		int x, y, w, h;
@@ -3409,6 +3778,8 @@ void ui_draw(void)
 	if (app.quick)
 		quick_draw();
 	menu_draw();
+	tip_draw();
+	dialog_draw();
 	gpu_frame(draw.q, draw.n, COL(C_EDITOR_BG));
 	app.dirty = false;
 }
@@ -3823,6 +4194,8 @@ static void watch_tick(void)
 void ui_tick(void)
 {
 	app.now = vx_now_ns();
+	if (tip_due && app.now >= tip_due)
+		app.dirty = true; /* time to show the tooltip */
 	projtools_tick();
 	man_tick();
 	lsp_tick();
@@ -3877,6 +4250,10 @@ void ui_tick(void)
 
 u64 ui_wait_hint_ms(void)
 {
+	if (tip_due) {
+		u64 now = vx_now_ns();
+		return tip_due > now ? (tip_due - now) / 1000000ull + 1 : 1;
+	}
 	for (int sv = 0; sv < LSV_COUNT; sv++)
 		if (app.lsps[sv] && !app.lsps_ready[sv])
 			return 30;
@@ -3898,6 +4275,7 @@ bool ui_init(const char *root, int w, int h, int scale, bool headless)
 	app.scale = scale;
 	app.headless = headless;
 	app.running = true;
+	theme_init();
 	app.theme = THEME_DARK;
 	const char *th = getenv("VXIDE_THEME");
 	if (th && strcmp(th, "light") == 0)
@@ -3942,6 +4320,8 @@ bool ui_init(const char *root, int w, int h, int scale, bool headless)
 	settings_load(); /* not in headless runs: tests must not see a user's settings */
 	if (th && strcmp(th, "light") == 0)
 		app.theme = THEME_LIGHT;
+	if (th && strcmp(th, "darker") == 0)
+		app.theme = THEME_DARKER;
 	if (getenv("VXIDE_NO_BLAME"))
 		app.blame_on = false;
 	if (getenv("VXIDE_BG"))
@@ -3954,11 +4334,13 @@ bool ui_init(const char *root, int w, int h, int scale, bool headless)
 		restart_lsp();
 	ui_layout();
 	app.focus = FOCUS_SIDEBAR;
+	session_restore(); /* the last editors of this folder (sets the focus) */
 	return true;
 }
 
 void ui_shutdown(void)
 {
+	session_save(); /* before the tabs close */
 	projtools_shutdown();
 	/* tabs first: closing a document still talks to the language server */
 	for (u32 gi = 0; gi < app.ngroups; gi++)

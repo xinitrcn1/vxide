@@ -2159,7 +2159,7 @@ static void ex(View *v, char *s)
 			return;
 		}
 		S.view = NULL;
-		run_command(CMD_CLOSE_EDITOR);
+		run_command(bang ? CMD_REVERT_AND_CLOSE : CMD_CLOSE_EDITOR);
 		return;
 	}
 	if (IS("wq", "x") || IS("xit", "exit")) {

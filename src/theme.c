@@ -1,8 +1,9 @@
 /* Colours from VSCodium's dark_modern.json / light_modern.json and the
  * dark_plus / light_plus token rules they include (0xRRGGBBAA). */
 #include "theme.h"
+#include <math.h>
 
-const Theme themes[THEME_COUNT] = {
+Theme themes[THEME_COUNT] = {
     [THEME_DARK] =
         {
             "Dark Modern",
@@ -318,3 +319,94 @@ const u8 tk_style[TK_COUNT] = {
     [TK_STRIKE] = TS_STRIKE,
     [TK_LINK] = TS_UNDERLINE,
 };
+
+/* ---- Dark Modern, darker ------------------------------------------------------
+ *
+ * Asked for: more contrast than Dark Modern, the red of a deleted file on a
+ * tab especially. Derived rather than drawn up by hand so it stays Dark
+ * Modern in every other respect:
+ *  - neutral dark surfaces (editor, side bar, tabs, status bar, panels, menus)
+ *    go to half their brightness, #1F1F1F -> #0F0F0F;
+ *  - borders, hover and selection colours stay, so they stand out more;
+ *  - text that carries meaning (git decorations, errors, warnings, dim and
+ *    secondary text, line numbers) and every syntax colour is raised until
+ *    it reaches a WCAG contrast ratio against the surface it is drawn on:
+ *    7:1 (AAA) for body text, 5.5:1 for decorations and secondary text.
+ *    Raising keeps the hue: channels are scaled up first, then mixed toward
+ *    white only if that is not enough. */
+
+static double chan(u32 c8)
+{
+	double c = (double)c8 / 255.0;
+	return c <= 0.03928 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
+}
+
+static double lum(u32 c)
+{
+	return 0.2126 * chan((c >> 24) & 255) + 0.7152 * chan((c >> 16) & 255) + 0.0722 * chan((c >> 8) & 255);
+}
+
+double theme_contrast(u32 a, u32 b)
+{
+	double la = lum(a), lb = lum(b);
+	return la > lb ? (la + 0.05) / (lb + 0.05) : (lb + 0.05) / (la + 0.05);
+}
+
+static u32 rgb(double r, double g, double b, u32 a)
+{
+	u32 R = (u32)VX_CLAMP(r + 0.5, 0, 255), G = (u32)VX_CLAMP(g + 0.5, 0, 255), B = (u32)VX_CLAMP(b + 0.5, 0, 255);
+	return R << 24 | G << 16 | B << 8 | (a & 255);
+}
+
+static u32 scale(u32 c, double f)
+{
+	return rgb(((c >> 24) & 255) * f, ((c >> 16) & 255) * f, ((c >> 8) & 255) * f, c);
+}
+
+/* brighter until contrast(c, bg) >= want */
+static u32 lift(u32 c, u32 bg, double want)
+{
+	for (int i = 0; i < 200 && theme_contrast(c, bg) < want; i++) {
+		u32 r = (c >> 24) & 255, g = (c >> 16) & 255, b = (c >> 8) & 255;
+		u32 mx = VX_MAX(r, VX_MAX(g, b));
+		if (mx < 250)
+			c = scale(c, 1.03); /* same hue, brighter */
+		else
+			c = rgb(r + (255 - r) * 0.06, g + (255 - g) * 0.06, b + (255 - b) * 0.06, c); /* toward white */
+	}
+	return c;
+}
+
+static bool neutral_surface(u32 c)
+{
+	u32 r = (c >> 24) & 255, g = (c >> 16) & 255, b = (c >> 8) & 255;
+	u32 mx = VX_MAX(r, VX_MAX(g, b)), mn = VX_MIN(r, VX_MIN(g, b));
+	return (c & 255) == 255 && mx - mn <= 6 && lum(c) < 0.0165; /* #222222 and darker greys */
+}
+
+void theme_init(void)
+{
+	Theme *t = &themes[THEME_DARKER];
+	*t = themes[THEME_DARK];
+	t->name = "Dark Modern Darker";
+	for (int i = 0; i < C_COUNT_; i++)
+		if (neutral_surface(t->c[i]))
+			t->c[i] = scale(t->c[i], 0.5);
+	/* the darkest surface text appears on (tabs / side bar / status bar) */
+	u32 bg = t->c[C_TABS_BG];
+	if (lum(t->c[C_SIDEBAR_BG]) > lum(bg))
+		bg = t->c[C_SIDEBAR_BG];
+	if (lum(t->c[C_EDITOR_BG]) > lum(bg))
+		bg = t->c[C_EDITOR_BG];
+	static const int body[] = {C_FG, C_SIDEBAR_FG, C_EDITOR_FG, C_TAB_ACTIVE_FG};
+	static const int deco[] = {C_GIT_MODIFIED,      C_GIT_UNTRACKED, C_GIT_DELETED,     C_GIT_ADDED,
+	                           C_GIT_CONFLICT,      C_GIT_IGNORED,   C_ERROR,           C_WARNING,
+	                           C_FG_DIM,            C_TAB_INACTIVE_FG, C_LINE_NUMBER,   C_DESCRIPTION_FG,
+	                           C_BREADCRUMB_FG,     C_CODELENS,      C_ACTBAR_FG_INACTIVE, C_LINK};
+	for (size_t i = 0; i < VX_COUNT(body); i++)
+		t->c[body[i]] = lift(t->c[body[i]], bg, 7.0);
+	for (size_t i = 0; i < VX_COUNT(deco); i++)
+		t->c[deco[i]] = lift(t->c[deco[i]], bg, 5.5);
+	for (int k = 0; k < TK_COUNT; k++)
+		t->tok[k] = lift(t->tok[k], t->c[C_EDITOR_BG], 5.5);
+}

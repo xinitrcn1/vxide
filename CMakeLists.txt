@@ -46,7 +46,7 @@ add_custom_target(shaders DEPENDS ${SHADER_HDRS})
 set(CORE base text syntax theme fstree fswatch json lsp git gitops gitgraph githunk lgblame blame regex search
 	png binfile)
 # Front end: window, Vulkan, fonts, UI.
-set(APP main gpu font icons draw ui editor panes menu actions gitui bgwork diffview binview vim projtools man
+set(APP main gpu font icons draw ui editor panes menu actions gitui bgwork diffview binview vim projtools man dialog session
 	imgload)
 
 list(TRANSFORM CORE PREPEND src/ OUTPUT_VARIABLE CORE_SRC)

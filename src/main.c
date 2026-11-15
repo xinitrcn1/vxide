@@ -115,6 +115,10 @@ static void pump_for(u64 ms)
 	u64 end = vx_now_ns() + ms * 1000000ull;
 	do {
 		ui_tick();
+		/* draw like the windowed loop does, so timed UI (tooltips, finished
+		 * background work) behaves the same in scripts */
+		if (app.dirty)
+			ui_draw();
 		sleep_ms(5);
 	} while (vx_now_ns() < end);
 }

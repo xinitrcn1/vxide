@@ -6,7 +6,8 @@
 #include "base.h"
 #include "syntax.h"
 
-enum { THEME_DARK, THEME_LIGHT, THEME_COUNT };
+/* THEME_DARKER is derived from Dark Modern at start-up (theme_init). */
+enum { THEME_DARK, THEME_LIGHT, THEME_DARKER, THEME_COUNT };
 
 enum {
 	C_FOCUS_BORDER,
@@ -129,7 +130,10 @@ typedef struct {
 	u32 tok[TK_COUNT];
 } Theme;
 
-extern const Theme themes[THEME_COUNT];
+extern Theme themes[THEME_COUNT];
+void theme_init(void);
+/* WCAG 2 contrast ratio of two colours (1..21) */
+double theme_contrast(u32 a, u32 b);
 
 /* Font style per token class, from the themes' fontStyle (same in both). */
 enum { TS_BOLD = 1, TS_ITALIC = 2, TS_STRIKE = 4, TS_UNDERLINE = 8 };

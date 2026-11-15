@@ -866,12 +866,16 @@ void gitui_graph_draw(int x, int y, int w, int h)
 		const char *subj = graph.pool.b + graph.subject[c];
 		const char *auth = graph.pool.b + graph.author[c];
 		int right = x + w - PX(8);
-		tx = draw_text_fit(FONT_UI, tx, ty, subj, strlen(subj), VX_MAX(right - tx - PX(60), PX(40)), COL(C_SIDEBAR_FG));
+		/* narrow: the subject gets the row (the author is in the hover card);
+		 * otherwise subject, refs, author like VSCodium's graph */
+		bool narrow = right - tx < PX(220);
+		tx = draw_text_fit(FONT_UI, tx, ty, subj, strlen(subj),
+		                   narrow ? right - tx : VX_MAX(right - tx - PX(60), PX(40)), COL(C_SIDEBAR_FG));
 		tx += PX(8);
 		const char *refs = graph.pool.b + graph.refs[c];
-		if (*refs)
+		if (*refs && !narrow)
 			draw_refs(refs, &tx, ry, rh, right - PX(40));
-		if (tx < right - PX(30))
+		if (!narrow && tx < right - PX(30))
 			draw_text_fit(FONT_UI, tx, ty, auth, strlen(auth), right - tx, COL(C_DESCRIPTION_FG));
 		(void)now;
 	}

@@ -2579,6 +2579,12 @@ static void find_widget_draw(int x, int y, int w)
 	draw_icon(ICON_ARROW_UP, fx + fwid - PX(66), fy + PX(8), COL(C_FG));
 	draw_icon(ICON_ARROW_DOWN, fx + fwid - PX(46), fy + PX(8), COL(C_FG));
 	draw_icon(ICON_CLOSE, fx + fwid - PX(24), fy + PX(8), COL(C_FG));
+	ui_tip(bx, fy + PX(7), PX(20), PX(20), "Match Case (Alt+C)");
+	ui_tip(bx + PX(22), fy + PX(7), PX(20), PX(20), "Match Whole Word (Alt+W)");
+	ui_tip(bx + PX(44), fy + PX(7), PX(20), PX(20), "Use Regular Expression (Alt+R)");
+	ui_tip(fx + fwid - PX(70), fy + PX(4), PX(20), PX(24), "Previous Match (Shift+Enter)");
+	ui_tip(fx + fwid - PX(50), fy + PX(4), PX(20), PX(24), "Next Match (Enter)");
+	ui_tip(fx + fwid - PX(28), fy + PX(4), PX(22), PX(24), "Close (Escape)");
 	if (app.find_replace) {
 		bool rf = app.focus == FOCUS_FIND && (app.find_flags & 0x100);
 		input_draw_ex(&app.repl_in, ix, fy + fw_row1 + PX(3), iw, 0, "Replace", rf);

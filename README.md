@@ -2,7 +2,8 @@
 
 A project-based code editor in C11, built with CMake, whose whole UI is
 drawn with Vulkan. Its look and its keyboard shortcuts follow VSCodium
-(Dark Modern / Light Modern themes, Dark+ / Light+ syntax colours). It
+(Dark Modern / Light Modern themes, plus a near-black, higher-contrast
+Dark Modern Darker; Dark+ / Light+ syntax colours). It
 talks to clangd and rust-analyzer over LSP and to git through libgit2.
 
 ```
@@ -17,6 +18,13 @@ There is no project file: the folder you open is the project. The
 explorer hides `.git`, `.svn`, `.hg`, `.jj`, `CVS`, `.DS_Store` and
 `Thumbs.db` (VSCodium's default `files.exclude`). Quick Open and Search
 also skip `node_modules`, `bower_components` and git-ignored paths.
+
+The UI keeps VSCodium's look, keys and words, and fixes what gets in the
+way: unsaved changes are never dropped without asking, the last editors of
+a folder come back on start, icon buttons have tooltips, status bar items
+are clickable, and the narrow side bar lays itself out to fit. The
+reasoning, the rules every component follows, and the list of annoyances
+removed are in [docs/ui-design.md](docs/ui-design.md).
 
 ## Requirements
 

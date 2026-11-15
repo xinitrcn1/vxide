@@ -149,6 +149,7 @@ typedef struct {
 	/* config, fixed */
 	int scale;
 	int theme;
+	int theme_before; /* the theme picker previews live; Escape goes back to this */
 	int w, h;
 	char *root;
 	bool headless;
@@ -381,6 +382,24 @@ void open_file(const char *abs_path, bool preview, u32 line, u32 col);
 void open_rel(const char *rel, bool preview, u32 line, u32 col);
 View *active_view(void);
 
+/* dialog.c: modal Save / Don't Save / Cancel */
+enum { DLG_CLOSE_TAB = 1, DLG_CLOSE_ALL, DLG_QUIT };
+void dialog_open(int kind, u32 arg, const char *title, const char *detail);
+bool dialog_active(void);
+void dialog_draw(void);
+void dialog_event(const Event *e);
+void dialog_result(int kind, u32 arg, int choice); /* ui.c; 0 save, 1 don't save, 2 cancel */
+void request_quit(void); /* asks first when files are unsaved */
+/* A tooltip for the control at x,y,w,h (shown when the pointer rests there). */
+void ui_tip(int x, int y, int w, int h, const char *text);
+void doc_set_lang(u32 d, int lang);
+
+/* session.c: reopen the last editors per project; recently used commands */
+void session_save(void);
+void session_restore(void);
+void command_used(int cmd);
+int command_recent_rank(int cmd);
+
 /* vim.c: vim emulation, active while app.vim_on. ed_key / ed_text pass
  * events here first; true means vim consumed it. */
 bool vim_key(View *v, const Event *e);
@@ -545,6 +564,9 @@ enum {
 	CMD_SAVE_ALL,
 	CMD_NEW_FILE,
 	CMD_CLOSE_EDITOR,
+	CMD_REVERT_AND_CLOSE,
+	CMD_CHANGE_LANGUAGE,
+	CMD_TOGGLE_INDENT_STYLE,
 	CMD_CLOSE_ALL,
 	CMD_NEXT_EDITOR,
 	CMD_PREV_EDITOR,
@@ -614,6 +636,7 @@ enum {
 	CMD_TOGGLE_THEME,
 	CMD_THEME_DARK,
 	CMD_THEME_LIGHT,
+	CMD_THEME_DARKER,
 	CMD_GIT_REFRESH,
 	CMD_GIT_COMMIT,
 	CMD_GIT_STAGE_ALL,

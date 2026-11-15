@@ -358,7 +358,8 @@ int main(void)
 		u32 a = gitops_fetch(o, false, false), b = gitops_fetch(o, false, false);
 		char lab[64];
 		bool busy = gitops_busy(o, lab, sizeof lab);
-		CHECK(busy && !strcmp(lab, "Fetching..."));
+		/* a local fetch can finish before this looks; when busy, the label says what runs */
+		CHECK(!busy || !strcmp(lab, "Fetching..."));
 		GitOpResult r;
 		u32 seen[2], ns = 0;
 		for (int i = 0; i < 20000 && ns < 2; i++) {

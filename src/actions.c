@@ -10,7 +10,39 @@
 
 /* ---- picker ------------------------------------------------------------------ */
 
-enum { PICK_REFERENCES = 1, PICK_LOCATIONS };
+enum { PICK_REFERENCES = 1, PICK_LOCATIONS, PICK_THEME = 301, PICK_LANGUAGE = 302 };
+
+static u32 lang_doc;
+
+/* Change Language Mode (the status bar's language item) */
+void language_pick(u32 d)
+{
+	lang_doc = d;
+	pick_begin(PICK_LANGUAGE, "Select Language Mode", NULL);
+	for (int l = 0; l < LANG_COUNT; l++) {
+		const char *id = syn_lang_lsp_id(l);
+		pick_add(syn_lang_name(l), l == app.docs.lang[d] ? "current" : (id ? id : ""), (u32)l);
+	}
+	pick_show();
+	for (u32 i = 0; i < app.quick_n; i++)
+		if (app.pick_val[app.quick_items[i]] == app.docs.lang[d])
+			app.quick_sel = i;
+}
+
+void theme_pick(void)
+{
+	app.theme_before = app.theme;
+	pick_begin(PICK_THEME, "Select Color Theme (Up/Down to preview)", NULL);
+	static const int order[] = {THEME_DARK, THEME_DARKER, THEME_LIGHT};
+	for (size_t i = 0; i < VX_COUNT(order); i++)
+		pick_add(themes[order[i]].name, order[i] == app.theme ? "current" : "", (u32)order[i]);
+	pick_show();
+	/* start on the current theme */
+	for (u32 i = 0; i < app.quick_n; i++)
+		if (app.pick_val[app.quick_items[i]] == (u32)app.theme)
+			app.quick_sel = i;
+}
+
 
 void pick_begin(int kind, const char *title, const char *placeholder)
 {
@@ -47,6 +79,15 @@ void pick_accept(int kind, u32 item)
 {
 	u32 v = app.pick_val[item];
 	switch (kind) {
+	case PICK_LANGUAGE:
+		if (lang_doc < app.docs.n)
+			doc_set_lang(lang_doc, (int)v);
+		break;
+	case PICK_THEME:
+		app.theme = app.theme_before = (int)v;
+		ui_status("Color Theme: %s", themes[app.theme].name);
+		settings_save();
+		break;
 	case PICK_REFERENCES:
 	case PICK_LOCATIONS:
 		if (v < loc_n)
