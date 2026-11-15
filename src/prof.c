@@ -302,6 +302,8 @@ int prof_detect(const char *path, const char *head, size_t n)
 	}
 	if (ends_with(b, ".gmon") || !strcmp(b, "gmon.out"))
 		return PK_GPROF;
+	if (ends_with(b, ".pmcsamples") || (n >= 17 && !memcmp(head, "# pmcstat samples", 17)))
+		return PK_PMC;
 	if (ends_with(b, ".gcov") && n && mfind(head, n, ":Source:", 8))
 		return PK_GCOV;
 	if (ends_with(b, ".gcda"))
@@ -316,6 +318,7 @@ const char *prof_kind_name(int kind)
 	case PK_JEPROF: return "jemalloc heap profile";
 	case PK_GPROF: return "gprof profile";
 	case PK_GCOV: return "gcov coverage";
+	case PK_PMC: return "hwpmc samples";
 	default: return "Profile";
 	}
 }
@@ -380,10 +383,19 @@ void prof_fmt(const Prof *p, u32 m, double v, char *buf, size_t cap)
 /* Run argv (PATH lookup), stdout captured, stdin/stderr /dev/null, in
  * cwd when given (through sh: posix_spawn has no portable chdir).
  * NULL when it could not be started or exited 127 (not found). */
-static char *run_capture_in(const char *cwd, char *const argv[], size_t *len, int *status);
+static char *run_capture_ex(const char *cwd, char *const argv[], size_t *len, int *status, bool err);
+static char *run_capture_in(const char *cwd, char *const argv[], size_t *len, int *status)
+{
+	return run_capture_ex(cwd, argv, len, status, false);
+}
 static char *run_capture(char *const argv[], size_t *len, int *status) { return run_capture_in(NULL, argv, len, status); }
 
-static char *run_capture_in(const char *cwd, char *const argv_in[], size_t *len, int *status)
+char *prof_run(const char *cwd, char *const argv[], size_t *len, int *status)
+{
+	return run_capture_ex(cwd, argv, len, status, true);
+}
+
+static char *run_capture_ex(const char *cwd, char *const argv_in[], size_t *len, int *status, bool err)
 {
 	char *wrap[64];
 	char *const *argv = argv_in;
@@ -406,7 +418,10 @@ static char *run_capture_in(const char *cwd, char *const argv_in[], size_t *len,
 	posix_spawn_file_actions_init(&fa);
 	posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
 	posix_spawn_file_actions_adddup2(&fa, po[1], 1);
-	posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+	if (err)
+		posix_spawn_file_actions_adddup2(&fa, po[1], 2);
+	else
+		posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
 	posix_spawn_file_actions_addclose(&fa, po[0]);
 	pid_t pid;
 	int rc = posix_spawnp(&pid, argv[0], &fa, NULL, argv, environ);
@@ -1153,6 +1168,116 @@ static int load_gcda(Prof *p, const char *path)
 	return -1;
 }
 
+/* ---- hwpmc samples (pmcstat -a) ------------------------------------------------------- */
+
+static const Prof *st_eq_p;
+static const u32 *st_eq_fr;
+static u32 st_eq_n;
+static bool eq_stack(const Prof *p, u32 id, const void *k)
+{
+	(void)k;
+	return p->st_len[id] == st_eq_n && !memcmp(p->sfr + p->st_off[id], st_eq_fr, st_eq_n * sizeof(u32));
+}
+
+static u32 pmc_frame(Prof *p, const char *l, size_t n)
+{
+	/* "0x201a1f hotloop /tmp/x/hot.c:25" (names may hold spaces) */
+	const char *sp = memchr(l, ' ', n);
+	if (!sp)
+		return NONE;
+	const char *r = sp + 1;
+	size_t rn = n - (size_t)(r - l);
+	const char *last = NULL;
+	for (size_t i = rn; i-- > 0;)
+		if (r[i] == ' ') {
+			last = r + i;
+			break;
+		}
+	const char *name = r;
+	size_t nn = last ? (size_t)(last - r) : rn;
+	u32 file = NONE, line = 0;
+	if (last) {
+		const char *fl = last + 1;
+		size_t fn = rn - (size_t)(fl - r);
+		const char *c = NULL;
+		for (size_t i = fn; i-- > 0;)
+			if (fl[i] == ':') {
+				c = fl + i;
+				break;
+			}
+		if (c && !(c - fl == 2 && !memcmp(fl, "??", 2))) {
+			file = file_of(p, fl, (size_t)(c - fl));
+			line = (u32)num_at(c + 1, fn - (size_t)(c - fl) - 1, NULL);
+		}
+	}
+	if ((nn == 9 && !memcmp(name, "<unknown>", 9)) || (nn == 2 && !memcmp(name, "??", 2)) || !nn)
+		return frame_of(p, fn_ofz(p, "[unknown]"), file, line, 0, NONE);
+	return frame_of(p, fn_of(p, name, nn), file, line, 0, NONE);
+}
+
+int prof_parse_pmc(Prof *p, const char *s, size_t n)
+{
+	prof_begin(p, PK_PMC);
+	set_met(p, 0, "Samples", PU_COUNT);
+	u32 *fr = NULL, frn = 0, frcap = 0;
+	ProfIx ix = {0};
+	u32 unknown = NONE;
+	u64 samples = 0;
+#define PMC_FLUSH()                                                                                                    	do {                                                                                                               		if (unknown == NONE)                                                                                           			unknown = fn_ofz(p, "[unknown]");                                                                          		/* frames past the last known one (towards the root) are stack junk */                                        		while (frn > 1 && p->fr_fn[fr[frn - 1]] == unknown)                                                            			frn--;                                                                                                     		if (frn) {                                                                                                     			for (u32 a = 0, b = frn - 1; a < b; a++, b--) {                                                            				u32 t = fr[a];                                                                                         				fr[a] = fr[b];                                                                                         				fr[b] = t;                                                                                             			}                                                                                                          			u64 h = hbytes(fr, frn * sizeof(u32), 0);                                                                  			st_eq_p = p;                                                                                               			st_eq_fr = fr;                                                                                             			st_eq_n = frn;                                                                                             			u32 id = ix_find(&ix, h, p, eq_stack, NULL);                                                               			if (id == NONE) {                                                                                          				double v[4] = {1, 0, 0, 0};                                                                            				stack_add(p, fr, frn, NONE, v);                                                                        				ix_add(&ix, h, p->nst - 1);                                                                            			} else                                                                                                     				p->st_v0[id] += 1;                                                                                     			samples++;                                                                                                 		}                                                                                                              		frn = 0;                                                                                                       	} while (0)
+	FOR_LINES(s, n, l, len)
+	{
+		const char *t = l;
+		size_t tn = len;
+		while (tn && t[tn - 1] == '\r')
+			tn--;
+		if (!tn)
+			continue;
+		if (t[0] == '#') {
+			/* "# pmcstat samples: event=... program=..." */
+			if (!p->title) {
+				const char *d = t + 1;
+				size_t dn = tn - 1;
+				trim(&d, &dn);
+				p->title = str_add(p, d, dn);
+				const char *ev = mfind(t, tn, "event=", 6);
+				if (ev) {
+					size_t k = 0;
+					while (ev + 6 + k < t + tn && ev[6 + k] != ' ')
+						k++;
+					char m[160];
+					snprintf(m, sizeof m, "Samples (%.*s)", (int)k, ev + 6);
+					set_met(p, 0, m, PU_COUNT);
+				}
+				const char *pg = mfind(t, tn, "program=", 8);
+				if (pg)
+					p->cmd = str_add(p, pg + 8, tn - (size_t)(pg + 8 - t));
+			}
+			continue;
+		}
+		if (tn >= 2 && t[0] == '-' && t[1] == '-') {
+			PMC_FLUSH();
+			continue;
+		}
+		if (t[0] != '0' || tn < 3 || t[1] != 'x')
+			continue; /* pmcstat's statistics lines */
+		u32 f = pmc_frame(p, t, tn);
+		if (f == NONE)
+			continue;
+		VX_GROW(fr, frcap, frn + 1);
+		fr[frn++] = f;
+	}
+	PMC_FLUSH();
+#undef PMC_FLUSH
+	ix_free(&ix);
+	free(fr);
+	p->hist_samples = samples;
+	if (!samples) {
+		snprintf(p->err, sizeof p->err, "No samples (was the program too short, or the event never counted?)");
+		return -1;
+	}
+	return 0;
+}
+
 /* ---- gmon ------------------------------------------------------------------------------ */
 
 static u64 rd(const u8 *d, int sz)
@@ -1692,6 +1817,7 @@ int prof_load(Prof *p, int kind, const char *path, const u8 *data, size_t n, con
 		return rc;
 	}
 	case PK_GPROF: return load_gmon(p, path, data, n, exe);
+	case PK_PMC: return prof_parse_pmc(p, (const char *)data, n);
 	case PK_GCOV:
 		if (path && ends_with(path, ".gcda"))
 			return load_gcda(p, path);

@@ -840,6 +840,7 @@ static bool draw_state(ProfDoc *b, int x, int y, int w, int h)
 		const char *m = b->kind == PK_GPROF   ? "Reading the profile and symbolising (addr2line)..."
 		                : b->kind == PK_GCOV  ? "Running gcov..."
 		                : b->kind == PK_JEPROF ? "Reading the heap profile and symbolising..."
+		                : b->kind == PK_PMC    ? "Reading the samples..."
 		                                      : "Reading the profile...";
 		draw_text(FONT_UI, x + PX(20), y + PX(14), m, strlen(m), COL(C_DESCRIPTION_FG));
 		return true;
@@ -995,7 +996,8 @@ static void draw_top(ProfDoc *b, u32 part, int x, int y, int w, int h)
 {
 	draw_rect(x, y, w, h, COL(C_EDITOR_BG));
 	bool gcov = b->kind == PK_GCOV, gprof = b->kind == PK_GPROF;
-	const char *title = gcov ? "Functions" : gprof ? "Flat profile" : "Top allocators";
+	bool mem = b->kind == PK_MASSIF || b->kind == PK_JEPROF;
+	const char *title = gcov ? "Functions" : mem ? "Top allocators" : "Flat profile";
 	y += draw_header(b, x, y, w, title);
 	h -= HDR_H;
 	int nb_h = gcov || b->sel_fn == NONE ? 0 : VX_MIN(h * 2 / 5, PX(240));
@@ -1009,7 +1011,7 @@ static void draw_top(ProfDoc *b, u32 part, int x, int y, int w, int h)
 		nc = 4;
 	} else {
 		Col c[] = {{"Function", 0, false, 0},
-		           {gprof ? "Self time" : "Self (allocated here)", PX(200), true, 1},
+		           {gprof ? "Self time" : mem ? "Self (allocated here)" : "Self", PX(200), true, 1},
 		           {"Total (with callees)", PX(200), true, 2},
 		           {"Calls", PX(90), true, 3},
 		           {"Location", PX(240), false, -1}};
@@ -2758,6 +2760,12 @@ void profview_status(View *v, char *buf, size_t cap)
 		char cb[32];
 		prof_fmt_count((double)p->total_calls, cb, sizeof cb);
 		snprintf(buf, cap, "gprof  %s  %s calls  %s", vb, cb, prof_str(p, p->title));
+		break;
+	}
+	case PK_PMC: {
+		char cb[32];
+		prof_fmt_count((double)p->hist_samples, cb, sizeof cb);
+		snprintf(buf, cap, "hwpmc  %s samples  %s", cb, prof_str(p, p->met_name[0]));
 		break;
 	}
 	case PK_GCOV: {

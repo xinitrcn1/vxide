@@ -376,6 +376,54 @@ static void test_gprof_e2e(void)
 	(void)system(cmd);
 }
 
+static void test_pmc(void)
+{
+	const char *a = "# pmcstat samples: event=cpu_clk_unhalted.thread_p rate=65536 program=./hot 10\n"
+	                " #samples/total 3\n"
+	                "0x201a1f hotloop /tmp/x/hot.c:25\n"
+	                "0x2018cb main /tmp/x/hot.c:0\n"
+	                "0x82208d3e8 ?? ??:0\n"
+	                "0x3c1363e03008 <unknown> ??:0\n"
+	                "--\n"
+	                "0x201a1f hotloop /tmp/x/hot.c:25\n"
+	                "0x2018cb main /tmp/x/hot.c:0\n"
+	                "0x55 <unknown> ??:0\n"
+	                "--\n"
+	                "0x201a30 operator new(unsigned long) /usr/include/c++/new:12\n"
+	                "0x201a23 hotloop /tmp/x/hot.c:24\n"
+	                "0x2018cb main /tmp/x/hot.c:0\n";
+	Prof p;
+	CHECK(prof_detect("/t/hot.cpu.pmcsamples", a, strlen(a)) == PK_PMC);
+	CHECK(prof_parse_pmc(&p, a, strlen(a)) == 0);
+	CHECK(p.hist_samples == 3);
+	CHECK(p.nst == 2);                          /* the first two samples are one stack */
+	CHECK(near(prof_total(&p, 0, PROF_NONE), 3));
+	CHECK_STR(prof_str(&p, p.met_name[0]), "Samples (cpu_clk_unhalted.thread_p)");
+	CHECK_STR(prof_str(&p, p.cmd), "./hot 10");
+	u32 mf = fn_named(&p, "main"), hf = fn_named(&p, "hotloop"), nf = fn_named(&p, "operator new(unsigned long)");
+	CHECK(mf != PROF_NONE && hf != PROF_NONE && nf != PROF_NONE);
+	/* root junk stripped: every stack starts at main */
+	for (u32 st = 0; st < p.nst; st++)
+		CHECK(p.fr_fn[p.sfr[p.st_off[st]]] == mf);
+	double *se = calloc(p.nfn, sizeof(double)), *to = calloc(p.nfn, sizeof(double));
+	prof_fn_sums(&p, 0, PROF_NONE, se, to);
+	CHECK(near(se[hf], 2) && near(to[hf], 3) && near(to[mf], 3) && near(se[nf], 1));
+	free(se);
+	free(to);
+	ProfLines l = {0};
+	prof_lines(&p, 0, PROF_NONE, &l);
+	bool l25 = false, l24 = false;
+	for (u32 i = 0; i < l.n; i++) {
+		if (l.line[i] == 25)
+			l25 = near(l.self[i], 2);
+		if (l.line[i] == 24)
+			l24 = l.self[i] == 0 && near(l.total[i], 1); /* the call site of operator new */
+	}
+	CHECK(l25 && l24);
+	prof_lines_free(&l);
+	prof_free(&p);
+}
+
 static void test_fmt(void)
 {
 	char b[32];
@@ -400,6 +448,7 @@ int main(void)
 	test_gprof_synth();
 	test_gmon_file();
 	test_gprof_e2e();
+	test_pmc();
 	test_fmt();
 	return tap_done();
 }

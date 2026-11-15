@@ -17,7 +17,7 @@
 
 #include "base.h"
 
-enum { PK_NONE, PK_MASSIF, PK_JEPROF, PK_GPROF, PK_GCOV };
+enum { PK_NONE, PK_MASSIF, PK_JEPROF, PK_GPROF, PK_GCOV, PK_PMC };
 enum { PU_BYTES, PU_COUNT, PU_SAMPLES };
 enum { PSN_EMPTY, PSN_DETAILED, PSN_PEAK }; /* massif heap_tree= */
 enum { PL_CODE = 1, PL_UNCOVERED = 2, PL_PARTIAL = 4 }; /* gcov line flags */
@@ -111,11 +111,19 @@ void prof_free(Prof *p);
  * itself; malloc'd, NULL when the tool failed. Runs tools: not on the UI
  * thread. */
 char *prof_raw_report(int kind, const char *path, const char *exe, size_t *n);
+/* Run argv (PATH lookup) in cwd (NULL: here), stdout and stderr captured
+ * together; NULL when it could not start (exit 127). Blocks: worker
+ * threads only. */
+char *prof_run(const char *cwd, char *const argv[], size_t *len, int *status);
 
 /* Parsers on their own (no files read, no tools run): for tests. */
 int prof_parse_massif(Prof *p, const char *s, size_t n);
 int prof_parse_jeprof(Prof *p, const char *s, size_t n); /* frames stay addresses */
 int prof_parse_gcov(Prof *p, const char *s, size_t n);
+/* pmcstat -R log -a out: one callchain per sample, leaf first, frames
+ * "0xADDR function file:line", samples separated by "--" (a "# ..." header
+ * line names the event). Identical stacks are merged. */
+int prof_parse_pmc(Prof *p, const char *s, size_t n);
 /* Symbolise jemalloc frames, then drop allocator frames at the leaves. */
 void prof_jeprof_symbolize(Prof *p);
 
