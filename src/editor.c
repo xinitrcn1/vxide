@@ -1629,6 +1629,7 @@ bool ed_command(View *v, int cmd)
 		ed_completion_trigger(v, true);
 		return true;
 	case CMD_SHOW_HOVER:
+		app.hover_mouse = false; /* stays until Escape or a key, wherever the pointer is */
 		app.hover_pending_off = (i32)v->head[0];
 		app.hover_doc = v->doc;
 		ed_hover_request(v);
@@ -2373,6 +2374,7 @@ void ed_mouse(View *v, const Event *e, int x, int y, int w, int h)
 			snprintf(app.blame_hover_hash, sizeof app.blame_hover_hash, "%s", blame_rect_hash);
 			app.blame_hover_x = blame_rect_x0;
 			app.blame_hover_y = blame_rect_y;
+			app.blame_hover_x1 = blame_rect_x1;
 		}
 		if (over) {
 			app.hover_due = 0;
@@ -2402,6 +2404,7 @@ void ed_mouse(View *v, const Event *e, int x, int y, int w, int h)
 		app.hover_open = false;
 		app.hover_pending_off = (i32)off;
 		app.hover_doc = v->doc;
+		app.hover_mouse = true;
 		app.hover_due = vx_now_ns() + 150000000ull;
 		return;
 	}
@@ -3191,6 +3194,9 @@ static void wrap_draw(int font, int x, int *y, int w, const char *s, size_t n, u
 		*y += lh;
 }
 
+/* the code hover's box on screen (last frame), 0 width when none */
+static int hover_box_x, hover_box_y, hover_box_w, hover_box_h;
+
 void ed_draw_popups(View *v)
 {
 	int cx, cy;
@@ -3255,6 +3261,23 @@ void ed_draw_popups(View *v)
 		}
 		draw_noclip();
 	}
+	if (app.hover_mouse && (app.hover_open || app.hover_due)) {
+		/* a pointer hover lives while the pointer is over the text it was
+		 * opened for or over the hover itself. Checked every frame: the
+		 * editor sees no move once the pointer has left its area, and a
+		 * fast move leaves it in one jump. */
+		Group *g = &app.groups[app.active_group];
+		int top = g->y + group_head_h(g);
+		bool in_text = app.hover_x >= g->x + ed_gutter_w(v) && app.hover_x < g->x + g->w - minimap_w(g->w) &&
+		               app.hover_y >= top && app.hover_y < g->y + g->h;
+		bool in_box = hover_box_w > 0 && app.hover_x >= hover_box_x && app.hover_x < hover_box_x + hover_box_w &&
+		              app.hover_y >= hover_box_y && app.hover_y < hover_box_y + hover_box_h;
+		if (!in_text && !in_box) {
+			app.hover_open = false;
+			app.hover_due = 0;
+		}
+	}
+	hover_box_w = 0;
 	if (app.hover_open && app.hover_doc == v->doc) {
 		Text *t = T(v);
 		u32 off = VX_MIN(app.hover_off, t->len);
@@ -3285,6 +3308,11 @@ void ed_draw_popups(View *v)
 				draw_rect(px, py, pw, boxh, COL(C_WIDGET_BG));
 				draw_frame(px, py, pw, boxh, COL(C_WIDGET_BORDER));
 				draw_clip(px, py, pw, boxh);
+				/* plus the gap to the word, so the pointer can travel onto the box */
+				hover_box_x = px;
+				hover_box_y = VX_MIN(py, cy);
+				hover_box_w = pw;
+				hover_box_h = VX_MAX(py + boxh, cy + app.line_h) - hover_box_y;
 			}
 			int y = py + pad;
 			int lines = 0;

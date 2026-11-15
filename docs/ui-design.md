@@ -73,6 +73,13 @@ actually runs into. Each departure is listed in §6, with what it fixes.
       right tab and marks the setting.
   - Opening a file from anywhere (Ctrl+P, a search result, a link) returns
     to the editors.
+  - **Workspaces never wait on the disk.** Manpages reads its index
+    (apropos) and its pages (man, mandoc) on a worker thread:
+    - the tab opens at once, showing "Reading the manual page index…" and
+      "Opening x…" while the disk works;
+    - the newest search wins and stale results are dropped;
+    - resting the pointer on the Manpages tab starts reading the index
+      before the click.
 - **Square geometry.** No rounded corners anywhere. Shapes are rectangles
   with 1 px borders, so alignment and spacing do the visual grouping. That
   is also cheap to draw: every quad is axis-aligned.
@@ -146,6 +153,10 @@ actually runs into. Each departure is listed in §6, with what it fixes.
 - Shown under the control, or above it when there is no room (status
   bar). Never shown while a button is held, or while a menu, picker or
   dialog is open.
+- **Clicking a control hides its tooltip** until the pointer moves on to
+  another control. Once you act on a control, the tip would only cover
+  what the click opened (for example the search box under the Manpages
+  tab).
 - Implemented once: drawing code calls `ui_tip(x, y, w, h, text)` for its
   controls, and the frame draws the one under the pointer.
 
@@ -157,6 +168,20 @@ actually runs into. Each departure is listed in §6, with what it fixes.
 | Inline blame card | 150 ms | Same |
 | Git graph commit card | 250 ms | The list is scanned with the mouse; a shorter delay flickers |
 | Tooltips | 600 ms | They are for learning, so they must not get in the way of people who already know |
+
+**Lifetime rule.** A card opened by the pointer lives only while the
+pointer is on its element or on the card itself (including the gap
+between them, so the pointer can travel onto the card).
+
+- This is checked every frame against the pointer's position, not only
+  when the element receives a move event. A fast move, or leaving the
+  window, gives the element no event to close the card with, so it used
+  to linger, or in the git graph's case follow the pointer around.
+- Leaving the window counts as "nothing is hovered". Dragging is the
+  exception: a drag keeps following the pointer outside the window.
+- The graph card is anchored to its row, not to the pointer.
+- A hover opened from the keyboard (Ctrl+K Ctrl+I) is not tied to the
+  pointer; it stays until Escape or a key.
 
 ### 4.6 Dialogs (modal)
 
@@ -261,6 +286,9 @@ tab text, error); they match VSCodium exactly and are left alone.
 | A workspace's tab didn't look active when the side bar was hidden | Visibility of status | Workspaces count as active whatever the side bar does |
 | Ctrl+K Ctrl+T toggled blindly between two themes | User control | VSCodium's picker with live preview |
 | The red of a deleted file was hard to read | Contrast | Dark Modern Darker (§5) |
+| Hover cards (blame, code hover, graph) stayed open, or followed the pointer, after a fast move away from their element | Consistency, user control | Per-frame lifetime rule (§4.5) |
+| A tooltip popped up over what a click had just opened | Minimalism | Clicking a control hides its tooltip (§4.4) |
+| Clicking Manpages froze the UI while apropos read the disk (seconds on a cold HDD) | Visibility of status, responsiveness | Worker thread, a loading state, and prefetch when the pointer rests on the tab (§3) |
 | Earlier rounds: the explorer could not scroll to the end of big trees | Visibility | It now reveals the selection only when the selection changes, and has a draggable scrollbar |
 | Earlier rounds: long lines in search/input bars ran under the icons | Consistency | Inputs wrap and grow (§4.1) |
 

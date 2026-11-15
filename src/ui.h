@@ -225,7 +225,8 @@ typedef struct {
 	bool blame_asked;
 	bool blame_hover; /* mouse rests on the inline blame text */
 	char blame_hover_hash[41];
-	int blame_hover_x, blame_hover_y;
+	int blame_hover_x, blame_hover_y, blame_hover_x1; /* the blame text's rect: the card lives while the pointer is on it */
+	bool hover_mouse; /* the code hover came from the pointer resting (not Ctrl+K Ctrl+I) */
 	u64 blame_hover_t;
 	Input commit_in;
 	i32 scm_scroll;
@@ -426,6 +427,8 @@ bool man_ws_key(const Event *e);
 bool man_ws_context(int mx, int my, int x, int y, int w);
 View *man_active_view(void);
 void man_shutdown(void);
+void man_prefetch(void); /* start reading the index (pointer on the tab) */
+bool man_busy(void);
 
 /* Workspaces: Manpages and Settings take the whole main area instead of
  * the side bar and the editor groups. */

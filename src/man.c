@@ -7,12 +7,13 @@
  * like info. The editor context menu has "Open Manpage" for the word
  * under the mouse (socket( -> socket(2); C and C++ files prefer the
  * programming sections 2, 3, 9, 4). */
-#define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE /* pipe2 */
 #include "ui.h"
 #include "syntax.h"
 #include "menu.h"
 
 #include <errno.h>
+#include <pthread.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <sys/wait.h>
@@ -21,6 +22,7 @@
 
 static bool man_focus_title(const char *title);
 static void man_add_tab(u32 d);
+bool man_busy(void);
 
 /* ---- running man / mandoc / apropos -------------------------------------------- */
 
@@ -30,7 +32,9 @@ static int capture(char *const argv[], char **out, size_t *n)
 	*out = NULL;
 	*n = 0;
 	int p[2];
-	if (pipe(p) != 0)
+	/* close-on-exec: a child another thread forks meanwhile must not keep
+	 * the write end open (read() would never see EOF) */
+	if (pipe2(p, O_CLOEXEC) != 0)
 		return -1;
 	pid_t pid = fork();
 	if (pid < 0) {
@@ -290,14 +294,10 @@ static int page_width(void)
 	return VX_CLAMP(cols, 50, 120);
 }
 
-/* Open name(sec) in a tab (or focus it). sec may be NULL; prefer_c tries
- * the programming sections first. */
-bool man_open(const char *name, const char *sec, bool prefer_c)
+/* Find and format a page (worker thread: no app state touched). */
+static bool render_page(const char *name, const char *sec, bool prefer_c, int width, Page *p, char *title,
+                        size_t tc, char *err, size_t ec)
 {
-	if (!name_ok(name) || (sec && *sec && !name_ok(sec))) {
-		ui_status("Not a manual page name: %s", name);
-		return false;
-	}
 	char path[4096] = "";
 	bool found = false;
 	if (sec && *sec)
@@ -310,53 +310,178 @@ bool man_open(const char *name, const char *sec, bool prefer_c)
 	if (!found)
 		found = man_where(name, NULL, path, sizeof path);
 	if (!found) {
-		ui_status("No manual entry for %s%s%s%s", name, sec && *sec ? "(" : "", sec && *sec ? sec : "",
-		          sec && *sec ? ")" : "");
+		snprintf(err, ec, "No manual entry for %s%s%s%s", name, sec && *sec ? "(" : "", sec && *sec ? sec : "",
+		         sec && *sec ? ")" : "");
 		return false;
 	}
-	char s[32], title[300];
-	sec_of_path(path, s, sizeof s);
-	snprintf(title, sizeof title, "%s(%s)", name, s);
-	Docs *D = &app.docs;
-	if (man_focus_title(title))
-		return true;
+	char s2[32];
+	sec_of_path(path, s2, sizeof s2);
+	snprintf(title, tc, "%s(%s)", name, s2);
 	char wopt[32];
-	snprintf(wopt, sizeof wopt, "width=%d", page_width());
+	snprintf(wopt, sizeof wopt, "width=%d", width);
 	char *argv[] = {"mandoc", "-T", "utf8", "-O", wopt, path, NULL};
 	char *out;
 	size_t n;
 	capture(argv, &out, &n);
 	if (!out || !n) {
 		free(out);
-		ui_status("mandoc could not format %s", title);
+		snprintf(err, ec, "mandoc could not format %s", title);
 		return false;
 	}
-	Page p = {0};
-	parse_page(&p, out, n);
+	parse_page(p, out, n);
 	free(out);
-	u32 d = doc_new_virtual(title, p.t ? p.t : "", p.n, LANG_NONE);
-	if (d != UINT32_MAX) {
-		D->man[d] = 1;
-		VX_GROW(D->s_line[d], D->scap[d], p.sn + 1);
-		D->s_col[d] = vx_realloc(D->s_col[d], D->scap[d] * sizeof(u32));
-		D->s_len[d] = vx_realloc(D->s_len[d], D->scap[d] * sizeof(u32));
-		D->s_cls[d] = vx_realloc(D->s_cls[d], D->scap[d]);
-		if (p.sn) {
-			memcpy(D->s_line[d], p.line, p.sn * sizeof(u32));
-			memcpy(D->s_col[d], p.col, p.sn * sizeof(u32));
-			memcpy(D->s_len[d], p.len, p.sn * sizeof(u32));
-			memcpy(D->s_cls[d], p.cls, p.sn);
-		}
-		D->sn[d] = p.sn;
-		man_add_tab(d);
-	}
-	free(p.t);
-	free(p.line);
-	free(p.col);
-	free(p.len);
-	free(p.cls);
-	return d != UINT32_MAX;
+	return true;
 }
+
+static void page_free(Page *p)
+{
+	free(p->t);
+	free(p->line);
+	free(p->col);
+	free(p->len);
+	free(p->cls);
+	memset(p, 0, sizeof *p);
+}
+
+/* A read-only document holding the page text with its style spans. */
+static u32 page_to_doc(Page *p, const char *title)
+{
+	u32 d = doc_new_virtual(title, p->t ? p->t : "", p->n, LANG_NONE);
+	if (d == UINT32_MAX)
+		return d;
+	Docs *D = &app.docs;
+	D->man[d] = 1;
+	VX_GROW(D->s_line[d], D->scap[d], p->sn + 1);
+	D->s_col[d] = vx_realloc(D->s_col[d], D->scap[d] * sizeof(u32));
+	D->s_len[d] = vx_realloc(D->s_len[d], D->scap[d] * sizeof(u32));
+	D->s_cls[d] = vx_realloc(D->s_cls[d], D->scap[d]);
+	if (p->sn) {
+		memcpy(D->s_line[d], p->line, p->sn * sizeof(u32));
+		memcpy(D->s_col[d], p->col, p->sn * sizeof(u32));
+		memcpy(D->s_len[d], p->len, p->sn * sizeof(u32));
+		memcpy(D->s_cls[d], p->cls, p->sn);
+	}
+	D->sn[d] = p->sn;
+	return d;
+}
+
+/* ---- the worker -------------------------------------------------------------------
+ * man, mandoc and apropos read the manual from disk; on a slow disk that
+ * takes seconds the first time. They run here, one job of each kind at a
+ * time (the newest request wins), and the UI picks the results up in
+ * man_tick. */
+
+typedef struct {
+	bool want;        /* a request is waiting */
+	u32 gen;          /* request number, to drop superseded results */
+	char q[512];      /* index: the query ("" = every page) */
+	char name[256], sec[32];
+	bool prefer_c, quiet;
+	int width;
+	/* result */
+	bool done, ok;
+	u32 done_gen;
+	Page p;
+	char title[300], err[300], done_q[512];
+	bool done_quiet;
+} Job;
+
+static Job jidx, jpage;
+static pthread_mutex_t jmu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t jcv = PTHREAD_COND_INITIALIZER;
+static bool jthread, jbusy;
+static u32 jgen;
+
+static void index_text(const char *q, Page *p);
+
+static void *worker(void *arg)
+{
+	(void)arg;
+	pthread_mutex_lock(&jmu);
+	for (;;) {
+		while (!jpage.want && !jidx.want)
+			pthread_cond_wait(&jcv, &jmu);
+		jbusy = true;
+		/* a page the user asked for comes before the index */
+		Job *j = jpage.want ? &jpage : &jidx;
+		Job in = *j;
+		j->want = false;
+		pthread_mutex_unlock(&jmu);
+		Page p = {0};
+		char title[300] = "", err[300] = "";
+		bool ok = true;
+
+		if (j == &jpage)
+			ok = render_page(in.name, in.sec[0] ? in.sec : NULL, in.prefer_c, in.width, &p, title, sizeof title, err,
+			                 sizeof err);
+		else
+			index_text(in.q, &p);
+		pthread_mutex_lock(&jmu);
+		if (j->done)
+			page_free(&j->p); /* an unclaimed older result */
+		j->done = true;
+		j->ok = ok;
+		j->done_gen = in.gen;
+		j->p = p;
+		j->done_quiet = in.quiet;
+		snprintf(j->title, sizeof j->title, "%s", title);
+		snprintf(j->err, sizeof j->err, "%s", err);
+		snprintf(j->done_q, sizeof j->done_q, "%s", in.q);
+		jbusy = false;
+	}
+	return NULL;
+}
+
+static void submit(Job *j)
+{
+	j->want = true;
+	j->gen = ++jgen;
+	if (!jthread) {
+		pthread_t t;
+		pthread_attr_t a;
+		pthread_attr_init(&a);
+		pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+		jthread = pthread_create(&t, &a, worker, NULL) == 0;
+		pthread_attr_destroy(&a);
+	}
+	pthread_cond_signal(&jcv);
+}
+
+static char man_opening[300]; /* shown while a page is being read */
+
+/* Open name(sec) in a tab (or focus it). sec may be NULL; prefer_c tries
+ * the programming sections first. The page is read in the background. */
+static bool man_open_ex(const char *name, const char *sec, bool prefer_c, bool quiet)
+{
+	if (!name_ok(name) || (sec && *sec && !name_ok(sec))) {
+		if (!quiet)
+			ui_status("Not a manual page name: %s", name);
+		return false;
+	}
+	if (sec && *sec) {
+		char title[300];
+		snprintf(title, sizeof title, "%s(%s)", name, sec);
+		if (man_focus_title(title))
+			return true;
+	}
+	pthread_mutex_lock(&jmu);
+	snprintf(jpage.name, sizeof jpage.name, "%s", name);
+	snprintf(jpage.sec, sizeof jpage.sec, "%s", sec ? sec : "");
+	jpage.prefer_c = prefer_c;
+	jpage.quiet = quiet;
+	jpage.width = page_width();
+	submit(&jpage);
+	pthread_mutex_unlock(&jmu);
+	snprintf(man_opening, sizeof man_opening, "%s%s%s%s", name, sec && *sec ? "(" : "", sec && *sec ? sec : "",
+	         sec && *sec ? ")" : "");
+	app.side_view = SIDE_MAN;
+	if (app.focus != FOCUS_MAN_INPUT)
+		app.focus = FOCUS_WORKSPACE;
+	app.dirty = true;
+	return true;
+}
+
+bool man_open(const char *name, const char *sec, bool prefer_c) { return man_open_ex(name, sec, prefer_c, false); }
 
 /* The name(sec) reference covering byte off of a man page, if any. */
 static bool link_at(u32 d, u32 off, char *name, size_t nc, char *sec, size_t sc)
@@ -468,14 +593,13 @@ static void view_free(View *v)
 }
 
 /* The Index text: "name(sec)   description" per page, links on the names. */
-static void build_index(const char *q)
+static void index_text(const char *q, Page *pp)
 {
-	snprintf(man_last, sizeof man_last, "%s", q);
 	char *argv[] = {"apropos", "--", (char *)(*q ? q : "."), NULL};
 	char *o;
 	size_t n;
 	capture(argv, &o, &n);
-	Page p = {0};
+	Page p = {0}; /* built here, handed to the caller */
 	u32 line = 0, count = 0;
 	const char *hdr = *q ? "Manual pages matching \"" : "All manual pages";
 	put(&p, hdr, (u32)strlen(hdr));
@@ -549,52 +673,36 @@ static void build_index(const char *q)
 		const char *m = "Nothing found.";
 		put(&p, m, (u32)strlen(m));
 	}
-	/* spans must be in line order for the renderer's binary search: the
-	 * description span of a line comes before its link, both on that line,
-	 * so the order holds */
-	char title[] = "Index";
-	u32 d = doc_new_virtual(title, p.t ? p.t : "", p.n, LANG_NONE);
-	if (d != UINT32_MAX) {
-		Docs *D = &app.docs;
-		D->man[d] = 1;
-		VX_GROW(D->s_line[d], D->scap[d], p.sn + 1);
-		D->s_col[d] = vx_realloc(D->s_col[d], D->scap[d] * sizeof(u32));
-		D->s_len[d] = vx_realloc(D->s_len[d], D->scap[d] * sizeof(u32));
-		D->s_cls[d] = vx_realloc(D->s_cls[d], D->scap[d]);
-		if (p.sn) {
-			memcpy(D->s_line[d], p.line, p.sn * sizeof(u32));
-			memcpy(D->s_col[d], p.col, p.sn * sizeof(u32));
-			memcpy(D->s_len[d], p.len, p.sn * sizeof(u32));
-			memcpy(D->s_cls[d], p.cls, p.sn);
-		}
-		D->sn[d] = p.sn;
-		View *nv = view_new(d);
-		if (mn == 0) {
-			mv[0] = nv;
-			mn = 1;
-		} else {
-			view_free(mv[0]);
-			mv[0] = nv;
-		}
-	}
-	free(p.t);
-	free(p.line);
-	free(p.col);
-	free(p.len);
-	free(p.cls);
-	app.dirty = true;
+	*pp = p;
+}
+
+static u32 idx_gen;       /* the index request whose result is wanted */
+static bool idx_asked;
+
+/* Ask for the index for a query (the newest request wins). */
+static void request_index(const char *q)
+{
+	pthread_mutex_lock(&jmu);
+	snprintf(jidx.q, sizeof jidx.q, "%s", q);
+	submit(&jidx);
+	idx_gen = jidx.gen;
+	pthread_mutex_unlock(&jmu);
+	idx_asked = true;
 }
 
 static void ensure_index(void)
 {
-	if (man_last[0] == '\x01')
-		build_index("");
+	if (!idx_asked)
+		request_index("");
 }
+
+/* Start reading the index early (the pointer is on the Manpages tab). */
+void man_prefetch(void) { ensure_index(); }
 
 static bool man_focus_title(const char *title)
 {
 	for (u32 i = 1; i < mn; i++)
-		if (!strcmp(app.docs.rel[mv[i]->doc], title)) {
+		if (mv[i] && !strcmp(app.docs.rel[mv[i]->doc], title)) {
 			mact = i;
 			app.side_view = SIDE_MAN;
 			app.focus = FOCUS_WORKSPACE;
@@ -606,6 +714,8 @@ static bool man_focus_title(const char *title)
 static void man_add_tab(u32 d)
 {
 	ensure_index();
+	if (mn == 0)
+		mn = 1; /* slot 0 is the Index, filled when it arrives */
 	if (mn == MAN_TABS) { /* drop the oldest page */
 		view_free(mv[1]);
 		memmove(mv + 1, mv + 2, (MAN_TABS - 2) * sizeof(View *));
@@ -638,14 +748,14 @@ static void close_tab_at(u32 i)
 View *man_active_view(void)
 {
 	ensure_index();
-	return mn ? mv[mact] : NULL;
+	return mn ? mv[mact] : NULL; /* NULL while the Index loads */
 }
 
 static int search_h(void) { return PX(44); }
 
 static int mtab_w(u32 i)
 {
-	const char *t = i == 0 ? "Index" : app.docs.rel[mv[i]->doc];
+	const char *t = i == 0 || !mv[i] ? "Index" : app.docs.rel[mv[i]->doc];
 	return PX(12) + font_width(FONT_UI, t, strlen(t)) + (i ? PX(36) : PX(12));
 }
 
@@ -677,6 +787,8 @@ static int content_y(int y, int w)
 void man_ws_draw(int x, int y, int w, int h)
 {
 	ensure_index();
+	if (!mn)
+		mn = 1; /* the Index tab shows at once, its text when it arrives */
 	draw_rect(x, y, w, h, COL(C_EDITOR_BG));
 	/* search bar */
 	draw_rect(x, y, w, search_h(), COL(C_SIDEBAR_BG));
@@ -700,7 +812,7 @@ void man_ws_draw(int x, int y, int w, int h)
 		draw_rect(tx + tw - PX(1), ty, PX(1), app.tabs_h, COL(C_TAB_BORDER));
 		if (act)
 			draw_rect(tx, ty, tw, PX(1), COL(C_TAB_ACTIVE_BORDER_TOP));
-		const char *t = i == 0 ? "Index" : app.docs.rel[mv[i]->doc];
+		const char *t = i == 0 || !mv[i] ? "Index" : app.docs.rel[mv[i]->doc];
 		u32 fg = act ? COL(C_TAB_ACTIVE_FG) : COL(C_TAB_INACTIVE_FG);
 		draw_text(FONT_UI, tx + PX(12), ty + (app.tabs_h - font_m[FONT_UI].line) / 2, t, strlen(t), fg);
 		bool hover = app.hover_x >= tx && app.hover_x < tx + tw && app.hover_y >= ty && app.hover_y < ty + app.tabs_h;
@@ -708,8 +820,24 @@ void man_ws_draw(int x, int y, int w, int h)
 			draw_icon(ICON_CLOSE, tx + tw - PX(28), ty + (app.tabs_h - PX(16)) / 2, fg);
 	}
 	draw_rect(x, cy - PX(1), w, PX(1), COL(C_TABS_BORDER));
-	if (!mn)
+	/* reading in the background: say so (next to the search box and,
+	 * while the Index is not there yet, in its place) */
+	bool busy = man_busy();
+	if (busy) {
+		char m[340];
+		if (man_opening[0])
+			snprintf(m, sizeof m, "Opening %s...", man_opening);
+		else
+			snprintf(m, sizeof m, "Searching...");
+		if (bx + bw + PX(12) < x + w - PX(80))
+			draw_text_fit(FONT_SMALL, bx + bw + PX(12), y + (search_h() - font_m[FONT_SMALL].line) / 2, m, strlen(m),
+			              x + w - (bx + bw + PX(24)), COL(C_DESCRIPTION_FG));
+	}
+	if (!mv[mact]) {
+		const char *m = "Reading the manual page index...";
+		draw_text(FONT_UI, x + PX(40), cy + PX(24), m, strlen(m), COL(C_DESCRIPTION_FG));
 		return;
+	}
 	man_g.x = x;
 	man_g.y = cy;
 	man_g.w = w;
@@ -717,26 +845,80 @@ void man_ws_draw(int x, int y, int w, int h)
 	ed_draw(&man_g, mv[mact], x, cy, w, y + h - cy, app.focus == FOCUS_WORKSPACE);
 }
 
+static char man_asked[512]; /* the query last sent to the worker */
+
 static void run_search_now(void)
 {
 	man_due = 0;
 	char q[512];
 	snprintf(q, sizeof q, "%.*s", (int)man_in.n, man_in.b ? man_in.b : "");
-	if (strcmp(q, man_last) != 0) {
-		build_index(q);
+	if (strcmp(q, man_asked) != 0 || !idx_asked) {
+		snprintf(man_asked, sizeof man_asked, "%s", q);
+		request_index(q);
 		mact = 0;
+	}
+}
+
+/* Background work outstanding (a page or an index being read). */
+bool man_busy(void)
+{
+	pthread_mutex_lock(&jmu);
+	bool b = jbusy || jidx.want || jpage.want || jidx.done || jpage.done;
+	pthread_mutex_unlock(&jmu);
+	return b;
+}
+
+/* Take finished work from the worker. */
+static void man_collect(void)
+{
+	pthread_mutex_lock(&jmu);
+	Job pg = jpage, ix = jidx;
+	bool page_done = jpage.done, idx_done = jidx.done;
+	jpage.done = jidx.done = false;
+	memset(&jpage.p, 0, sizeof jpage.p);
+	memset(&jidx.p, 0, sizeof jidx.p);
+	pthread_mutex_unlock(&jmu);
+	if (page_done) {
+		man_opening[0] = 0;
+		if (!pg.ok) {
+			if (!pg.done_quiet)
+				ui_status("%s", pg.err);
+		} else if (!man_focus_title(pg.title)) {
+			u32 d = page_to_doc(&pg.p, pg.title);
+			if (d != UINT32_MAX)
+				man_add_tab(d);
+		}
+		page_free(&pg.p);
+		app.dirty = true;
+	}
+	if (idx_done) {
+		if (ix.done_gen == idx_gen) { /* superseded searches are dropped */
+			u32 d = page_to_doc(&ix.p, "Index");
+			if (d != UINT32_MAX) {
+				View *nv = view_new(d);
+				if (mn == 0)
+					mn = 1;
+				if (mv[0])
+					view_free(mv[0]);
+				mv[0] = nv;
+				snprintf(man_last, sizeof man_last, "%s", ix.done_q);
+			}
+		}
+		page_free(&ix.p);
+		app.dirty = true;
 	}
 }
 
 void man_tick(void)
 {
+	man_collect();
 	if (man_due && app.now >= man_due) {
 		run_search_now();
 		app.dirty = true;
 	}
 }
 
-u64 man_wait_hint(void) { return man_due ? 30 : 1000; }
+u64 man_wait_hint(void) { return man_due || man_busy() ? 30 : 1000; }
 
 /* Keys the workspace takes before the global bindings. */
 bool man_ws_key(const Event *e)
@@ -769,15 +951,11 @@ bool man_ws_key(const Event *e)
 			char q[512];
 			snprintf(q, sizeof q, "%.*s", (int)man_in.n, man_in.b ? man_in.b : "");
 			char name[256], sec[32] = "";
-			if (sscanf(q, "%255[^( ](%31[^)])", name, sec) >= 1 && name_ok(name)) {
-				char path[4096];
-				if (man_where(name, sec[0] ? sec : NULL, path, sizeof path))
-					man_open(name, sec[0] ? sec : NULL, false);
-				else
-					app.focus = FOCUS_WORKSPACE;
-			} else {
-				app.focus = FOCUS_WORKSPACE;
-			}
+			app.focus = FOCUS_WORKSPACE;
+			/* looked up in the background; quietly nothing when there is no
+			 * such page (the search results are there anyway) */
+			if (sscanf(q, "%255[^( ](%31[^)])", name, sec) >= 1 && name_ok(name))
+				man_open_ex(name, sec[0] ? sec : NULL, false, true);
 			return true;
 		}
 		if (e->key == SDLK_ESCAPE || e->key == SDLK_DOWN) {
@@ -786,7 +964,7 @@ bool man_ws_key(const Event *e)
 		}
 		return false;
 	}
-	if (app.focus == FOCUS_WORKSPACE && mn && !mods && (e->key == SDLK_RETURN || e->key == SDLK_KP_ENTER)) {
+	if (app.focus == FOCUS_WORKSPACE && mn && mv[mact] && !mods && (e->key == SDLK_RETURN || e->key == SDLK_KP_ENTER)) {
 		man_follow(mv[mact]->doc, mv[mact]->head[0]);
 		return true;
 	}
@@ -809,7 +987,7 @@ void man_ws_event(const Event *e, int x, int y, int w, int h)
 			input_key(&man_in, e);
 			if (man_in.n != before)
 				man_due = vx_now_ns() + 250000000ull;
-		} else if (mn) {
+		} else if (mn && mv[mact]) {
 			ed_key(mv[mact], e);
 		}
 		return;
@@ -847,7 +1025,7 @@ void man_ws_event(const Event *e, int x, int y, int w, int h)
 		}
 		return;
 	}
-	if (!mn || e->y < cy)
+	if (!mn || !mv[mact] || e->y < cy)
 		return;
 	View *v = mv[mact];
 	if (e->type == EV_MDOWN && e->button == 1) {
@@ -865,7 +1043,7 @@ void man_ws_event(const Event *e, int x, int y, int w, int h)
 bool man_ws_context(int mx, int my, int x, int y, int w)
 {
 	int cy = content_y(y, w);
-	if (!mn || my < cy)
+	if (!mn || !mv[mact] || my < cy)
 		return true;
 	View *v = mv[mact];
 	app.ctx = CTX_EDITOR;
@@ -882,7 +1060,8 @@ bool man_ws_context(int mx, int my, int x, int y, int w)
 void man_shutdown(void)
 {
 	for (u32 i = 0; i < mn; i++)
-		view_free(mv[i]);
+		if (mv[i])
+			view_free(mv[i]);
 	mn = mact = 0;
 	man_last[0] = '\x01';
 	man_last[1] = 0;

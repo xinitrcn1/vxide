@@ -101,6 +101,16 @@ static bool translate(const SDL_Event *s, Event *e)
 	case SDL_EVENT_WINDOW_FOCUS_GAINED:
 		e->type = EV_FOCUS;
 		return true;
+	case SDL_EVENT_WINDOW_MOUSE_LEAVE:
+		/* the pointer left the window: nothing is hovered any more (a fast
+		 * move out gives no last motion event inside). Not while dragging:
+		 * a drag keeps following the pointer outside. */
+		if (SDL_GetMouseState(NULL, NULL) != 0)
+			return false;
+		e->type = EV_MMOVE;
+		e->x = e->y = -10000;
+		e->mods = map_mods(SDL_GetModState());
+		return true;
 	default:
 		return false;
 	}

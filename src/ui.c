@@ -2400,6 +2400,8 @@ static struct {
 	char t[512];
 } tip, tip_last;
 static bool tip_have;
+static bool tip_block; /* a click on the control hides its tip until the pointer moves on */
+static int tip_block_x, tip_block_y; /* where that click was */
 static u64 tip_since, tip_due;
 
 void ui_tip(int x, int y, int w, int h, const char *text)
@@ -2425,6 +2427,12 @@ static void tip_draw(void)
 	if (strcmp(tip.t, tip_last.t) != 0 || tip.x != tip_last.x || tip.y != tip_last.y) {
 		tip_last = tip; /* another control: start over */
 		tip_since = now;
+		/* still blocked if this is the control that was clicked */
+		tip_block = tip_block && in_rect(tip_block_x, tip_block_y, tip.x, tip.y, tip.w, tip.h);
+	}
+	if (tip_block) {
+		tip_due = 0;
+		return;
 	}
 	if (now < tip_since + 600000000ull) {
 		tip_due = tip_since + 600000000ull;
@@ -2645,6 +2653,11 @@ void ui_event(const Event *e)
 {
 	app.dirty = true;
 	app.blink_t0 = vx_now_ns();
+	if (e->type == EV_MDOWN) {
+		tip_block = true; /* the user acted on the control: its tip would only cover things */
+		tip_block_x = e->x;
+		tip_block_y = e->y;
+	}
 	if (dialog_active() && e->type != EV_RESIZE && e->type != EV_QUIT && e->type != EV_FOCUS) {
 		if (e->type == EV_MMOVE) {
 			app.hover_x = e->x;
@@ -3407,6 +3420,8 @@ static void draw_top_tabs(void)
 		                                   "Settings (Ctrl+,)"};
 		if (i < (int)VX_COUNT(tips))
 			ui_tip(x, 0, w, h, tips[i]);
+		if (hover && top_tabs[i].view == SIDE_MAN)
+			man_prefetch(); /* the click is coming: start reading the disk now */
 		draw_rect(x, 0, w, h - (active ? 0 : PX(1)), active ? COL(C_TAB_ACTIVE_BG) : COL(C_TAB_INACTIVE_BG));
 		if (active)
 			draw_rect(x, 0, w, PX(1), COL(C_TAB_ACTIVE_BORDER_TOP));

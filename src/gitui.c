@@ -21,6 +21,11 @@ static u32 expanded = UINT32_MAX; /* row whose files are listed */
 static GitCommitInfo exp_ci;
 static bool exp_ok;
 static u32 hover_row = UINT32_MAX;
+/* the hovered graph row as drawn (the card lives while the pointer is on it) */
+static int hr_x, hr_y, hr_w, hr_h;
+static bool hr_drawn;
+/* the last commit card drawn (the blame card may be travelled onto) */
+static int cd_x, cd_y, cd_w, cd_h;
 static u64 hover_t0;
 
 /* hover card cache (graph rows and blame) */
@@ -776,6 +781,7 @@ static void draw_refs(const char *refs, int *tx, int ty, int rh, int maxx)
 void gitui_graph_draw(int x, int y, int w, int h)
 {
 	int hh = PX(22);
+	hr_drawn = false;
 	draw_clip(x, y, w, h);
 	draw_rect(x, y, w, PX(1), COL(C_SECTION_HEADER_BORDER));
 	draw_icon(graph_open ? ICON_CHEVRON_DOWN : ICON_CHEVRON_RIGHT, x + PX(2), y + (hh - PX(16)) / 2,
@@ -805,6 +811,13 @@ void gitui_graph_draw(int x, int y, int w, int h)
 		u32 it = row_item(r);
 		bool hover = app.hover_x >= x && app.hover_x < x + w && app.hover_y >= ry && app.hover_y < ry + rh &&
 		             app.hover_y >= cy;
+		if (hover && row_item(r) == hover_row) {
+			hr_x = x;
+			hr_y = ry;
+			hr_w = w;
+			hr_h = rh;
+			hr_drawn = true;
+		}
 		if ((r == graph_sel && focused) || hover)
 			draw_rect(x, ry, w, rh, (r == graph_sel && focused) ? COL(C_LIST_ACTIVE_BG) : COL(C_LIST_HOVER_BG));
 		int ty = ry + (rh - font_m[FONT_UI].line) / 2;
@@ -1072,6 +1085,10 @@ static void draw_card(const char *hash, int ax, int ay)
 	int py = ay - ph - PX(4);
 	if (py < 0)
 		py = ay + app.line_h + PX(4);
+	cd_x = px;
+	cd_y = py;
+	cd_w = pw;
+	cd_h = ph;
 	draw_rect(px - PX(1), py, pw + PX(2), ph + PX(3), COL(C_WIDGET_SHADOW));
 	draw_rect(px, py, pw, ph, COL(C_WIDGET_BG));
 	draw_frame(px, py, pw, ph, COL(C_WIDGET_BORDER));
@@ -1092,9 +1109,27 @@ void gitui_draw_popups(void)
 	if (!app.git)
 		return;
 	u64 now = vx_now_ns();
+	/* Cards close as soon as the pointer is off their element, checked here
+	 * each frame: a fast move (or leaving the window) gives the element no
+	 * event to close them with. */
+	bool on_row = hr_drawn && app.hover_x >= hr_x && app.hover_x < hr_x + hr_w && app.hover_y >= hr_y &&
+	              app.hover_y < hr_y + hr_h;
+	if (!on_row)
+		hover_row = UINT32_MAX;
+	if (app.blame_hover) {
+		bool on_text = app.hover_x >= app.blame_hover_x && app.hover_x < app.blame_hover_x1 &&
+		               app.hover_y >= app.blame_hover_y && app.hover_y < app.blame_hover_y + app.line_h;
+		/* the card plus the gap above/below the line */
+		int top = VX_MIN(cd_y, app.blame_hover_y), bot = VX_MAX(cd_y + cd_h, app.blame_hover_y);
+		bool on_card = cd_w > 0 && app.hover_x >= cd_x && app.hover_x < cd_x + cd_w && app.hover_y >= top &&
+		               app.hover_y < bot;
+		if (!on_text && !on_card)
+			app.blame_hover = false;
+	}
+	cd_w = 0;
 	if (app.side_visible && app.side_view == SIDE_SCM && hover_row < graph.n && now - hover_t0 > 250000000ull &&
 	    !menu_is_open() && !app.quick)
-		draw_card(graph.hash[hover_row], app.hover_x + PX(12), app.hover_y);
+		draw_card(graph.hash[hover_row], hr_x + PX(24), hr_y); /* anchored to the row, not the pointer */
 	if (app.blame_hover && now - app.blame_hover_t > 150000000ull && !menu_is_open() && !app.quick)
 		draw_card(app.blame_hover_hash, app.blame_hover_x, app.blame_hover_y);
 }
