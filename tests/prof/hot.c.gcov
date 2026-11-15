@@ -1,0 +1,72 @@
+        -:    0:Source:hot.c
+        -:    0:Graph:./hotcov-hot.gcno
+        -:    0:Data:./hotcov-hot.gcda
+        -:    0:Runs:1
+        -:    0:Programs:1
+        -:    1:#include <stdio.h>
+        -:    2:#include <stdlib.h>
+        -:    3:#include <string.h>
+        -:    4:
+function work called 200 returned 100% blocks executed 100%
+      200:    5:static double work(int n)
+        -:    6:{
+      200:    7:	double s = 0;
+   400200:    8:	for (int i = 0; i < n; i++)
+branch  0 taken 400000
+branch  1 taken 200
+   400000:    9:		s += (double)i * 0.5 / (i + 1);
+      200:   10:	return s;
+        -:   11:}
+        -:   12:
+function grow called 2001 returned 100% blocks executed 100%
+     2001:   13:static char *grow(size_t n)
+        -:   14:{
+     2001:   15:	char *p = malloc(n);
+     2001:   16:	memset(p, 1, n);
+     2001:   17:	return p;
+        -:   18:}
+        -:   19:
+function hotloop called 1 returned 100% blocks executed 100%
+        1:   20:static double hotloop(int n)
+        -:   21:{
+        1:   22:	double s = 0;
+     2001:   23:	for (int k = 0; k < n; k++)
+branch  0 taken 2000
+branch  1 taken 1
+  2002000:   24:		for (int i = 0; i < 1000; i++)
+branch  0 taken 2000000
+branch  1 taken 2000
+  2002000:   25:			s += (i ^ k) * 1.0001;
+        1:   26:	return s;
+        -:   27:}
+        -:   28:
+function leafy called 2000 returned 100% blocks executed 100%
+     2000:   29:static void leafy(char **keep, int i) { keep[i] = grow(1000 + (size_t)i * 64); }
+        -:   30:
+function main called 1 returned 100% blocks executed 92%
+        1:   31:int main(int argc, char **argv)
+        -:   32:{
+        1:   33:	int n = argc > 1 ? atoi(argv[1]) : 20000;
+branch  0 taken 1
+branch  1 taken 0
+        -:   34:	char *keep[2000];
+        1:   35:	double s = 0;
+     2001:   36:	for (int i = 0; i < 2000; i++) {
+branch  0 taken 2000
+branch  1 taken 1
+     2000:   37:		leafy(keep, i);
+     2000:   38:		if (i % 10 == 0)
+branch  0 taken 1800
+branch  1 taken 200
+      200:   39:			s += work(n);
+     2000:   40:	}
+        1:   41:	s += hotloop(n);
+     1001:   42:	for (int i = 0; i < 2000; i += 2)
+branch  0 taken 1000
+branch  1 taken 1
+     1000:   43:		free(keep[i]);
+        1:   44:	char *big = grow(5 << 20);
+        1:   45:	free(big);
+        1:   46:	printf("%f\n", s);
+        1:   47:	return 0;
+        -:   48:}
