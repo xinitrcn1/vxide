@@ -121,5 +121,10 @@ if command -v cmake >/dev/null 2>&1 && { command -v lldb-dap >/dev/null 2>&1 || 
 	printf '#include <stdio.h>\nstatic int counter;\nstatic int twice(int v)\n{\n\treturn v * 2;\n}\nint main(void)\n{\n\tint a = 1;\n\ta += 2;\n\tcounter = twice(a);\n\tcounter += 1;\n\tprintf("%%d\\n", counter);\n\treturn 0;\n}\n' > "$wf/src/main.c"
 	VXIDE_NO_LSP=1 "$vx" --headless 1200x800 --script tests/workflow.vx "$wf"
 	test -x "$wf/build/demo"
+	# stop at main: the option comes from the project's session
+	st="$tmp/state"
+	mkdir -p "$st/sessions"
+	printf 'wfflags\t1\t1\n' > "$st/sessions/$(printf '%s' "$wf" | tr / %)"
+	VXIDE_STATE_DIR="$st" VXIDE_NO_LSP=1 "$vx" --headless 1200x800 --script tests/workflow_main.vx "$wf"
 fi
 echo "ui test ok"

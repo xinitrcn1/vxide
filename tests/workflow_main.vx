@@ -1,0 +1,8 @@
+# Workflow: "Stop at the start of main" (set through the session) opens
+# main.c on main's first statement, with no breakpoint and no file open.
+key F5
+wait 12000
+expect file main.c
+expect line 9
+key F5
+wait 2000
