@@ -61,4 +61,9 @@ mkdir -p "$c"
 	printf 'one\nMAIN\nthree\n' > f.c && git commit -qam main && ! git merge topic >/dev/null 2>&1)
 VXIDE_NO_LSP=1 "$vx" --headless 1000x700 --script tests/conflict.vx "$c"
 (cd "$c" && test -z "$(git diff --name-only --diff-filter=U)" && ! grep -q '<<<<<<<' f.c)
+# profiles: the viewer opens a source annotated; next hot line follows the costs
+p="$tmp/prof"
+mkdir -p "$p"
+cp tests/prof/massif.out.hot tests/prof/hot.c tests/prof/hot.c.gcov "$p/"
+VXIDE_NO_LSP=1 "$vx" --headless 1000x700 --script tests/prof.vx "$p"
 echo "ui test ok"

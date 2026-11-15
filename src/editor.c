@@ -40,7 +40,7 @@ static int digits(u32 n)
 int ed_gutter_w(View *v)
 {
 	int nd = VX_MAX(digits(text_lines(T(v))), 5);
-	return PX(18) + nd * app.char_w + PX(26);
+	return PX(18) + nd * app.char_w + PX(26) + profann_gutter_w(v->doc);
 }
 
 static int minimap_w(int w) { return app.minimap_on && w > PX(400) ? VX_MIN(PX(100), w / 8) : 0; }
@@ -2228,7 +2228,7 @@ void ed_mouse(View *v, const Event *e, int x, int y, int w, int h)
 	if (e->type == EV_MDOWN && e->button == 1 && app.git) {
 		/* a click on the git change bar in the gutter (VSCodium's quick diff peek) */
 		int nd = VX_MAX(digits(text_lines(t)), 5);
-		int gx = x + PX(18) + nd * app.char_w + PX(5);
+		int gx = x + profann_gutter_w(v->doc) + PX(18) + nd * app.char_w + PX(5);
 		i64 py = (i64)(e->y - y) + v->scroll_y;
 		u32 l = py < 0 ? 0 : (u32)(py / app.line_h);
 		Docs *D = &app.docs;
@@ -2728,6 +2728,9 @@ void ed_draw(Group *g, View *v, int x, int y, int w, int h, bool focused)
 	if (app.find_open)
 		find_matches(v);
 
+	/* a profile's cost per line (profview.c), under everything else */
+	draw_clip(text_x, y, text_w, h);
+	profann_lines(d, first, last, text_x, text_w, y0, lh);
 	draw_clip(x, y, w - mm - SCROLL_W, h);
 	/* backgrounds: current line, selections, matches */
 	for (u32 l = first; l < last; l++) {
@@ -2979,7 +2982,9 @@ void ed_draw(Group *g, View *v, int x, int y, int w, int h, bool focused)
 	draw_clip(x, y, gut, h);
 	draw_rect(x, y, gut - PX(26) + PX(22), h, COL(C_EDITOR_BG));
 	int nd = VX_MAX(digits(nl), 5);
-	int num_r = x + PX(18) + nd * app.char_w;
+	int ann_w = profann_gutter_w(d);
+	profann_gutter(d, first, last, x, y0, lh);
+	int num_r = x + ann_w + PX(18) + nd * app.char_w;
 	for (u32 l = first; l < last; l++) {
 		int ly = y0 + (int)(l - first) * lh;
 		char num[16];
@@ -3082,6 +3087,7 @@ void ed_draw(Group *g, View *v, int x, int y, int w, int h, bool focused)
 				int my = y + (int)((i64)D->d_line0[d][i] * h / VX_MAX((i64)nl, 1));
 				draw_rect(sx + SCROLL_W - lane, my, lane, PX(3), sev == LSP_SEV_ERROR ? COL(C_ERROR) : COL(C_WARNING));
 			}
+			profann_ruler(d, sx + lane + PX(1), y, lane, h, nl);
 			int cy = y + (int)((i64)cur_line * h / VX_MAX((i64)nl, 1));
 			draw_rect(sx + PX(1), cy, SCROLL_W - PX(1), PX(2), (COL(C_CURSOR) & 0xFFFFFF00u) | 0xA0u);
 		}

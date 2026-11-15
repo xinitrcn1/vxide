@@ -1,0 +1,29 @@
+# Profiles: run by tests/t_ui.sh in a scratch project with the tests/prof fixtures.
+open massif.out.hot
+wait 1000
+key Tab
+key Return
+expect file hot.c
+expect line 15
+key ctrl+shift+p
+type Profile: Go to Next Hot Line
+key Return
+expect line 29
+open hot.c.gcov
+wait 1000
+key ctrl+shift+p
+type Profile: Annotate Source with Profile
+key Return
+open hot.c
+key ctrl+Home
+key ctrl+shift+p
+type Profile: Go to Next Hot Line
+key Return
+expect line 24
+key ctrl+shift+p
+type Profile: Go to Next Hot Line
+key Return
+expect line 25
+key ctrl+shift+p
+type Profile: Clear Source Annotation
+key Return
