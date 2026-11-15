@@ -128,6 +128,10 @@ DejaVu Sans Mono for code, with DejaVu Sans as the fallback.
   marks in the overview ruler. "Profile: Go to Next / Previous Hot Line"
   walks them; "Profile: Annotate Source with Profile..." picks the
   profile; "Profile: Open Raw Report" shows gprof's or gcov's own text.
+- **Markdown preview**: Markdown tabs have Edit and Preview subtabs
+  (Ctrl+Shift+V): headings, emphasis, code (highlighted by the fence's
+  language), lists and task lists, quotes, tables, links (anchors, files,
+  URLs); double-click in the preview edits that spot.
 - **Search**: the editor find widget and the Search view share one
   matcher: literal, case, whole word, and regex (Alt+C / Alt+W / Alt+R). The
   Search view has replace with a struck-out/inserted preview, Replace All
