@@ -18,6 +18,7 @@ enum {
 	ICON_GEAR_S,
 	ICON_BOOK_S, /* Manpages */
 	ICON_PULSE_S, /* Profiling */
+	ICON_PLAY_S,  /* Workflow */
 	/* 16 px */
 	ICON_CHEVRON_RIGHT,
 	ICON_CHEVRON_DOWN,
@@ -38,6 +39,14 @@ enum {
 	ICON_ARROW_UP,
 	ICON_ARROW_DOWN,
 	ICON_SPLIT,
+	/* debugger toolbar, 16 px */
+	ICON_DBG_CONTINUE,
+	ICON_DBG_PAUSE,
+	ICON_DBG_STEP_OVER,
+	ICON_DBG_STEP_INTO,
+	ICON_DBG_STEP_OUT,
+	ICON_DBG_STOP,
+	ICON_DBG_RESTART,
 	ICON_COUNT
 };
 

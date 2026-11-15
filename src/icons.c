@@ -171,6 +171,14 @@ static void art_pulse(float W)
 	line(16.5f, 12.5f, 21.5f, 12.5f, W);
 }
 
+static void art_play(float W)
+{
+	begin((int)(24.0f * G + 0.5f));
+	line(7.0f, 5.0f, 7.0f, 19.0f, W);
+	line(7.0f, 5.0f, 18.5f, 12.0f, W);
+	line(7.0f, 19.0f, 18.5f, 12.0f, W);
+}
+
 static void art_gear(float W)
 {
 	const float PI = 3.14159265f;
@@ -207,6 +215,8 @@ void icons_init(void)
 			store(ICON_BOOK_S);
 			art_pulse(W);
 			store(ICON_PULSE_S);
+			art_play(W);
+			store(ICON_PLAY_S);
 		}
 	}
 	G = 1.0f;
@@ -215,6 +225,52 @@ void icons_init(void)
 	line(6.0f, 4.0f, 10.0f, 8.0f, w + 0.2f);
 	line(10.0f, 8.0f, 6.0f, 12.0f, w + 0.2f);
 	store(ICON_CHEVRON_RIGHT);
+
+	/* debugger toolbar */
+	begin(16); /* continue: a filled triangle */
+	for (float k = 0; k < 4.5f; k += 0.5f)
+		line(4.5f + k, 3.5f + k * 0.78f, 4.5f + k, 12.5f - k * 0.78f, 1.0f);
+	line(4.5f, 3.5f, 12.5f, 8.0f, 1.2f);
+	line(4.5f, 12.5f, 12.5f, 8.0f, 1.2f);
+	store(ICON_DBG_CONTINUE);
+	begin(16); /* pause: two bars */
+	line(5.0f, 3.5f, 5.0f, 12.5f, 2.2f);
+	line(11.0f, 3.5f, 11.0f, 12.5f, 2.2f);
+	store(ICON_DBG_PAUSE);
+	begin(16); /* step over: an arc over a dot */
+	ring(8.0f, 8.5f, 5.0f, 1.2f);
+	for (int yy = 0; yy < S; yy++) /* keep the top half of the ring */
+		for (int xx = 0; xx < S; xx++)
+			if (yy > 8)
+				cov[yy * S + xx] = 0;
+	line(13.0f, 8.5f, 13.0f, 5.0f, 1.2f);
+	line(13.0f, 8.5f, 10.0f, 8.0f, 1.2f);
+	disc(8.0f, 13.0f, 1.6f);
+	store(ICON_DBG_STEP_OVER);
+	begin(16); /* step into: an arrow down to a dot */
+	line(8.0f, 2.5f, 8.0f, 9.5f, 1.2f);
+	line(5.0f, 7.0f, 8.0f, 10.0f, 1.2f);
+	line(11.0f, 7.0f, 8.0f, 10.0f, 1.2f);
+	disc(8.0f, 13.5f, 1.6f);
+	store(ICON_DBG_STEP_INTO);
+	begin(16); /* step out: an arrow up from a dot */
+	line(8.0f, 3.0f, 8.0f, 10.0f, 1.2f);
+	line(5.0f, 6.0f, 8.0f, 3.0f, 1.2f);
+	line(11.0f, 6.0f, 8.0f, 3.0f, 1.2f);
+	disc(8.0f, 13.5f, 1.6f);
+	store(ICON_DBG_STEP_OUT);
+	begin(16); /* stop: a square */
+	for (float k = 4.0f; k <= 12.0f; k += 1.0f)
+		line(4.0f, k, 12.0f, k, 1.2f);
+	store(ICON_DBG_STOP);
+	begin(16); /* restart: an open ring with an arrow head */
+	ring(8.0f, 8.0f, 5.0f, 1.2f);
+	for (int yy = 0; yy < 7; yy++)
+		for (int xx = 9; xx < S; xx++)
+			cov[yy * S + xx] = 0;
+	line(9.0f, 3.0f, 12.5f, 3.0f, 1.2f);
+	line(12.5f, 3.0f, 12.5f, 6.5f, 1.2f);
+	store(ICON_DBG_RESTART);
 
 	begin(16);
 	line(4.0f, 6.0f, 8.0f, 10.0f, w + 0.2f);
