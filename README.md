@@ -128,7 +128,9 @@ DejaVu Sans Mono for code, with DejaVu Sans as the fallback.
   marks in the overview ruler. "Profile: Go to Next / Previous Hot Line"
   walks them; "Profile: Annotate Source with Profile..." picks the
   profile; "Profile: Open Raw Report" shows gprof's or gcov's own text.
-- **Workflow** (CMake, run, debug): a side bar tab. CMake: configure
+- **Workflow** (CMake, run, debug): a pane right of the editors (the
+  Workflow tab toggles it), so the Explorer stays on the left; a stop
+  opens its source line and raises the window. CMake: configure
   presets (CMakePresets.json with inherits / include / macros) or
   ./build, Configure and Build, the cache options (booleans toggle,
   values edit, advanced on demand). Run: an executable target from the
