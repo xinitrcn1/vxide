@@ -33,7 +33,7 @@ typedef struct Event {
 
 #define MAX_DOCS 256
 
-enum { LSV_CLANGD, LSV_RUST, LSV_COUNT };
+enum { LSV_CLANGD, LSV_RUST, LSV_QML, LSV_GODOT, LSV_COUNT };
 
 typedef struct {
 	u32 n;
@@ -44,7 +44,8 @@ typedef struct {
 	u8 untitled[MAX_DOCS];
 	u8 tabs[MAX_DOCS]; /* indentation uses tabs (detected) */
 	u8 readonly[MAX_DOCS]; /* virtual documents (diffs, commits) */
-	u8 bin[MAX_DOCS];      /* binary: hex editor / disassembly (binview.c) */
+	u8 bin[MAX_DOCS];
+	u8 man[MAX_DOCS];      /* a manual page (man.c): read-only, links */      /* binary: hex editor / disassembly (binview.c) */
 	u32 refs[MAX_DOCS]; /* views showing it */
 
 	/* highlighter: lexer state at the start of each line */
@@ -117,7 +118,7 @@ typedef struct {
 /* ---- workbench ---------------------------------------------------------- */
 
 enum { DIFF_WORKTREE = 1, DIFF_STAGED, DIFF_COMMIT };
-enum { SIDE_EXPLORER, SIDE_SEARCH, SIDE_SCM, SIDE_SETTINGS, SIDE_COUNT };
+enum { SIDE_EXPLORER, SIDE_SEARCH, SIDE_SCM, SIDE_SETTINGS, SIDE_MAN, SIDE_COUNT };
 enum { PANEL_PROBLEMS, PANEL_OUTPUT, PANEL_COUNT };
 enum {
 	FOCUS_EDITOR,
@@ -126,6 +127,8 @@ enum {
 	FOCUS_QUICK,
 	FOCUS_FIND,
 	FOCUS_SEARCH_INPUT,
+	FOCUS_MAN_INPUT,
+	FOCUS_WORKSPACE, /* the Manpages page or the Settings page */
 	FOCUS_SCM_INPUT,
 };
 enum { QUICK_NONE, QUICK_FILES, QUICK_COMMANDS, QUICK_GOTO_LINE, QUICK_PROMPT, QUICK_CONFIRM, QUICK_PICK };
@@ -157,6 +160,9 @@ typedef struct {
 	/* metrics */
 	int act_w, top_h, side_w, status_h, tabs_h, subtabs_h, crumbs_h, panel_h;
 	bool minimap_on; /* settings */
+	char bg_path[1024]; /* editor background image, "" = none */
+	int bg_opacity;     /* percent */
+	int bg_iw, bg_ih;   /* loaded image size, 0 = none */
 	int line_h, char_w, row_h;
 
 	/* layout results */
@@ -212,6 +218,7 @@ typedef struct {
 	Git *git;
 	Blame *blame;
 	bool blame_on; /* git.blame.editorDecoration.enabled */
+	bool vim_on;   /* vim keybindings (off by default) */
 	u32 blame_gen;  /* bumps on every git refresh (HEAD may move) */
 	u32 blame_doc, blame_key;
 	bool blame_asked;
@@ -230,6 +237,7 @@ typedef struct {
 	Lsp *lsps[LSV_COUNT];
 	bool lsps_ready[LSV_COUNT];
 	bool lsps_failed[LSV_COUNT];
+	u64 lsps_retry_ns[LSV_COUNT]; /* reconnect time for servers we connect to (Godot) */
 	i32 compl_req, hover_req, def_req;
 	u32 compl_doc;
 	char compl_prefix[128];
@@ -372,9 +380,60 @@ int file_icon_draw(const char *name, int x, int y, int h);
 void open_file(const char *abs_path, bool preview, u32 line, u32 col);
 void open_rel(const char *rel, bool preview, u32 line, u32 col);
 View *active_view(void);
+
+/* vim.c: vim emulation, active while app.vim_on. ed_key / ed_text pass
+ * events here first; true means vim consumed it. */
+bool vim_key(View *v, const Event *e);
+bool vim_text(View *v, const char *s, size_t n);
+bool vim_claims_key(const Event *e);
+const char *vim_mode_label(void); /* "-- INSERT --", "-- VISUAL --", ":wq" being typed..., or NULL */
+bool vim_block_cursor(void);      /* normal/visual: draw a block cursor */
+void vim_reset(void);             /* back to normal mode (toggle, tab switch) */
+bool vim_command(View *v, int cmd); /* ed_command: bound keys vim owns (Ctrl+D/U/W/[) */
+u32 vim_cursor_off(View *v, u32 c); /* where cursor c's block is drawn */
+bool ed_undo_redo(View *v, bool redo, u32 *pos); /* editor.c; pos = start of the change */
+int ed_view_lines(void);                         /* editor.c; whole lines in view */
 /* The ready language server of a document that is open on it, else NULL. */
 Lsp *doc_lsp(u32 d);
 const char *lsv_name(int sv);
+
+/* man.c: manual pages */
+bool man_open(const char *name, const char *sec, bool prefer_c);
+bool man_follow(u32 d, u32 off);
+void man_open_at(View *v, u32 off);
+void man_ws_draw(int x, int y, int w, int h);
+void man_ws_event(const Event *e, int x, int y, int w, int h);
+bool man_ws_key(const Event *e);
+bool man_ws_context(int mx, int my, int x, int y, int w);
+View *man_active_view(void);
+void man_shutdown(void);
+
+/* Workspaces: Manpages and Settings take the whole main area instead of
+ * the side bar and the editor groups. */
+bool ui_workspace(void);
+void workspace_area(int *x, int *y, int *w, int *h);
+void settings_ws_draw(int x, int y, int w, int h);
+void settings_ws_event(const Event *e, int x, int y, int w, int h);
+void settings_load(void);
+void settings_save(void);
+void background_apply(void); /* (re)load app.bg_path into the GPU */
+void man_tick(void);
+u64 man_wait_hint(void);
+/* panes.c helpers shared with other panes */
+int view_title(int x, int y, int w, const char *t);
+void list_row_bg(int x, int y, int w, int h, bool selected, bool focused, bool hover);
+
+/* projtools.c: Qt and Godot integration */
+void projtools_init(void);
+void projtools_tick(void);
+void projtools_shutdown(void);
+bool projtools_busy(void);
+bool projtools_command(int cmd);
+void projtools_explorer_menu(u32 node);
+const char *godot_dir(void);
+int godot_lsp_port(void);
+const char *qmlls_path(void);
+const char *qt_build_dir(void);
 void close_tab(u32 g, u32 t);
 
 /* editor.c */
@@ -434,8 +493,6 @@ void scm_refresh(void);
 void problems_draw(int x, int y, int w, int h);
 bool problems_event(const Event *e, int x, int y, int w, int h);
 void output_draw(int x, int y, int w, int h);
-void settings_draw(int x, int y, int w, int h);
-bool settings_event(const Event *e, int x, int y, int w, int h);
 bool output_event(const Event *e, int x, int y, int w, int h);
 u32 problems_count(int sev);
 
@@ -497,6 +554,19 @@ enum {
 	CMD_VIEW_SEARCH,
 	CMD_VIEW_SCM,
 	CMD_VIEW_SETTINGS,
+	CMD_TOGGLE_VIM,
+	CMD_VIEW_MAN,
+	CMD_OPEN_MANPAGE,
+	CMD_SET_BACKGROUND,
+	CMD_CLEAR_BACKGROUND,
+	CMD_QT_DESIGNER,
+	CMD_QT_LINGUIST,
+	CMD_QT_PREVIEW_QML,
+	CMD_GODOT_EDITOR,
+	CMD_GODOT_RUN,
+	CMD_GODOT_RUN_SCENE,
+	CMD_GODOT_STOP,
+	CMD_GODOT_HEADLESS_LSP,
 	CMD_VIEW_PROBLEMS,
 	CMD_VIEW_OUTPUT,
 	CMD_SPLIT,

@@ -505,6 +505,8 @@ void ed_text(View *v, const char *s, size_t n)
 {
 	if (app.docs.bin[v->doc] && v->diff_left == UINT32_MAX)
 		return;
+	if (app.vim_on && vim_text(v, s, n))
+		return;
 	Text *t = T(v);
 	box.on = false;
 	if (readonly_doc(v))
@@ -1297,12 +1299,14 @@ static void move_cursors(View *v, u32 key, int mods, int page_lines)
 
 /* ---- commands ---------------------------------------------------------------- */
 
-static void undo_redo(View *v, bool redo)
+static bool undo_redo_at(View *v, bool redo, u32 *at)
 {
 	u32 a, b;
 	bool ok = redo ? text_redo(T(v), &a, &b) : text_undo(T(v), &a, &b);
 	if (!ok)
-		return;
+		return false;
+	if (at)
+		*at = a;
 	/* text_undo bypassed doc_replace: resync the dependent state */
 	Docs *D = &app.docs;
 	D->lstate_ok[v->doc] = 0;
@@ -1321,7 +1325,16 @@ static void undo_redo(View *v, bool redo)
 		}
 	ed_set_cursor(v, b, false);
 	ed_reveal(v, b, false);
+	return true;
 }
+
+static void undo_redo(View *v, bool redo) { undo_redo_at(v, redo, NULL); }
+
+/* Undo/redo one group; pos gets the start of the change (vim puts the cursor there). */
+bool ed_undo_redo(View *v, bool redo, u32 *pos) { return undo_redo_at(v, redo, pos); }
+
+/* Whole lines the last drawn editor shows (H/M/L, Ctrl+D, zz). */
+int ed_view_lines(void) { return VX_MAX(g_view_h / VX_MAX(app.line_h, 1), 1); }
 
 /* ---- case transforms (Transform to Uppercase/Lowercase/Title/Snake/Kebab) ---- */
 
@@ -1629,6 +1642,8 @@ bool ed_key(View *v, const Event *e)
 {
 	if (app.docs.bin[v->doc] && v->diff_left == UINT32_MAX)
 		return binview_key(v, e);
+	if (app.vim_on && vim_key(v, e))
+		return true;
 	int mods = e->mods & (MOD_CTRL | MOD_SHIFT | MOD_ALT);
 	u32 k = e->key;
 	if ((k == SDLK_BACKSPACE || k == SDLK_DELETE || k == SDLK_RETURN || k == SDLK_KP_ENTER || k == SDLK_TAB) &&
@@ -2915,16 +2930,30 @@ void ed_draw(Group *g, View *v, int x, int y, int w, int h, bool focused)
 
 	/* cursors (blink 530 ms on/off, solid while typing) */
 	u64 phase = (vx_now_ns() - app.blink_t0) / 530000000ull;
-	if (focused && (app.headless || phase % 2 == 0)) {
+	bool vim_block = app.vim_on && vim_block_cursor();
+	if (focused && (app.headless || vim_block || phase % 2 == 0)) {
 		for (u32 c = 0; c < v->nc; c++) {
-			u32 l = text_line_of(t, v->head[c]);
+			u32 h = vim_block ? vim_cursor_off(v, c) : v->head[c];
+			u32 l = text_line_of(t, h);
 			if (l < first || l >= last)
 				continue;
 			int ly = y0 + (int)(l - first) * lh;
-			int cx = tx + x_of(t, l, v->head[c]);
-			if (app.overtype) {
+			int cx = tx + x_of(t, l, h);
+			if (vim_block) {
+				/* vim normal/visual: a filled cell, the glyph in the background colour */
+				u32 le = text_line_start(t, l) + text_line_len(t, l);
+				int cw = h < le ? x_of(t, l, next_char(t, h)) - x_of(t, l, h) : app.char_w;
+				draw_rect(cx, ly, VX_MAX(cw, PX(2)), lh, COL(C_CURSOR));
+				if (h < le) {
+					char gb[4];
+					u32 gn = VX_MIN(4u, le - h), cp;
+					text_copy(t, h, gn, gb);
+					utf8_decode(gb, gn, &cp);
+					if (cp != ' ' && cp != '\t')
+						draw_glyph(font_glyph(FONT_MONO, cp), cx, ly, COL(C_EDITOR_BG));
+				}
+			} else if (app.overtype) {
 				/* block cursor over the character it will replace */
-				u32 h = v->head[c];
 				u32 le = text_line_start(t, l) + text_line_len(t, l);
 				int cw = h < le ? x_of(t, l, next_char(t, h)) - x_of(t, l, h) : app.char_w;
 				draw_rect(cx, ly, VX_MAX(cw, PX(2)), lh, (COL(C_CURSOR) & 0xFFFFFF00u) | 0x80u);

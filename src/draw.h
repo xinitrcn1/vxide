@@ -16,6 +16,7 @@ enum {
 	ICON_SEARCH_S,
 	ICON_SCM_S,
 	ICON_GEAR_S,
+	ICON_BOOK_S, /* Manpages */
 	/* 16 px */
 	ICON_CHEVRON_RIGHT,
 	ICON_CHEVRON_DOWN,
@@ -55,6 +56,8 @@ void draw_begin(int w, int h);
 void draw_clip(int x, int y, int w, int h); /* intersect with screen */
 void draw_noclip(void);
 void draw_rect(int x, int y, int w, int h, u32 rgba);
+/* the background image (gpu_set_background) at this alpha, over x,y,w,h */
+void push_image_quad(int x, int y, int w, int h, u32 alpha);
 void draw_frame(int x, int y, int w, int h, u32 rgba); /* 1px outline */
 void draw_squiggle(int x, int y, int w, u32 rgba);
 void draw_icon(int icon, int x, int y, u32 rgba);

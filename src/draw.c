@@ -34,7 +34,7 @@ static void push(int x, int y, int w, int h, u16 u, u16 v, u32 c)
 	int cx1 = VX_MIN(x1, draw.x1), cy1 = VX_MIN(y1, draw.y1);
 	if (cx0 >= cx1 || cy0 >= cy1 || !(c & 0xFF))
 		return;
-	if (u < QUAD_SQUIGGLE) {
+	if (u < QUAD_IMAGE) {
 		u = (u16)(u + (cx0 - x));
 		v = (u16)(v + (cy0 - y));
 	} else if (u == QUAD_SQUIGGLE && (cx0 != x || cy0 != y)) {
@@ -55,6 +55,7 @@ static void push(int x, int y, int w, int h, u16 u, u16 v, u32 c)
 }
 
 void draw_rect(int x, int y, int w, int h, u32 c) { push(x, y, w, h, QUAD_SOLID, 0, c); }
+void push_image_quad(int x, int y, int w, int h, u32 alpha) { push(x, y, w, h, QUAD_IMAGE, 0, 0xFFFFFF00u | (alpha & 255)); }
 
 void draw_atlas_rect(int x, int y, int w, int h, u16 u, u16 v, u32 c) { push(x, y, w, h, u, v, c); }
 

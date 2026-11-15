@@ -146,6 +146,7 @@ void ctx_menu_editor(View *v, int x, int y, u32 off)
 	menu_item("Go to References", CMD_GOTO_REFERENCES, lsp);
 	menu_sep();
 	menu_item("Find All References", CMD_FIND_ALL_REFERENCES, lsp);
+	menu_item("Open Manpage", CMD_OPEN_MANPAGE, true);
 	menu_sep();
 	menu_item("Change All Occurrences", CMD_CHANGE_ALL_OCCURRENCES, !ro);
 	menu_sep();
@@ -175,6 +176,7 @@ void ctx_menu_explorer(int x, int y, u32 node)
 	menu_sep();
 	menu_item("Refresh Explorer", CMD_REFRESH_EXPLORER, true);
 	menu_item("Collapse Folders in Explorer", CMD_COLLAPSE_FOLDERS, true);
+	projtools_explorer_menu(node);
 }
 
 void ctx_menu_tab(int x, int y, u32 group, u32 tab)

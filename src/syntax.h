@@ -72,6 +72,12 @@ enum {
 	LANG_TOML,      /* TOML (.toml, Cargo.lock, Pipfile)             */
 	LANG_CPP,       /* C++26 (.cpp .cc .hpp ..., .h with C++ markers) */
 	LANG_RUST,      /* Rust (.rs)                                    */
+	LANG_CSHARP,    /* C# 13 (.cs .csx)                              */
+	LANG_QML,       /* QML (.qml) with JavaScript bindings           */
+	LANG_QMAKE,     /* qmake project files (.pro .pri .prf .prl)     */
+	LANG_GDSCRIPT,  /* GDScript (.gd)                                */
+	LANG_GODOT_RES, /* Godot resources (.tscn .tres .godot .import)  */
+	LANG_XML,       /* XML (.xml .ui .qrc .svg .csproj ..., <?xml)   */
 	LANG_COUNT /* Markdown keeps a fence language in 5 bits: <= 32  */
 };
 

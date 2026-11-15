@@ -306,7 +306,7 @@ void input_draw(Input *in, int x, int y, int w, int h, const char *ph, bool focu
 
 /* ---- shared bits ------------------------------------------------------------- */
 
-static int view_title(int x, int y, int w, const char *t)
+int view_title(int x, int y, int w, const char *t)
 {
 	int h = PX(35);
 	draw_text(FONT_SMALL, x + PX(20), y + (h - font_m[FONT_SMALL].line) / 2, t, strlen(t),
@@ -335,7 +335,7 @@ static void upper(char *dst, const char *s, size_t cap)
 	dst[i] = 0;
 }
 
-static void list_row_bg(int x, int y, int w, int h, bool selected, bool focused, bool hover)
+void list_row_bg(int x, int y, int w, int h, bool selected, bool focused, bool hover)
 {
 	if (selected) {
 		draw_rect(x, y, w, h, focused ? COL(C_LIST_ACTIVE_BG) : COL(C_LIST_INACTIVE_BG));
@@ -2025,99 +2025,474 @@ bool sidebar_over_input(int x, int y, int w, int mx, int my)
 	return false;
 }
 
-/* ---- settings ------------------------------------------------------------------ */
+/* ---- settings workspace ------------------------------------------------------
+ *
+ * A whole page like VSCodium's settings editor: a search bar, one permanent
+ * tab per category, and the settings of the active category below. A search
+ * goes to the tab of the first matching setting and marks it; Enter / F3 /
+ * Down step through the matches across tabs. Settings are kept in
+ * $XDG_CONFIG_HOME/vxide/settings.conf (key=value). */
 
-/* The few things that can be changed (the UI is not customisable as such):
- * one row each, a square check box or a value that cycles on click. */
-enum { SET_THEME, SET_BLAME, SET_MINIMAP, SET_LSP, SET_COUNT };
+enum { CAT_APPEARANCE, CAT_EDITOR, CAT_GIT, CAT_LANGUAGES, CAT_COUNT };
+static const char *const cat_name[CAT_COUNT] = {"Appearance", "Editor", "Git", "Languages"};
 
-static void settings_row(int i, char *label, size_t lc, char *value, size_t vc, int *checked)
+enum {
+	ST_THEME,
+	ST_MINIMAP,
+	ST_BG,
+	ST_BG_OPACITY,
+	ST_VIM,
+	ST_OVERTYPE,
+	ST_BLAME,
+	ST_LSP,
+	ST_GODOT_LSP,
+	ST_COUNT
+};
+
+/* the table (SoA) */
+static const u8 st_cat[ST_COUNT] = {CAT_APPEARANCE, CAT_APPEARANCE, CAT_APPEARANCE, CAT_APPEARANCE, CAT_EDITOR,
+                                    CAT_EDITOR,     CAT_GIT,        CAT_LANGUAGES,  CAT_LANGUAGES};
+static const char *const st_label[ST_COUNT] = {
+    "Color Theme",
+    "Minimap",
+    "Editor Background Image",
+    "Editor Background Opacity",
+    "Vim Keybindings",
+    "Overtype",
+    "Inline Blame",
+    "Language Servers",
+    "Godot Headless Language Server",
+};
+static const char *const st_desc[ST_COUNT] = {
+    "Dark Modern or Light Modern, with the Dark+ / Light+ syntax colours.",
+    "Show the minimap next to the editor scrollbar.",
+    "A PNG or JPEG drawn over the editor area, scaled to cover it. The opacity below keeps the code readable.",
+    "How strongly the background image shows through (0-100 %).",
+    "Normal / insert / visual modes and ex commands, like VSCodium's Vim extension. Off by default.",
+    "Typed characters replace the ones under the cursor (Insert toggles it).",
+    "Show the last commit of the cursor line at its end (git.blame.editorDecoration).",
+    "clangd (C, C++), rust-analyzer (Rust; never builds the target), qmlls (QML), Godot (GDScript, from the running "
+    "editor).",
+    "Start Godot without a window to serve GDScript when the editor is not open. It imports the project first, which "
+    "reads the whole project from disk.",
+};
+static const char *const st_key[ST_COUNT] = {"theme", "minimap", "background", "background_opacity", "vim",
+                                             NULL,    "blame",   NULL,         NULL};
+
+static Input set_in;
+static int set_tab;
+static int set_hit = -1; /* the setting a search went to */
+static i32 set_scroll;
+
+static void settings_path(char *out, size_t cap)
 {
+	const char *x = getenv("XDG_CONFIG_HOME");
+	const char *home = getenv("HOME");
+	if (x && *x)
+		snprintf(out, cap, "%s/vxide/settings.conf", x);
+	else
+		snprintf(out, cap, "%s/.config/vxide/settings.conf", home ? home : ".");
+}
+
+static bool settings_enabled(void) { return !app.headless || getenv("VXIDE_SETTINGS"); }
+
+void settings_load(void)
+{
+	if (!settings_enabled())
+		return;
+	char p[4096];
+	const char *env = getenv("VXIDE_SETTINGS");
+	if (env)
+		snprintf(p, sizeof p, "%s", env);
+	else
+		settings_path(p, sizeof p);
+	FILE *f = fopen(p, "r");
+	if (!f)
+		return;
+	char line[2048];
+	while (fgets(line, sizeof line, f)) {
+		line[strcspn(line, "\r\n")] = 0;
+		char *eq = strchr(line, '=');
+		if (!eq || line[0] == '#')
+			continue;
+		*eq = 0;
+		const char *k = line, *v = eq + 1;
+		if (!strcmp(k, "theme"))
+			app.theme = !strcmp(v, "light") ? THEME_LIGHT : THEME_DARK;
+		else if (!strcmp(k, "minimap"))
+			app.minimap_on = atoi(v) != 0;
+		else if (!strcmp(k, "blame"))
+			app.blame_on = atoi(v) != 0;
+		else if (!strcmp(k, "vim"))
+			app.vim_on = atoi(v) != 0;
+		else if (!strcmp(k, "background"))
+			snprintf(app.bg_path, sizeof app.bg_path, "%s", v);
+		else if (!strcmp(k, "background_opacity"))
+			app.bg_opacity = VX_CLAMP(atoi(v), 0, 100);
+	}
+	fclose(f);
+}
+
+void settings_save(void)
+{
+	if (!settings_enabled())
+		return;
+	char p[4096];
+	const char *env = getenv("VXIDE_SETTINGS");
+	if (env) {
+		snprintf(p, sizeof p, "%s", env);
+	} else {
+		settings_path(p, sizeof p);
+		/* make the folders */
+		char d[4096];
+		snprintf(d, sizeof d, "%s", p);
+		for (char *s = d + 1; *s; s++)
+			if (*s == '/') {
+				*s = 0;
+				mkdir(d, 0755);
+				*s = '/';
+			}
+	}
+	char tmp[4200];
+	snprintf(tmp, sizeof tmp, "%s.tmp", p);
+	FILE *f = fopen(tmp, "w");
+	if (!f)
+		return;
+	fprintf(f, "# vxide settings\ntheme=%s\nminimap=%d\nblame=%d\nvim=%d\nbackground=%s\nbackground_opacity=%d\n",
+	        app.theme == THEME_LIGHT ? "light" : "dark", app.minimap_on, app.blame_on, app.vim_on, app.bg_path,
+	        app.bg_opacity);
+	if (fclose(f) == 0)
+		rename(tmp, p);
+}
+
+static void lsp_status(char *out, size_t cap)
+{
+	size_t k = 0;
+	out[0] = 0;
+	for (int sv = 0; sv < LSV_COUNT && k < cap; sv++) {
+		const char *st = app.lsps[sv] ? (app.lsps_ready[sv] ? "running" : "starting")
+		                 : app.lsps_failed[sv] ? "not available"
+		                                       : "idle";
+		k += (size_t)snprintf(out + k, cap - k, "%s%s: %s", sv ? ",  " : "", lsv_name(sv), st);
+	}
+}
+
+/* the value text and the clickable control label of a setting */
+static void st_value(int i, char *val, size_t vc, char *btn, size_t bc, int *checked)
+{
+	val[0] = btn[0] = 0;
 	*checked = -1;
-	value[0] = 0;
 	switch (i) {
-	case SET_THEME:
-		snprintf(label, lc, "Color Theme");
-		snprintf(value, vc, "%s", themes[app.theme].name);
+	case ST_THEME:
+		snprintf(val, vc, "%s", themes[app.theme].name);
+		snprintf(btn, bc, "Switch to %s", themes[app.theme == THEME_DARK ? THEME_LIGHT : THEME_DARK].name);
 		break;
-	case SET_BLAME:
-		snprintf(label, lc, "Git blame on the cursor line");
-		*checked = app.blame_on;
+	case ST_MINIMAP: *checked = app.minimap_on; break;
+	case ST_VIM: *checked = app.vim_on; break;
+	case ST_OVERTYPE: *checked = app.overtype; break;
+	case ST_BLAME: *checked = app.blame_on; break;
+	case ST_BG:
+		snprintf(val, vc, "%s", app.bg_path[0] ? app.bg_path : "None");
+		snprintf(btn, bc, "%s", app.bg_path[0] ? "Change...   Clear" : "Choose...");
 		break;
-	case SET_MINIMAP:
-		snprintf(label, lc, "Minimap");
-		*checked = app.minimap_on;
+	case ST_BG_OPACITY:
+		snprintf(val, vc, "%d %%", app.bg_opacity);
+		snprintf(btn, bc, "-   +");
 		break;
-	case SET_LSP:
-		snprintf(label, lc, "Language servers (clangd, rust-analyzer)");
-		{
-			bool any = false, ready = true;
-			for (int sv = 0; sv < LSV_COUNT; sv++)
-				if (app.lsps[sv]) {
-					any = true;
-					ready &= app.lsps_ready[sv];
-				}
-			snprintf(value, vc, "%s", any ? (ready ? "running - restart" : "starting") : "stopped - start");
-		}
+	case ST_LSP:
+		lsp_status(val, vc);
+		snprintf(btn, bc, "Restart");
+		break;
+	case ST_GODOT_LSP:
+		snprintf(val, vc, "%s", godot_dir() ? godot_dir() : "No Godot project in this folder");
+		snprintf(btn, bc, "%s", godot_dir() ? "Start" : "");
 		break;
 	}
 }
 
-static int settings_row_h(void) { return PX(44); }
-
-void settings_draw(int x, int y, int w, int h)
+static bool ci_contains(const char *hay, const char *needle, u32 nn)
 {
-	(void)h;
-	int cy = view_title(x, y, w, "SETTINGS");
-	for (int i = 0; i < SET_COUNT; i++) {
-		char label[128], value[128];
-		int checked;
-		settings_row(i, label, sizeof label, value, sizeof value, &checked);
-		int ry = cy + i * settings_row_h();
-		bool hover = in_rect(app.hover_x, app.hover_y, x, ry, w, settings_row_h());
-		if (hover)
-			draw_rect(x, ry, w, settings_row_h(), COL(C_LIST_HOVER_BG));
-		int tx = x + PX(14);
-		if (checked >= 0) {
-			int bx = tx, by = ry + (settings_row_h() - PX(14)) / 2;
-			draw_frame(bx, by, PX(14), PX(14), COL(C_INPUT_BORDER));
-			if (checked)
-				draw_icon(ICON_CHECK, bx - PX(1), by - PX(1), COL(C_FG));
-			draw_text_fit(FONT_UI, tx + PX(22), ry + (settings_row_h() - font_m[FONT_UI].line) / 2, label,
-			              strlen(label), w - PX(44), COL(C_SIDEBAR_FG));
-		} else {
-			draw_text_fit(FONT_UI_BOLD, tx, ry + PX(4), label, strlen(label), w - PX(24), COL(C_SIDEBAR_FG));
-			draw_text_fit(FONT_UI, tx, ry + PX(4) + font_m[FONT_UI].line, value, strlen(value), w - PX(24),
-			              COL(C_LINK));
-		}
-	}
-}
-
-bool settings_event(const Event *e, int x, int y, int w, int h)
-{
-	(void)x;
-	(void)w;
-	(void)h;
-	if (e->type != EV_MDOWN)
+	if (!nn)
 		return false;
-	int cy = y + PX(35);
-	if (e->y < cy)
-		return true;
-	int i = (e->y - cy) / settings_row_h();
+	for (const char *h = hay; *h; h++) {
+		u32 k = 0;
+		while (k < nn && h[k] && ((h[k] | 32) == (needle[k] | 32) || h[k] == needle[k]))
+			k++;
+		if (k == nn)
+			return true;
+	}
+	return false;
+}
+
+static bool st_match(int i)
+{
+	if (!set_in.n)
+		return false;
+	return ci_contains(st_label[i], set_in.b, set_in.n) || ci_contains(st_desc[i], set_in.b, set_in.n) ||
+	       ci_contains(cat_name[st_cat[i]], set_in.b, set_in.n) ||
+	       (st_key[i] && ci_contains(st_key[i], set_in.b, set_in.n));
+}
+
+/* go to the next match after the current one (wrapping across tabs) */
+static void set_next_match(int dir)
+{
+	int start = set_hit < 0 ? (dir > 0 ? -1 : 0) : set_hit;
+	for (int k = 1; k <= ST_COUNT; k++) {
+		int i = ((start + dir * k) % ST_COUNT + ST_COUNT) % ST_COUNT;
+		if (st_match(i)) {
+			set_hit = i;
+			set_tab = st_cat[i];
+			return;
+		}
+	}
+	set_hit = -1;
+}
+
+static int set_search_h(void) { return PX(44); }
+static int set_row_h(void) { return PX(78); }
+
+static int set_tab_w(int c) { return PX(24) + font_width(FONT_UI, cat_name[c], strlen(cat_name[c])); }
+
+typedef struct {
+	int bx, bw, iy, ih; /* search box */
+	int ty, cy;         /* tab row, content top */
+	int cx, cw;         /* content column */
+} SetGeo;
+
+static SetGeo set_geo(int x, int y, int w)
+{
+	SetGeo g;
+	g.bw = VX_MIN(w - PX(130), PX(640));
+	g.bx = x + PX(110);
+	g.ih = input_height(&set_in, g.bw, 0);
+	g.iy = y + (set_search_h() - g.ih) / 2;
+	g.ty = y + set_search_h();
+	g.cy = g.ty + app.tabs_h;
+	g.cx = x + PX(40);
+	g.cw = VX_MIN(w - PX(80), PX(900));
+	return g;
+}
+
+/* where a row's controls are, for drawing and clicks */
+static int ctl_x(const SetGeo *g) { return g->cx + PX(4); }
+
+void settings_ws_draw(int x, int y, int w, int h)
+{
+	SetGeo g = set_geo(x, y, w);
+	draw_rect(x, y, w, h, COL(C_EDITOR_BG));
+	draw_rect(x, y, w, set_search_h(), COL(C_SIDEBAR_BG));
+	const char *lbl = "SETTINGS";
+	draw_text(FONT_SMALL, x + PX(20), y + (set_search_h() - font_m[FONT_SMALL].line) / 2, lbl, strlen(lbl),
+	          COL(C_SIDEBAR_TITLE_FG));
+	input_draw_ex(&set_in, g.bx, g.iy, g.bw, 0, "Search settings", app.focus == FOCUS_MAN_INPUT);
+	if (set_in.n) {
+		int n = 0;
+		for (int i = 0; i < ST_COUNT; i++)
+			n += st_match(i);
+		char b[48];
+		snprintf(b, sizeof b, n == 1 ? "1 setting found" : "%d settings found", n);
+		if (g.bx + g.bw + PX(12) + font_width(FONT_SMALL, b, strlen(b)) < x + w)
+			draw_text(FONT_SMALL, g.bx + g.bw + PX(12), y + (set_search_h() - font_m[FONT_SMALL].line) / 2, b,
+			          strlen(b), COL(C_DESCRIPTION_FG));
+	}
+	/* category tabs: fixed, never closed */
+	draw_rect(x, g.ty, w, app.tabs_h, COL(C_TABS_BG));
+	int tx = x;
+	for (int c = 0; c < CAT_COUNT; c++) {
+		int tw = set_tab_w(c);
+		bool act = c == set_tab;
+		bool has = false;
+		for (int i = 0; i < ST_COUNT; i++)
+			has |= st_cat[i] == c && st_match(i);
+		draw_rect(tx, g.ty, tw, app.tabs_h, act ? COL(C_TAB_ACTIVE_BG) : COL(C_TAB_INACTIVE_BG));
+		draw_rect(tx + tw - PX(1), g.ty, PX(1), app.tabs_h, COL(C_TAB_BORDER));
+		if (act)
+			draw_rect(tx, g.ty, tw, PX(1), COL(C_TAB_ACTIVE_BORDER_TOP));
+		u32 fg = act ? COL(C_TAB_ACTIVE_FG) : has ? COL(C_LINK) : COL(C_TAB_INACTIVE_FG);
+		draw_text(FONT_UI, tx + PX(12), g.ty + (app.tabs_h - font_m[FONT_UI].line) / 2, cat_name[c],
+		          strlen(cat_name[c]), fg);
+		tx += tw;
+	}
+	draw_rect(x, g.cy - PX(1), w, PX(1), COL(C_TABS_BORDER));
+	/* the rows of this category */
+	draw_clip(x, g.cy, w, y + h - g.cy);
+	int ry = g.cy + PX(16) - set_scroll;
+	const char *head = cat_name[set_tab];
+	draw_text(FONT_UI_BOLD, g.cx, ry, head, strlen(head), COL(C_FG));
+	ry += PX(34);
+	for (int i = 0; i < ST_COUNT; i++) {
+		if (st_cat[i] != set_tab)
+			continue;
+		int rh = set_row_h();
+		bool hit = i == set_hit;
+		bool match = st_match(i);
+		if (hit) {
+			draw_rect(g.cx - PX(12), ry - PX(6), g.cw + PX(24), rh - PX(4), COL(C_LIST_HOVER_BG));
+			draw_rect(g.cx - PX(12), ry - PX(6), PX(2), rh - PX(4), COL(C_FOCUS_BORDER));
+		}
+		char val[512], btn[64];
+		int checked;
+		st_value(i, val, sizeof val, btn, sizeof btn, &checked);
+		u32 lc = match ? COL(C_LINK) : COL(C_FG);
+		int cx = ctl_x(&g);
+		int ly = ry;
+		draw_text_fit(FONT_UI_BOLD, g.cx, ly, st_label[i], strlen(st_label[i]), g.cw, lc);
+		ly += font_m[FONT_UI_BOLD].line + PX(2);
+		draw_text_fit(FONT_UI, g.cx, ly, st_desc[i], strlen(st_desc[i]), g.cw, COL(C_DESCRIPTION_FG));
+		ly += font_m[FONT_UI].line + PX(6);
+		if (checked >= 0) {
+			draw_frame(cx, ly + PX(1), PX(16), PX(16), COL(C_INPUT_BORDER));
+			if (checked)
+				draw_icon(ICON_CHECK, cx, ly + PX(1), COL(C_FG));
+			const char *t = checked ? "On" : "Off";
+			draw_text(FONT_UI, cx + PX(26), ly, t, strlen(t), COL(C_FG));
+		} else {
+			int vx = draw_text_fit(FONT_UI, cx, ly, val, strlen(val), g.cw / 2 + PX(160), COL(C_FG));
+			if (btn[0])
+				draw_text(FONT_UI, VX_MAX(vx + PX(16), cx + PX(140)), ly, btn, strlen(btn), COL(C_LINK));
+		}
+		ry += rh;
+	}
+	draw_noclip();
+}
+
+static void set_click(int i, int mx, const SetGeo *g, int vx_end)
+{
+	int cx = ctl_x(g);
 	switch (i) {
-	case SET_THEME:
-		run_command(CMD_TOGGLE_THEME);
-		break;
-	case SET_BLAME:
-		run_command(CMD_GIT_TOGGLE_BLAME);
-		break;
-	case SET_MINIMAP:
+	case ST_THEME: run_command(CMD_TOGGLE_THEME); break;
+	case ST_MINIMAP:
 		app.minimap_on = !app.minimap_on;
+		settings_save();
 		break;
-	case SET_LSP:
-		run_command(CMD_RESTART_LSP);
+	case ST_VIM: run_command(CMD_TOGGLE_VIM); break;
+	case ST_OVERTYPE: app.overtype = !app.overtype; break;
+	case ST_BLAME: run_command(CMD_GIT_TOGGLE_BLAME); break;
+	case ST_BG: {
+		/* "Change...   Clear": the right half clears */
+		int bx = VX_MAX(vx_end + PX(16), cx + PX(140));
+		int cw = font_width(FONT_UI, "Change...   ", 12);
+		if (app.bg_path[0] && mx >= bx + cw)
+			run_command(CMD_CLEAR_BACKGROUND);
+		else if (mx >= bx)
+			run_command(CMD_SET_BACKGROUND);
 		break;
 	}
+	case ST_BG_OPACITY: {
+		int bx = VX_MAX(vx_end + PX(16), cx + PX(140));
+		int mw = font_width(FONT_UI, "-  ", 3);
+		if (mx >= bx && mx < bx + mw)
+			app.bg_opacity = VX_MAX(app.bg_opacity - 5, 0);
+		else if (mx >= bx + mw && mx < bx + mw * 3)
+			app.bg_opacity = VX_MIN(app.bg_opacity + 5, 100);
+		settings_save();
+		break;
+	}
+	case ST_LSP: run_command(CMD_RESTART_LSP); break;
+	case ST_GODOT_LSP:
+		if (godot_dir())
+			run_command(CMD_GODOT_HEADLESS_LSP);
+		break;
+	}
+}
+
+void settings_ws_event(const Event *e, int x, int y, int w, int h)
+{
+	(void)h;
+	SetGeo g = set_geo(x, y, w);
 	app.dirty = true;
-	return true;
+	if (e->type == EV_WHEEL) {
+		set_scroll = VX_MAX(set_scroll - (i32)(e->wy * PX(40)), 0);
+		return;
+	}
+	if (e->type == EV_TEXT) {
+		app.focus = FOCUS_MAN_INPUT; /* typing searches */
+		input_text(&set_in, e->text, strlen(e->text));
+		set_hit = -1;
+		set_next_match(1);
+		return;
+	}
+	if (e->type == EV_KEY) {
+		int mods = e->mods & (MOD_CTRL | MOD_SHIFT | MOD_ALT);
+		if (mods == MOD_CTRL && (e->key == SDLK_F || e->key == SDLK_L)) {
+			app.focus = FOCUS_MAN_INPUT;
+			return;
+		}
+		if (mods == MOD_CTRL && (e->key == SDLK_TAB || e->key == SDLK_PAGEDOWN)) {
+			set_tab = (set_tab + 1) % CAT_COUNT;
+			return;
+		}
+		if ((mods == (MOD_CTRL | MOD_SHIFT) && e->key == SDLK_TAB) || (mods == MOD_CTRL && e->key == SDLK_PAGEUP)) {
+			set_tab = (set_tab + CAT_COUNT - 1) % CAT_COUNT;
+			return;
+		}
+		if (e->key == SDLK_RETURN || e->key == SDLK_KP_ENTER || e->key == SDLK_F3 || e->key == SDLK_DOWN) {
+			set_next_match((e->mods & MOD_SHIFT) ? -1 : 1);
+			return;
+		}
+		if (e->key == SDLK_UP) {
+			set_next_match(-1);
+			return;
+		}
+		if (e->key == SDLK_ESCAPE) {
+			if (set_in.n) {
+				input_set(&set_in, "", 0);
+				set_hit = -1;
+			} else {
+				app.focus = FOCUS_WORKSPACE;
+			}
+			return;
+		}
+		if (app.focus == FOCUS_MAN_INPUT) {
+			u32 before = set_in.n;
+			input_key(&set_in, e);
+			if (set_in.n != before) {
+				set_hit = -1;
+				set_next_match(1);
+			}
+		}
+		return;
+	}
+	if (e->type != EV_MDOWN || e->button != 1)
+		return;
+	if (e->y < g.ty) {
+		if (e->x >= g.bx && e->x < g.bx + g.bw && e->y >= g.iy && e->y < g.iy + g.ih) {
+			app.focus = FOCUS_MAN_INPUT;
+			input_click_ex(&set_in, g.bx, g.iy, g.bw, 0, e->x, e->y, e->clicks);
+		}
+		return;
+	}
+	if (e->y < g.cy) {
+		int tx = x;
+		for (int c = 0; c < CAT_COUNT; c++) {
+			int tw = set_tab_w(c);
+			if (e->x >= tx && e->x < tx + tw) {
+				set_tab = c;
+				set_scroll = 0;
+			}
+			tx += tw;
+		}
+		return;
+	}
+	app.focus = FOCUS_WORKSPACE;
+	int ry = g.cy + PX(16) - set_scroll + PX(34);
+	for (int i = 0; i < ST_COUNT; i++) {
+		if (st_cat[i] != set_tab)
+			continue;
+		if (e->y >= ry && e->y < ry + set_row_h()) {
+			int ly = ry + font_m[FONT_UI_BOLD].line + PX(2) + font_m[FONT_UI].line + PX(6);
+			if (e->y >= ly - PX(4) && e->y < ly + font_m[FONT_UI].line + PX(6)) {
+				char val[512], btn[64];
+				int checked;
+				st_value(i, val, sizeof val, btn, sizeof btn, &checked);
+				int cx = ctl_x(&g);
+				int vx_end = cx + VX_MIN(font_width(FONT_UI, val, strlen(val)), g.cw / 2 + PX(160));
+				if (checked >= 0 ? e->x < cx + PX(60) : e->x >= cx)
+					set_click(i, e->x, &g, vx_end);
+			}
+			set_hit = i;
+			return;
+		}
+		ry += set_row_h();
+	}
 }

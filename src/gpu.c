@@ -68,6 +68,17 @@ static struct {
 	const u8 *atlas_cpu;
 	int dx0, dy0, dx1, dy1; /* dirty rect, empty when dx0 >= dx1 */
 
+	/* background image (binding 1) */
+	VkImage bg;
+	VkDeviceMemory bg_mem;
+	VkImageView bg_view;
+	VkSampler bg_samp;
+	VkBuffer bg_stage;
+	VkDeviceMemory bg_stage_mem;
+	u32 bg_w, bg_h;
+	bool bg_pending; /* staged, not yet copied */
+	float bg_pc[4];
+
 	Frame fr[FRAMES];
 	u32 fi;
 	bool need_recreate;
@@ -282,19 +293,23 @@ static VkShaderModule shader(const u32 *code, size_t size)
 	return m;
 }
 
+void gpu_set_background(const u8 *rgba, int w, int h);
+
 static void make_pipeline(void)
 {
-	VkDescriptorSetLayoutBinding b = {0};
-	b.binding = 0;
-	b.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-	b.descriptorCount = 1;
-	b.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+	VkDescriptorSetLayoutBinding b[2] = {{0}, {0}};
+	for (u32 i = 0; i < 2; i++) {
+		b[i].binding = i;
+		b[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		b[i].descriptorCount = 1;
+		b[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+	}
 	VkDescriptorSetLayoutCreateInfo dli = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-	dli.bindingCount = 1;
-	dli.pBindings = &b;
+	dli.bindingCount = 2;
+	dli.pBindings = b;
 	VK(vkCreateDescriptorSetLayout(G.dev, &dli, NULL, &G.dsl));
 
-	VkPushConstantRange pcr = {VK_SHADER_STAGE_VERTEX_BIT, 0, 8};
+	VkPushConstantRange pcr = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32};
 	VkPipelineLayoutCreateInfo pli = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
 	pli.setLayoutCount = 1;
 	pli.pSetLayouts = &G.dsl;
@@ -366,8 +381,10 @@ static void make_pipeline(void)
 	sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
 	sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
 	VK(vkCreateSampler(G.dev, &sci, NULL, &G.samp));
+	sci.magFilter = sci.minFilter = VK_FILTER_LINEAR; /* the background is scaled */
+	VK(vkCreateSampler(G.dev, &sci, NULL, &G.bg_samp));
 
-	VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
+	VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2};
 	VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
 	dpi.maxSets = 1;
 	dpi.poolSizeCount = 1;
@@ -547,6 +564,10 @@ bool gpu_init(SDL_Window *win, int w, int h)
 	make_render_pass();
 	make_pipeline();
 	make_atlas();
+	{
+		const u8 none[4] = {0, 0, 0, 0};
+		gpu_set_background(none, 1, 1); /* binding 1 always has an image */
+	}
 	make_frames();
 	make_target();
 	return true;
@@ -573,6 +594,12 @@ void gpu_shutdown(void)
 	vkDestroyImage(G.dev, G.atlas, NULL);
 	vkFreeMemory(G.dev, G.atlas_mem, NULL);
 	vkDestroySampler(G.dev, G.samp, NULL);
+	vkDestroyImageView(G.dev, G.bg_view, NULL);
+	vkDestroyImage(G.dev, G.bg, NULL);
+	vkFreeMemory(G.dev, G.bg_mem, NULL);
+	vkDestroyBuffer(G.dev, G.bg_stage, NULL);
+	vkFreeMemory(G.dev, G.bg_stage_mem, NULL);
+	vkDestroySampler(G.dev, G.bg_samp, NULL);
 	vkDestroyDescriptorPool(G.dev, G.dpool, NULL);
 	vkDestroyPipeline(G.dev, G.pipe, NULL);
 	vkDestroyPipelineLayout(G.dev, G.pl, NULL);
@@ -667,6 +694,65 @@ static void upload_atlas(VkCommandBuffer c)
 	G.dx0 = G.dx1 = 0;
 }
 
+void gpu_set_background(const u8 *rgba, int w, int h)
+{
+	static const u8 none[4] = {0, 0, 0, 0};
+	if (!rgba || w <= 0 || h <= 0) {
+		rgba = none;
+		w = h = 1;
+	}
+	vkDeviceWaitIdle(G.dev); /* frames in flight use the old image */
+	if (G.bg) {
+		vkDestroyImageView(G.dev, G.bg_view, NULL);
+		vkDestroyImage(G.dev, G.bg, NULL);
+		vkFreeMemory(G.dev, G.bg_mem, NULL);
+	}
+	if (G.bg_stage) {
+		vkDestroyBuffer(G.dev, G.bg_stage, NULL);
+		vkFreeMemory(G.dev, G.bg_stage_mem, NULL);
+	}
+	make_image((u32)w, (u32)h, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+	           &G.bg, &G.bg_mem, &G.bg_view);
+	void *map;
+	make_buffer((VkDeviceSize)w * h * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &G.bg_stage, &G.bg_stage_mem, &map);
+	memcpy(map, rgba, (size_t)w * h * 4);
+	G.bg_w = (u32)w;
+	G.bg_h = (u32)h;
+	G.bg_pending = true;
+	VkDescriptorImageInfo ii = {G.bg_samp, G.bg_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+	VkWriteDescriptorSet wr = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+	wr.dstSet = G.ds;
+	wr.dstBinding = 1;
+	wr.descriptorCount = 1;
+	wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	wr.pImageInfo = &ii;
+	vkUpdateDescriptorSets(G.dev, 1, &wr, 0, NULL);
+}
+
+void gpu_background_place(float x, float y, float w, float h)
+{
+	G.bg_pc[0] = x;
+	G.bg_pc[1] = y;
+	G.bg_pc[2] = w > 0 ? 1.0f / w : 0.0f;
+	G.bg_pc[3] = h > 0 ? 1.0f / h : 0.0f;
+}
+
+static void upload_background(VkCommandBuffer c)
+{
+	if (!G.bg_pending)
+		return;
+	barrier(c, G.bg, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+	        VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+	VkBufferImageCopy r = {0};
+	r.imageSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+	r.imageExtent = (VkExtent3D){G.bg_w, G.bg_h, 1};
+	vkCmdCopyBufferToImage(c, G.bg_stage, G.bg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+	barrier(c, G.bg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+	G.bg_pending = false;
+}
+
 bool gpu_frame(const Quad *q, u32 n, u32 clear)
 {
 	if (G.need_recreate || G.nimg == 0) {
@@ -699,6 +785,7 @@ bool gpu_frame(const Quad *q, u32 n, u32 clear)
 	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 	VK(vkBeginCommandBuffer(c, &bi));
 	upload_atlas(c);
+	upload_background(c);
 
 	VkClearValue cv;
 	cv.color.float32[0] = (float)((clear >> 24) & 255) / 255.0f;
@@ -719,8 +806,8 @@ bool gpu_frame(const Quad *q, u32 n, u32 clear)
 		vkCmdSetScissor(c, 0, 1, &sc);
 		vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, G.pipe);
 		vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, G.pl, 0, 1, &G.ds, 0, NULL);
-		float pc[2] = {2.0f / (float)G.w, 2.0f / (float)G.h};
-		vkCmdPushConstants(c, G.pl, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof pc, pc);
+		float pc[8] = {2.0f / (float)G.w, 2.0f / (float)G.h, 0, 0, G.bg_pc[0], G.bg_pc[1], G.bg_pc[2], G.bg_pc[3]};
+		vkCmdPushConstants(c, G.pl, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
 		VkDeviceSize off = 0;
 		vkCmdBindVertexBuffers(c, 0, 1, &f->inst, &off);
 		vkCmdDraw(c, 6, n, 0, 0);

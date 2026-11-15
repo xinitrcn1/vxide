@@ -74,6 +74,9 @@ Lsp *lsp_start(const char *root, char *const argv[]);
 /* Same, with settings (a JSON object) sent as initializationOptions and
  * returned for every workspace/configuration item. */
 Lsp *lsp_start_ex(const char *root, char *const argv[], const char *settings);
+/* Connect to a server listening on TCP (Godot's editor serves GDScript on
+ * 127.0.0.1:6005); NULL when nothing listens. Stopping only disconnects. */
+Lsp *lsp_connect(const char *root, const char *host, int port, const char *settings);
 void lsp_stop(Lsp *l); /* shutdown + exit, then kills after a grace period */
 int lsp_fd(Lsp *l);    /* readable fd for poll(); -1 when dead */
 bool lsp_ready(Lsp *l);

@@ -4,6 +4,8 @@
 #include "ui.h"
 #include "syntax.h"
 #include "binfile.h"
+#include "imgload.h"
+#include "gpu.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -91,10 +93,26 @@ static int lsv_for(const char *id)
 		return LSV_CLANGD;
 	if (!strcmp(id, "rust"))
 		return LSV_RUST;
+	if (!strcmp(id, "qml"))
+		return LSV_QML;
+	if (!strcmp(id, "gdscript"))
+		return LSV_GODOT;
 	return -1;
 }
 
-const char *lsv_name(int sv) { return sv == LSV_RUST ? "rust-analyzer" : "clangd"; }
+const char *lsv_name(int sv)
+{
+	static const char *const n[LSV_COUNT] = {"clangd", "rust-analyzer", "qmlls", "Godot"};
+	return sv >= 0 && sv < LSV_COUNT ? n[sv] : "?";
+}
+
+/* Godot's server lives in its editor: try again soon (after a headless
+ * server was started, or while GDScript files wait for the editor). */
+void lsp_retry_soon(int sv)
+{
+	app.lsps_failed[sv] = false;
+	app.lsps_retry_ns[sv] = vx_now_ns() + 3000000000ull;
+}
 
 Lsp *doc_lsp(u32 d)
 {
@@ -129,10 +147,41 @@ static void lsv_start(int sv)
 		char *argv[] = {(char *)(cmd ? cmd : "clangd"), "--log=error", "--background-index",
 		                "--background-index-priority=low", NULL};
 		app.lsps[sv] = lsp_start(app.root, argv);
-	} else {
+	} else if (sv == LSV_RUST) {
 		const char *cmd = getenv("VXIDE_RUST_ANALYZER");
 		char *argv[] = {(char *)(cmd ? cmd : "rust-analyzer"), NULL};
 		app.lsps[sv] = lsp_start_ex(app.root, argv, k_rust_settings);
+	} else if (sv == LSV_QML) {
+		/* qmlls resolves imports through the CMake build folder, as with the
+		 * Qt extension's qt-qml.qmlls.useQmlImportPathEnvVar/build dir */
+		const char *q = qmlls_path();
+		if (q) {
+			/* --no-cmake-calls: qmlls would otherwise rebuild the project with
+			 * CMake when C++ files change (disk churn, like a cargo build) */
+			char *argv[] = {(char *)q, "--no-cmake-calls", NULL, NULL, NULL};
+			if (qt_build_dir()) {
+				argv[2] = "-b";
+				argv[3] = (char *)qt_build_dir();
+			}
+			app.lsps[sv] = lsp_start(app.root, argv);
+		}
+	} else if (sv == LSV_GODOT) {
+		if (app.now && app.now < app.lsps_retry_ns[sv])
+			return;
+		const char *dir = godot_dir();
+		app.lsps[sv] = lsp_connect(dir ? dir : app.root, "127.0.0.1", godot_lsp_port(), NULL);
+		if (!app.lsps[sv]) {
+			/* the editor is not running yet: godot-tools keeps trying */
+			app.lsps_failed[sv] = true;
+			app.lsps_retry_ns[sv] = vx_now_ns() + 10000000000ull;
+			static bool told;
+			if (!told) {
+				told = true;
+				ui_status("GDScript: no Godot editor on port %d (Godot Tools: Open Workspace with Godot Editor)",
+				          godot_lsp_port());
+			}
+			return;
+		}
 	}
 	if (!app.lsps[sv]) {
 		app.lsps_failed[sv] = true; /* not installed: don't retry on every open */
@@ -246,6 +295,7 @@ u32 doc_new_untitled(void)
 	D->rel[d] = vx_strdup(name);
 	D->lang[d] = LANG_NONE;
 	D->bin[d] = 0;
+	D->man[d] = 0;
 	D->untitled[d] = 1;
 	D->refs[d] = 0;
 	D->lstate_ok[d] = 0;
@@ -274,6 +324,7 @@ void doc_release(u32 d)
 	if (D->bin[d])
 		binview_doc_released(d);
 	D->bin[d] = 0;
+	D->man[d] = 0;
 	text_free(&D->text[d]);
 	free(D->path[d]);
 	free(D->rel[d]);
@@ -415,8 +466,20 @@ void doc_replace(u32 d, u32 pos, u32 del, const char *ins, u32 nins, u32 group)
 
 /* ---- views, tabs ---------------------------------------------------------- */
 
+bool ui_workspace(void) { return app.side_view == SIDE_MAN || app.side_view == SIDE_SETTINGS; }
+
+void workspace_area(int *x, int *y, int *w, int *h)
+{
+	*x = 0;
+	*y = app.top_h;
+	*w = app.w;
+	*h = (app.panel_visible ? app.panel_y : app.h - app.status_h) - app.top_h;
+}
+
 View *active_view(void)
 {
+	if (app.side_view == SIDE_MAN)
+		return man_active_view(); /* the page shown in the Manpages workspace */
 	Group *g = &app.groups[app.active_group];
 	return g->nt ? g->tab[g->active] : NULL;
 }
@@ -516,6 +579,8 @@ void show_doc_public(u32 d)
 
 static u32 show_doc(u32 d, bool preview)
 {
+	if (ui_workspace())
+		app.side_view = SIDE_EXPLORER; /* opening a file leaves Manpages / Settings */
 	Group *g = &app.groups[app.active_group];
 	for (u32 t = 0; t < g->nt; t++)
 		if (g->tab[t]->doc == d && g->tab[t]->diff_left == UINT32_MAX) {
@@ -764,6 +829,9 @@ static const Binding bindings[] = {
     {C | A, SDLK_S, W_EDITOR, CMD_GIT_STAGE_RANGES, 1},
     {C, SDLK_N, W_EDITOR, CMD_GIT_UNSTAGE_RANGES, 1},
     {C, SDLK_R, W_EDITOR, CMD_GIT_REVERT_RANGES, 1},
+    {0, SDLK_F5, W_ANY, CMD_GODOT_RUN, 0},
+    {S, SDLK_F5, W_ANY, CMD_GODOT_STOP, 0},
+    {0, SDLK_F6, W_ANY, CMD_GODOT_RUN_SCENE, 0},
     {A, SDLK_F5, W_EDITOR, CMD_DIFF_NEXT_CHANGE, 0},
     {S | A, SDLK_F5, W_EDITOR, CMD_DIFF_PREV_CHANGE, 0},
     {S, SDLK_F12, W_EDITOR, CMD_GOTO_REFERENCES, 0},
@@ -801,6 +869,19 @@ static const char *cmd_titles[CMD_COUNT] = {
     [CMD_VIEW_SEARCH] = "View: Show Search",
     [CMD_VIEW_SCM] = "View: Show Source Control",
     [CMD_VIEW_SETTINGS] = "Preferences: Open Settings",
+    [CMD_TOGGLE_VIM] = "Preferences: Toggle Vim Keybindings",
+    [CMD_VIEW_MAN] = "View: Show Manpages",
+    [CMD_OPEN_MANPAGE] = "Open Manpage",
+    [CMD_SET_BACKGROUND] = "Preferences: Set Editor Background Image...",
+    [CMD_CLEAR_BACKGROUND] = "Preferences: Clear Editor Background Image",
+    [CMD_QT_DESIGNER] = "Qt: Open in Qt Widgets Designer",
+    [CMD_QT_LINGUIST] = "Qt: Open in Qt Linguist",
+    [CMD_QT_PREVIEW_QML] = "Qt: Preview QML File",
+    [CMD_GODOT_EDITOR] = "Godot Tools: Open Workspace with Godot Editor",
+    [CMD_GODOT_RUN] = "Godot Tools: Run Project",
+    [CMD_GODOT_RUN_SCENE] = "Godot Tools: Run Current Scene",
+    [CMD_GODOT_STOP] = "Godot Tools: Stop",
+    [CMD_GODOT_HEADLESS_LSP] = "Godot Tools: Start Headless Language Server",
     [CMD_VIEW_PROBLEMS] = "View: Focus Problems",
     [CMD_VIEW_OUTPUT] = "View: Toggle Output",
     [CMD_SPLIT] = "View: Split Editor",
@@ -1232,6 +1313,18 @@ static void quick_accept(void)
 		quick_close();
 		gitui_prompt_accept(pk, s);
 		free(s);
+		return;
+	}
+	if (kind == QUICK_PROMPT && app.quick_prompt_kind == 60) { /* background image */
+		char *s = vx_strndup(in->b ? in->b : "", in->n);
+		quick_close();
+		if (*s && s[0] != '/')
+			snprintf(app.bg_path, sizeof app.bg_path, "%s/%s", app.root, s);
+		else
+			snprintf(app.bg_path, sizeof app.bg_path, "%s", s);
+		free(s);
+		background_apply();
+		settings_save();
 		return;
 	}
 	if (kind == QUICK_PROMPT) {
@@ -1772,11 +1865,48 @@ void run_command(int cmd)
 		app.focus = app.panel_visible ? FOCUS_PANEL : FOCUS_EDITOR;
 		ui_layout();
 		break;
+	case CMD_QT_DESIGNER:
+	case CMD_QT_LINGUIST:
+	case CMD_QT_PREVIEW_QML:
+	case CMD_GODOT_EDITOR:
+	case CMD_GODOT_RUN:
+	case CMD_GODOT_RUN_SCENE:
+	case CMD_GODOT_STOP:
+	case CMD_GODOT_HEADLESS_LSP:
+		projtools_command(cmd);
+		break;
+	case CMD_VIEW_MAN:
+		app.side_view = SIDE_MAN;
+		app.focus = FOCUS_MAN_INPUT;
+		break;
+	case CMD_SET_BACKGROUND:
+		app.quick = QUICK_PROMPT;
+		app.quick_prompt_kind = 60;
+		snprintf(app.quick_title, sizeof app.quick_title, "Editor background image (PNG or JPEG path)");
+		input_set(&app.quick_in, app.bg_path, strlen(app.bg_path));
+		app.focus = FOCUS_QUICK;
+		break;
+	case CMD_CLEAR_BACKGROUND:
+		app.bg_path[0] = 0;
+		background_apply();
+		settings_save();
+		break;
+	case CMD_OPEN_MANPAGE:
+		if (v && v->diff_left == UINT32_MAX && !app.docs.bin[v->doc]) {
+			u32 off = app.ctx == CTX_EDITOR ? app.ctx_off : v->head[0];
+			app.ctx = CTX_NONE;
+			man_open_at(v, off);
+		}
+		break;
+	case CMD_TOGGLE_VIM:
+		app.vim_on = !app.vim_on;
+		vim_reset();
+		ui_status("Vim keybindings %s", app.vim_on ? "on" : "off");
+		settings_save();
+		break;
 	case CMD_VIEW_SETTINGS:
 		app.side_view = SIDE_SETTINGS;
-		app.side_visible = true;
-		app.focus = FOCUS_SIDEBAR;
-		ui_layout();
+		app.focus = FOCUS_WORKSPACE;
 		break;
 	case CMD_VIEW_EXPLORER:
 	case CMD_VIEW_SEARCH:
@@ -1881,6 +2011,7 @@ void run_command(int cmd)
 	case CMD_TOGGLE_THEME:
 		app.theme = app.theme == THEME_DARK ? THEME_LIGHT : THEME_DARK;
 		ui_status("Color Theme: %s", themes[app.theme].name);
+		settings_save();
 		break;
 	case CMD_THEME_DARK:
 		app.theme = THEME_DARK;
@@ -1945,6 +2076,7 @@ void run_command(int cmd)
 		break;
 	case CMD_GIT_TOGGLE_BLAME:
 		app.blame_on = !app.blame_on;
+		settings_save();
 		break;
 	case CMD_REFRESH_EXPLORER:
 		fs_refresh(&app.tree);
@@ -1986,7 +2118,7 @@ static bool in_rect(int x, int y, int rx, int ry, int rw, int rh)
 static bool focus_is_input(void)
 {
 	return app.focus == FOCUS_QUICK || app.focus == FOCUS_FIND ||
-	       app.focus == FOCUS_SEARCH_INPUT || app.focus == FOCUS_SCM_INPUT;
+	       app.focus == FOCUS_SEARCH_INPUT || app.focus == FOCUS_SCM_INPUT || app.focus == FOCUS_MAN_INPUT;
 }
 
 static int key_mods(int m) { return m & (MOD_CTRL | MOD_SHIFT | MOD_ALT); }
@@ -2004,11 +2136,17 @@ static bool try_bindings(const Event *e)
 		app.chord = false;
 		app.status_until = 0;
 	}
+	if (app.vim_on && !chord && app.focus == FOCUS_EDITOR) {
+		View *v = active_view();
+		if (v && !(app.docs.bin[v->doc] && v->diff_left == UINT32_MAX) && vim_claims_key(e))
+			return false; /* vim's Ctrl+D / Ctrl+U / Ctrl+W ... go to ed_key */
+	}
 	for (size_t i = 0; i < VX_COUNT(bindings); i++) {
 		const Binding *b = &bindings[i];
 		if (b->key != e->key || b->mods != mods || b->chord != chord)
 			continue;
-		if (b->when == W_EDITOR && app.focus != FOCUS_EDITOR)
+		if (b->when == W_EDITOR && app.focus != FOCUS_EDITOR &&
+		    !(app.focus == FOCUS_WORKSPACE && app.side_view == SIDE_MAN))
 			continue;
 		if (b->when == W_NOT_INPUT && focus_is_input())
 			continue;
@@ -2037,8 +2175,7 @@ static void sidebar_event(const Event *e, int x, int y, int w, int h)
 		search_event(e, x, y, w, h);
 	else if (app.side_view == SIDE_SCM)
 		scm_event(e, x, y, w, h);
-	else
-		settings_event(e, x, y, w, h);
+	(void)0;
 }
 
 /* ---- top-level tabs (Project, Git, Search, Settings) -------------------- */
@@ -2050,6 +2187,7 @@ static const struct {
     {SIDE_EXPLORER, ICON_FILES_S, CMD_VIEW_EXPLORER, "Project"},
     {SIDE_SCM, ICON_SCM_S, CMD_VIEW_SCM, "Git"},
     {SIDE_SEARCH, ICON_SEARCH_S, CMD_VIEW_SEARCH, "Search"},
+    {SIDE_MAN, ICON_BOOK_S, CMD_VIEW_MAN, "Manpages"},
     {SIDE_SETTINGS, ICON_GEAR_S, CMD_VIEW_SETTINGS, "Settings"},
 };
 
@@ -2098,6 +2236,13 @@ static int tab_layout(Group *g, u32 want, int *ox, int *oy);
 static void context_click(int mx, int my)
 {
 	app.compl_open = app.hover_open = false;
+	if (ui_workspace() && my >= app.top_h && !(app.panel_visible && my >= app.panel_y)) {
+		int x, y, w, h;
+		workspace_area(&x, &y, &w, &h);
+		if (app.side_view == SIDE_MAN)
+			man_ws_context(mx, my, x, y, w);
+		return;
+	}
 	if (my >= app.h - app.status_h || mx < app.act_w)
 		return;
 	if (app.side_visible && mx < app.side_x + app.side_w) {
@@ -2240,9 +2385,22 @@ void ui_event(const Event *e)
 				return;
 			}
 		}
+		if (app.side_view == SIDE_MAN && !app.quick &&
+		    (app.focus == FOCUS_WORKSPACE || app.focus == FOCUS_MAN_INPUT) && man_ws_key(e))
+			return;
 		if (try_bindings(e))
 			return;
 		switch (app.focus) {
+		case FOCUS_WORKSPACE:
+		case FOCUS_MAN_INPUT: {
+			int x, y, w, h;
+			workspace_area(&x, &y, &w, &h);
+			if (app.side_view == SIDE_MAN)
+				man_ws_event(e, x, y, w, h);
+			else if (app.side_view == SIDE_SETTINGS)
+				settings_ws_event(e, x, y, w, h);
+			return;
+		}
 		case FOCUS_QUICK:
 			quick_key(e);
 			return;
@@ -2301,6 +2459,9 @@ void ui_event(const Event *e)
 		}
 		default: {
 			View *v = active_view();
+			if (v && app.docs.man[v->doc] && (e->key == SDLK_RETURN || e->key == SDLK_KP_ENTER) &&
+			    !key_mods(e->mods) && man_follow(v->doc, v->head[0]))
+				return;
 			if (v)
 				ed_key(v, e);
 			return;
@@ -2311,6 +2472,16 @@ void ui_event(const Event *e)
 		if (app.chord)
 			return;
 		switch (app.focus) {
+		case FOCUS_WORKSPACE:
+		case FOCUS_MAN_INPUT: {
+			int x, y, w, h;
+			workspace_area(&x, &y, &w, &h);
+			if (app.side_view == SIDE_MAN)
+				man_ws_event(e, x, y, w, h);
+			else if (app.side_view == SIDE_SETTINGS)
+				settings_ws_event(e, x, y, w, h);
+			return;
+		}
 		case FOCUS_QUICK:
 			input_text(&app.quick_in, e->text, strlen(e->text));
 			quick_update();
@@ -2352,6 +2523,15 @@ void ui_event(const Event *e)
 	if (e->type == EV_MMOVE) {
 		app.hover_x = mx;
 		app.hover_y = my;
+	}
+	if (e->type == EV_MUP && ui_workspace()) {
+		app.mouse_down = false;
+		app.drag = DRAG_NONE;
+		int x, y, w, h;
+		workspace_area(&x, &y, &w, &h);
+		if (app.side_view == SIDE_MAN)
+			man_ws_event(e, x, y, w, h);
+		return;
 	}
 	if (e->type == EV_MUP) {
 		app.mouse_down = false;
@@ -2439,7 +2619,7 @@ void ui_event(const Event *e)
 			int i = top_tab_hit(mx);
 			if (i >= 0) {
 				/* the active tab hides the side bar, like the activity bar did */
-				if (app.side_visible && app.side_view == top_tabs[i].view)
+				if (app.side_visible && app.side_view == top_tabs[i].view && !ui_workspace())
 					run_command(CMD_TOGGLE_SIDEBAR);
 				else
 					run_command(top_tabs[i].cmd);
@@ -2447,10 +2627,22 @@ void ui_event(const Event *e)
 		}
 		return;
 	}
+	if (ui_workspace() && !(app.panel_visible && my >= app.panel_y)) {
+		int x, y, w, h;
+		workspace_area(&x, &y, &w, &h);
+		if (e->type == EV_MDOWN && app.focus != FOCUS_MAN_INPUT)
+			app.focus = FOCUS_WORKSPACE;
+		if (app.side_view == SIDE_MAN)
+			man_ws_event(e, x, y, w, h);
+		else
+			settings_ws_event(e, x, y, w, h);
+		return;
+	}
 	if (app.side_visible && mx < app.side_x + app.side_w) {
 		int x, y, w, h;
 		sidebar_area(&x, &y, &w, &h);
-		if (e->type == EV_MDOWN && app.focus != FOCUS_SEARCH_INPUT && app.focus != FOCUS_SCM_INPUT)
+		if (e->type == EV_MDOWN && app.focus != FOCUS_SEARCH_INPUT && app.focus != FOCUS_SCM_INPUT &&
+		    app.focus != FOCUS_MAN_INPUT)
 			app.focus = FOCUS_SIDEBAR;
 		sidebar_event(e, x, y, w, h);
 		return;
@@ -2479,6 +2671,13 @@ void ui_event(const Event *e)
 				app.focus = FOCUS_EDITOR;
 		}
 		View *v = g->tab[g->active];
+		if (e->type == EV_MDOWN && e->button == 1 && app.docs.man[v->doc] && v->diff_left == UINT32_MAX &&
+		    !key_mods(e->mods)) {
+			/* man pages: a click on name(sec) opens it, like info */
+			u32 off = ed_offset_at(v, e->x, e->y, g->x, g->y + group_head_h(g));
+			if (man_follow(v->doc, off))
+				return;
+		}
 		if (e->type == EV_MDOWN && e->button == 1)
 			app.drag = DRAG_EDITOR;
 		ed_mouse(v, e, g->x, g->y + group_head_h(g), g->w, g->h - group_head_h(g));
@@ -2914,8 +3113,7 @@ static void draw_sidebar(void)
 		search_draw(x, y, w - PX(1), h);
 	else if (app.side_view == SIDE_SCM)
 		scm_draw(x, y, w - PX(1), h);
-	else
-		settings_draw(x, y, w - PX(1), h);
+	(void)0;
 	draw_noclip();
 	if (app.drag == DRAG_SIDE || (abs(app.hover_x - (x + w)) <= PX(2) && app.hover_y >= y && app.hover_y < y + h))
 		draw_rect(x + w - PX(2), y, PX(4), h, COL(C_SASH_HOVER));
@@ -3056,6 +3254,13 @@ static void draw_status(void)
 		if (in_rect(app.hover_x, app.hover_y, x0, y, x - x0, app.status_h))
 			draw_rect(x0, y, x - x0, app.status_h, COL(C_STATUS_HOVER_BG));
 	}
+	if (app.vim_on) {
+		/* the vim mode first; a status message follows it */
+		const char *vm = vim_mode_label();
+		if (vm && *vm)
+			x = draw_text(FONT_UI, x + PX(16), y + (app.status_h - font_m[FONT_UI].line) / 2, vm, strlen(vm),
+			              COL(C_STATUS_FG));
+	}
 	if (app.status_msg[0] && vx_now_ns() < app.status_until) {
 		x += PX(8);
 		draw_text_fit(FONT_UI, x, y + (app.status_h - font_m[FONT_UI].line) / 2, app.status_msg,
@@ -3082,7 +3287,7 @@ static void draw_status(void)
 			rx = status_item(rx, y, bs, strlen(bs), true);
 			return;
 		}
-		const char *ln = syn_lang_name(D->lang[v->doc]);
+		const char *ln = D->man[v->doc] ? "Manual Page" : syn_lang_name(D->lang[v->doc]);
 		rx = status_item(rx, y, ln, strlen(ln), true);
 		if (app.overtype)
 			rx = status_item(rx, y, "OVR", 3, true);
@@ -3121,17 +3326,75 @@ static void draw_status(void)
 
 /* ---- frame ----------------------------------------------------------- */
 
+/* ---- editor background image ------------------------------------------------ */
+
+void background_apply(void)
+{
+	app.bg_iw = app.bg_ih = 0;
+	if (!app.bg_path[0]) {
+		gpu_set_background(NULL, 0, 0);
+		return;
+	}
+	int w, h;
+	u8 *px = img_load(app.bg_path, &w, &h);
+	if (!px) {
+		ui_status("Cannot load background image %s (PNG or JPEG)", app.bg_path);
+		gpu_set_background(NULL, 0, 0);
+		return;
+	}
+	gpu_set_background(px, w, h);
+	free(px);
+	app.bg_iw = w;
+	app.bg_ih = h;
+}
+
+/* The picture covers the editor area (all groups), centred and cropped,
+ * like the background extensions do it. */
+static void background_place(void)
+{
+	if (!app.bg_iw)
+		return;
+	float x = (float)app.ed_x, y = (float)app.ed_y, w = (float)app.ed_w, h = (float)app.ed_h;
+	float s = VX_MAX(w / (float)app.bg_iw, h / (float)app.bg_ih);
+	float dw = (float)app.bg_iw * s, dh = (float)app.bg_ih * s;
+	gpu_background_place(x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+}
+
+/* Drawn over the text, see-through, so the code stays readable at any
+ * opacity (VSCodium's background extensions do the same). */
+static void background_overlay(Group *g)
+{
+	if (!app.bg_iw || app.bg_opacity <= 0 || !g->nt)
+		return;
+	int hh = group_head_h(g);
+	u32 a = (u32)VX_CLAMP(app.bg_opacity * 255 / 100, 0, 255);
+	draw_clip(g->x, g->y + hh, g->w, g->h - hh);
+	push_image_quad(g->x, g->y + hh, g->w, g->h - hh, a);
+	draw_noclip();
+}
+
 void ui_draw(void)
 {
 	draw_begin(app.w, app.h);
-	for (u32 gi = 0; gi < app.ngroups; gi++) {
-		Group *g = &app.groups[gi];
-		draw_group(g, gi);
-		if (gi > 0)
-			draw_rect(g->x - PX(1) + 1, g->y, PX(1), g->h, COL(C_TABS_BORDER));
+	background_place();
+	if (ui_workspace()) {
+		int x, y, w, h;
+		workspace_area(&x, &y, &w, &h);
+		if (app.side_view == SIDE_MAN)
+			man_ws_draw(x, y, w, h);
+		else
+			settings_ws_draw(x, y, w, h);
+	} else {
+		for (u32 gi = 0; gi < app.ngroups; gi++) {
+			Group *g = &app.groups[gi];
+			draw_group(g, gi);
+			background_overlay(g);
+			if (gi > 0)
+				draw_rect(g->x - PX(1) + 1, g->y, PX(1), g->h, COL(C_TABS_BORDER));
+		}
+		if (app.side_visible)
+			draw_sidebar();
 	}
-	if (app.side_visible)
-		draw_sidebar();
 	draw_top_tabs();
 	if (app.panel_visible)
 		draw_panel();
@@ -3270,6 +3533,16 @@ static void lsp_tick_one(int sv)
 		case LSP_EV_EXIT:
 			ui_log("[lsp] %s exited", lsv_name(sv));
 			app.lsps_ready[sv] = false;
+			if (sv == LSV_GODOT) {
+				/* the editor closed: hang up, reopen documents on reconnect */
+				lsp_stop(L);
+				app.lsps[sv] = NULL;
+				for (u32 d = 0; d < app.docs.n; d++)
+					if (app.docs.lsp_sv[d] == sv)
+						app.docs.lsp_open[d] = false;
+				app.lsps_retry_ns[sv] = vx_now_ns() + 5000000000ull;
+				return;
+			}
 			break;
 		default:
 			break;
@@ -3299,6 +3572,21 @@ static void lsp_tick(void)
 {
 	for (int sv = 0; sv < LSV_COUNT; sv++)
 		lsp_tick_one(sv);
+	/* Godot: the editor may come and go; reconnect while GDScript is open */
+	int sv = LSV_GODOT;
+	Docs *D = &app.docs;
+	bool want = false;
+	for (u32 d = 0; d < D->n; d++)
+		if (D->path[d] && D->lsp_sv[d] == sv && !D->lsp_open[d])
+			want = true;
+	if (want && !app.lsps[sv] && app.now >= app.lsps_retry_ns[sv] && !getenv("VXIDE_NO_LSP")) {
+		app.lsps_failed[sv] = false;
+		lsv_start(sv);
+		if (app.lsps[sv])
+			for (u32 d = 0; d < D->n; d++)
+				if (D->path[d] && D->lsp_sv[d] == sv)
+					lsp_sync_open(d);
+	}
 }
 
 /* Repo-relative path of a document inside the work tree, or NULL. */
@@ -3535,6 +3823,8 @@ static void watch_tick(void)
 void ui_tick(void)
 {
 	app.now = vx_now_ns();
+	projtools_tick();
+	man_tick();
 	lsp_tick();
 	git_tick();
 	{
@@ -3590,8 +3880,10 @@ u64 ui_wait_hint_ms(void)
 	for (int sv = 0; sv < LSV_COUNT; sv++)
 		if (app.lsps[sv] && !app.lsps_ready[sv])
 			return 30;
-	if (binview_busy())
+	if (binview_busy() || projtools_busy())
 		return 20;
+	if (man_wait_hint() < 250)
+		return man_wait_hint();
 	return 250;
 }
 
@@ -3646,6 +3938,18 @@ bool ui_init(const char *root, int w, int h, int scale, bool headless)
 		app.blame = blame_start(git_workdir(app.git));
 	}
 	app.tree_scan_ns = vx_now_ns();
+	app.bg_opacity = 12;
+	settings_load(); /* not in headless runs: tests must not see a user's settings */
+	if (th && strcmp(th, "light") == 0)
+		app.theme = THEME_LIGHT;
+	if (getenv("VXIDE_NO_BLAME"))
+		app.blame_on = false;
+	if (getenv("VXIDE_BG"))
+		snprintf(app.bg_path, sizeof app.bg_path, "%s", getenv("VXIDE_BG"));
+	if (getenv("VXIDE_BG_OPACITY"))
+		app.bg_opacity = VX_CLAMP(atoi(getenv("VXIDE_BG_OPACITY")), 0, 100);
+	background_apply();
+	projtools_init();
 	if (!getenv("VXIDE_NO_LSP"))
 		restart_lsp();
 	ui_layout();
@@ -3655,6 +3959,7 @@ bool ui_init(const char *root, int w, int h, int scale, bool headless)
 
 void ui_shutdown(void)
 {
+	projtools_shutdown();
 	/* tabs first: closing a document still talks to the language server */
 	for (u32 gi = 0; gi < app.ngroups; gi++)
 		while (app.groups[gi].nt)

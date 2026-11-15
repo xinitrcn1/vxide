@@ -1,5 +1,6 @@
-/* Syntax highlighting lexers: C23, C++26, Rust, x86 assembly (AT&T and Intel), Lisp,
- * shell, Perl, troff and Markdown (which embeds the others in fences).
+/* Syntax highlighting lexers: C23, C++26, Rust, C#, x86 assembly (AT&T and Intel), Lisp,
+ * shell, Perl, troff, QML, qmake, GDScript, Godot resources, XML and Markdown (which
+ * embeds the others in fences).
  *
  * Each lexer is a pure function of (state at line start, line bytes) that
  * writes token spans and returns the state at the end of the line. Keyword
@@ -4967,6 +4968,9 @@ static int md_fence_lang(const char *w, u32 n)
 	    {"toml", LANG_TOML},
 	    {"cpp", LANG_CPP},      {"c++", LANG_CPP},       {"cxx", LANG_CPP},       {"cc", LANG_CPP},
 	    {"hpp", LANG_CPP},      {"rust", LANG_RUST},     {"rs", LANG_RUST},
+	    {"cs", LANG_CSHARP},    {"csharp", LANG_CSHARP}, {"c#", LANG_CSHARP},    {"qml", LANG_QML},
+	    {"gdscript", LANG_GDSCRIPT}, {"gd", LANG_GDSCRIPT}, {"xml", LANG_XML},  {"svg", LANG_XML},
+	    {"xaml", LANG_XML},    {"qmake", LANG_QMAKE},  {"tscn", LANG_GODOT_RES}, {"tres", LANG_GODOT_RES},
 	};
 	for (size_t i = 0; i < VX_COUNT(map); i++)
 		if (!strcmp(b, map[i].name))
@@ -7393,6 +7397,2184 @@ static u32 lex_rust(u32 state, const char *s, u32 n, SynSpans *o)
 	return rs_state(RS_CODE, 0, attr, adepth, use);
 }
 
+/* ================================================================== */
+/* XML                                                                 */
+/*
+ * Per VSCodium's xml.tmLanguage under Dark+/Light+:
+ *   entity.name.tag (and its namespace prefix)        -> TK_TAG
+ *   punctuation.definition.tag (< </ > /> <? ?> <!)  -> TK_TAGPUNCT
+ *   entity.other.attribute-name                      -> TK_ATTR
+ *   string.quoted.double/single.xml and string.unquoted.cdata.xml (Light+
+ *   shows them #0000FF, like YAML plain scalars)     -> TK_UNQUOTED
+ *   constant.character.entity (&amp; &#10; %pe;)     -> TK_LANGCONST
+ *   invalid.illegal.bad-ampersand                     -> TK_INVALID
+ *   keyword.other.doctype / .entity (DOCTYPE ENTITY PUBLIC ...) -> TK_STORAGE
+ *   variable.language.documentroot (<!DOCTYPE html>) -> TK_LANGCONST
+ *   comments                                         -> TK_COMMENT
+ * The ':' of a prefixed name has no colour. The same scanner colours the
+ * XML of C# /// comments (text as comment, values as strings).
+ *
+ * State: bits 0-2 mode (0 text, 1 comment, 2 CDATA, 3 inside a tag,
+ * 4 "value", 5 'value', 6 DOCTYPE), bit 3 the tag is a processing
+ * instruction, bit 4 inside the DOCTYPE internal subset. */
+
+enum { XM_TEXT, XM_COMMENT, XM_CDATA, XM_TAG, XM_DQ, XM_SQ, XM_DOCTYPE };
+#define XM_PI 8u
+#define XM_SUBSET 16u
+
+/* Thread-local depth of nested lexers (string interpolation holes). */
+static _Thread_local int syn_nest;
+
+static inline bool xml_name(u8 c)
+{
+	return is_alpha(c) || is_digit(c) || c == '_' || c == '-' || c == '.' || c == ':' || c >= 0x80;
+}
+
+/* First occurrence of mk at or after i, or UINT32_MAX. */
+static u32 str_find(const char *s, u32 n, u32 i, const char *mk)
+{
+	u32 ml = (u32)strlen(mk);
+	for (; i + ml <= n; i++)
+		if (s[i] == mk[0] && memcmp(s + i, mk, ml) == 0)
+			return i;
+	return UINT32_MAX;
+}
+
+/* Entity reference at s[i] ('&' or '%'): &name; &#10; &#x1F; -> its end or i. */
+static u32 xml_entity(const char *s, u32 n, u32 i)
+{
+	u32 j = i + 1;
+	if (j < n && s[j] == '#' && s[i] == '&') {
+		j++;
+		if (j < n && (s[j] == 'x' || s[j] == 'X')) {
+			j++;
+			while (j < n && is_xdigit((u8)s[j]))
+				j++;
+		} else {
+			while (j < n && is_digit((u8)s[j]))
+				j++;
+		}
+	} else {
+		while (j < n && xml_name((u8)s[j]))
+			j++;
+	}
+	return j > i + 1 && j < n && s[j] == ';' ? j + 1 : i;
+}
+
+/* A (prefixed) name from i: the parts in cls, the ':' plain. */
+static u32 xml_qname(const char *s, u32 n, u32 i, u32 cls, SynSpans *o)
+{
+	u32 e = i;
+	while (e < n && xml_name((u8)s[e]))
+		e++;
+	u32 a = i;
+	for (u32 k = i; k < e; k++)
+		if (s[k] == ':') {
+			emit(o, a, k - a, cls);
+			a = k + 1;
+		}
+	emit(o, a, e - a, cls);
+	return e;
+}
+
+/* Quoted value body from i up to the quote q (entities coloured). */
+static u32 xml_value(const char *s, u32 n, u32 i, u8 q, u32 cls, bool *closed, SynSpans *o)
+{
+	u32 run = i, j = i;
+	*closed = false;
+	while (j < n) {
+		if ((u8)s[j] == q) {
+			emit(o, run, j + 1 - run, cls);
+			*closed = true;
+			return j + 1;
+		}
+		if (s[j] == '&') {
+			u32 e = xml_entity(s, n, j);
+			if (e > j) {
+				emit(o, run, j - run, cls);
+				emit(o, j, e - j, TK_LANGCONST);
+				j = run = e;
+				continue;
+			}
+		}
+		j++;
+	}
+	emit(o, run, n - run, cls);
+	return n;
+}
+
+static bool xml_dtd_keyword(const char *w, u32 n)
+{
+	static const char *const kws[] = {"DOCTYPE", "ENTITY", "ELEMENT", "ATTLIST", "NOTATION", "PUBLIC", "SYSTEM",
+	                                  "EMPTY", "ANY", "CDATA", "ID", "IDREF", "IDREFS", "NMTOKEN", "NMTOKENS",
+	                                  "NDATA", "#PCDATA", "#REQUIRED", "#IMPLIED", "#FIXED"};
+	for (size_t k = 0; k < VX_COUNT(kws); k++)
+		if (word_is(w, n, kws[k]))
+			return true;
+	return false;
+}
+
+/* Scan XML from i in `state`; returns the state at the end of the line.
+ * doc: C# documentation comment colours. */
+static u32 xml_scan(u32 state, const char *s, u32 n, u32 i, bool doc, SynSpans *o)
+{
+	u32 mode = state & 7u, pi = state & XM_PI, sub = state & XM_SUBSET;
+	u32 text = doc ? TK_COMMENT : TK_TEXT, val = doc ? TK_STRING : TK_UNQUOTED;
+	bool closed;
+	while (i < n) {
+		u8 c = (u8)s[i];
+		switch (mode) {
+		case XM_COMMENT: {
+			u32 e = str_find(s, n, i, "-->");
+			if (e == UINT32_MAX) {
+				emit(o, i, n - i, TK_COMMENT);
+				return XM_COMMENT | sub;
+			}
+			emit(o, i, e + 3 - i, TK_COMMENT);
+			i = e + 3;
+			mode = sub ? XM_DOCTYPE : XM_TEXT;
+			continue;
+		}
+		case XM_CDATA: {
+			u32 e = str_find(s, n, i, "]]>");
+			if (e == UINT32_MAX) {
+				emit(o, i, n - i, val);
+				return XM_CDATA;
+			}
+			emit(o, i, e + 3 - i, val);
+			i = e + 3;
+			mode = XM_TEXT;
+			continue;
+		}
+		case XM_DQ:
+		case XM_SQ:
+			i = xml_value(s, n, i, mode == XM_DQ ? '"' : '\'', val, &closed, o);
+			if (!closed)
+				return mode | pi;
+			mode = XM_TAG;
+			continue;
+		case XM_TAG:
+			if (is_space(c)) {
+				i++;
+			} else if (c == '>') {
+				emit(o, i, 1, TK_TAGPUNCT);
+				i++;
+				mode = XM_TEXT;
+				pi = 0;
+			} else if ((c == '/' || c == '?') && i + 1 < n && s[i + 1] == '>') {
+				emit(o, i, 2, TK_TAGPUNCT);
+				i += 2;
+				mode = XM_TEXT;
+				pi = 0;
+			} else if (c == '"' || c == '\'') {
+				emit(o, i, 1, val);
+				i = xml_value(s, n, i + 1, c, val, &closed, o);
+				if (!closed)
+					return (c == '"' ? XM_DQ : XM_SQ) | pi;
+			} else if (c == '<') {
+				mode = XM_TEXT; /* an unclosed tag: let the text rules see the '<' */
+				pi = 0;
+			} else if (xml_name(c) && c != '-' && c != '.' && !is_digit(c)) {
+				i = xml_qname(s, n, i, TK_ATTR, o);
+			} else {
+				i++;
+			}
+			continue;
+		case XM_DOCTYPE:
+			if (c == '"' || c == '\'') {
+				u32 e = i + 1;
+				while (e < n && (u8)s[e] != c)
+					e++;
+				if (e < n)
+					e++;
+				emit(o, i, e - i, TK_STRING);
+				i = e;
+			} else if (c == '[') {
+				sub = XM_SUBSET;
+				i++;
+			} else if (c == ']') {
+				sub = 0;
+				i++;
+			} else if (c == '>') {
+				emit(o, i, 1, TK_TAGPUNCT);
+				i++;
+				if (!sub)
+					mode = XM_TEXT;
+			} else if (c == '<' && n - i >= 4 && memcmp(s + i, "<!--", 4) == 0) {
+				emit(o, i, 4, TK_COMMENT);
+				i += 4;
+				mode = XM_COMMENT;
+			} else if (c == '<' && i + 1 < n && (s[i + 1] == '!' || s[i + 1] == '?')) {
+				emit(o, i, 2, TK_TAGPUNCT);
+				i += 2;
+			} else if ((c == '&' || c == '%') && xml_entity(s, n, i) > i) {
+				u32 e = xml_entity(s, n, i);
+				emit(o, i, e - i, TK_LANGCONST);
+				i = e;
+			} else if (xml_name(c) || c == '#') {
+				u32 e = i + 1;
+				while (e < n && xml_name((u8)s[e]))
+					e++;
+				if (xml_dtd_keyword(s + i, e - i))
+					emit(o, i, e - i, TK_STORAGE);
+				i = e;
+			} else {
+				i++;
+			}
+			continue;
+		default: /* XM_TEXT */
+			break;
+		}
+		if (c == '<') {
+			if (n - i >= 4 && memcmp(s + i, "<!--", 4) == 0) {
+				emit(o, i, 4, TK_COMMENT);
+				i += 4;
+				mode = XM_COMMENT;
+				continue;
+			}
+			if (n - i >= 9 && memcmp(s + i, "<![CDATA[", 9) == 0) {
+				emit(o, i, 9, val);
+				i += 9;
+				mode = XM_CDATA;
+				continue;
+			}
+			if (i + 2 < n && s[i + 1] == '!' && is_alpha((u8)s[i + 2])) {
+				/* <!DOCTYPE root ...> */
+				emit(o, i, 2, TK_TAGPUNCT);
+				u32 e = i + 2;
+				while (e < n && xml_name((u8)s[e]))
+					e++;
+				emit(o, i + 2, e - i - 2, TK_STORAGE);
+				u32 a = skip_ws(s, n, e), b = a;
+				while (b < n && xml_name((u8)s[b]))
+					b++;
+				emit(o, a, b - a, TK_LANGCONST);
+				i = b;
+				mode = XM_DOCTYPE;
+				sub = 0;
+				continue;
+			}
+			u32 p = i + 1;
+			if (p < n && (s[p] == '/' || s[p] == '?'))
+				p++;
+			if (p < n && (is_alpha((u8)s[p]) || s[p] == '_' || s[p] == ':' || (u8)s[p] >= 0x80)) {
+				emit(o, i, p - i, TK_TAGPUNCT);
+				pi = s[i + 1] == '?' ? XM_PI : 0;
+				i = xml_qname(s, n, p, TK_TAG, o);
+				mode = XM_TAG;
+				continue;
+			}
+			emit(o, i, 1, text);
+			i++;
+			continue;
+		}
+		if (c == '&') {
+			u32 e = xml_entity(s, n, i);
+			if (e > i) {
+				emit(o, i, e - i, TK_LANGCONST);
+				i = e;
+			} else {
+				emit(o, i, 1, doc ? text : TK_INVALID);
+				i++;
+			}
+			continue;
+		}
+		u32 e = i + 1;
+		while (e < n && s[e] != '<' && s[e] != '&')
+			e++;
+		emit(o, i, e - i, text);
+		i = e;
+	}
+	return mode | pi | sub;
+}
+
+static u32 lex_xml(u32 state, const char *s, u32 n, SynSpans *o) { return xml_scan(state, s, n, 0, false, o); }
+
+/* Does the head start like an XML document (BOM, blanks, then <?xml)? */
+static bool xml_head(const char *h, size_t n)
+{
+	if (!h)
+		return false;
+	size_t i = 0;
+	if (n >= 3 && (u8)h[0] == 0xEF && (u8)h[1] == 0xBB && (u8)h[2] == 0xBF)
+		i = 3;
+	while (i < n && (h[i] == ' ' || h[i] == '\t' || h[i] == '\r' || h[i] == '\n'))
+		i++;
+	return n - i >= 5 && memcmp(h + i, "<?xml", 5) == 0;
+}
+
+/* ================================================================== */
+/* C#                                                                  */
+/*
+ * Per VSCodium's csharp.tmLanguage under Dark+/Light+:
+ *   keyword.control.* (if else switch case while do for foreach in break
+ *   continue goto return throw try catch finally yield when lock fixed),
+ *   using (keyword.other.directive.using and the using statement)
+ *                                                       -> TK_CONTROL
+ *   storage.modifier / storage.type (public static readonly partial async
+ *   required file scoped class struct record namespace delegate var get
+ *   set init ...), keyword.type (int string object ...),
+ *   keyword.operator.expression (new typeof nameof default is as await
+ *   with stackalloc), query keywords (from where select ...) and pattern
+ *   combinators (and or not)                            -> TK_STORAGE
+ *   entity.name.type.* (declared types, generic types and their
+ *   arguments, types after new/is/as/typeof, base lists and constraints,
+ *   casts, attributes, namespaces and using directives) -> TK_TYPE
+ *   entity.name.function (declarations and calls)      -> TK_FUNCTION
+ *   variable.other.* and entity.name.variable.* (locals, parameters,
+ *   fields, properties, objects: every other name)     -> TK_VARIABLE
+ *   constant.language, variable.language (this base _) -> TK_LANGCONST
+ *   keyword.other.attribute-specifier (assembly: return:) -> TK_STORAGE
+ *   meta.preprocessor: the directive TK_PREPROC, its symbols TK_VARIABLE,
+ *   #region / #error messages TK_STRING.
+ * Strings: "" with escapes, verbatim @"" ("" escapes), interpolated $""
+ * and $@"" / @$"" ({{ }} escapes; the hole is meta.embedded -- plain --
+ * and lexed as C#, a :format is string), raw """...""" with any number of
+ * quotes and $$""" interpolation (holes open with as many braces as '$').
+ * /// comments colour their XML tags (see xml_scan).
+ *
+ * State: bits 0-1 mode (0 code, 1 block comment, 2 verbatim string,
+ * 3 raw string), bit 2 interpolated (verbatim), bits 3-7 the raw string's
+ * quote count, bits 8-10 its '$' count. */
+
+enum { CS_CODE, CS_BLOCK, CS_VERB, CS_RAW };
+#define CS_INTERP 4u
+#define CS_STATE(mode, interp, q, d) \
+	((u32)(mode) | ((interp) ? CS_INTERP : 0u) | (VX_MIN((u32)(q), 31u) << 3) | (VX_MIN((u32)(d), 7u) << 8))
+
+enum {
+	CSK_CTRL = 1, CSK_MOD, CSK_EXPR, CSK_TYPE, CSK_CONST, CSK_DECL, CSK_RECORD, CSK_NS, CSK_USING, CSK_DELEGATE,
+	CSK_CTX, CSK_CTXCTRL, CSK_QUERY, CSK_ACCESSOR, CSK_PATTERN, CSK_IN, CSK_DEFAULT, CSK_NEW, CSK_ISAS,
+	CSK_TYPEOF, CSK_CHECKED, CSK_WITH, CSK_CASE, CSK_WHERE, CSK_FOREACH
+};
+static KwSet kw_cs;
+static const char cs_ctrl[] = "if else switch while do for break continue goto return throw try catch finally lock fixed";
+static const char cs_mod[] = "public protected internal private abstract virtual override sealed static readonly volatile "
+                             "const extern ref params out implicit explicit event operator";
+static const char cs_type[] = "bool byte sbyte char decimal double float int uint long ulong short ushort object string "
+                              "void dynamic nint nuint";
+static const char cs_ctx[] = "partial async await var required file scoped global unmanaged notnull managed allows alias";
+static const char cs_query[] = "from select orderby ascending descending join on equals into let group by";
+
+static void cs_build(void)
+{
+	kw_list(&kw_cs, cs_ctrl, CSK_CTRL);
+	kw_list(&kw_cs, cs_mod, CSK_MOD);
+	kw_list(&kw_cs, "stackalloc nameof", CSK_EXPR);
+	kw_list(&kw_cs, cs_type, CSK_TYPE);
+	kw_list(&kw_cs, "true false null this base", CSK_CONST);
+	kw_list(&kw_cs, "class struct interface enum", CSK_DECL);
+	kw_add(&kw_cs, "record", 6, CSK_RECORD);
+	kw_add(&kw_cs, "namespace", 9, CSK_NS);
+	kw_add(&kw_cs, "using", 5, CSK_USING);
+	kw_add(&kw_cs, "delegate", 8, CSK_DELEGATE);
+	kw_list(&kw_cs, cs_ctx, CSK_CTX);
+	kw_list(&kw_cs, "yield when", CSK_CTXCTRL);
+	kw_list(&kw_cs, cs_query, CSK_QUERY);
+	kw_list(&kw_cs, "get set init add remove", CSK_ACCESSOR);
+	kw_list(&kw_cs, "and or not", CSK_PATTERN);
+	kw_add(&kw_cs, "in", 2, CSK_IN);
+	kw_add(&kw_cs, "default", 7, CSK_DEFAULT);
+	kw_add(&kw_cs, "new", 3, CSK_NEW);
+	kw_list(&kw_cs, "is as", CSK_ISAS);
+	kw_list(&kw_cs, "typeof sizeof", CSK_TYPEOF);
+	kw_list(&kw_cs, "checked unchecked unsafe", CSK_CHECKED);
+	kw_add(&kw_cs, "with", 4, CSK_WITH);
+	kw_add(&kw_cs, "case", 4, CSK_CASE);
+	kw_add(&kw_cs, "where", 5, CSK_WHERE);
+	kw_add(&kw_cs, "foreach", 7, CSK_FOREACH);
+}
+
+static inline bool cs_ident(u8 c) { return is_alpha(c) || is_digit(c) || c == '_' || c >= 0x80; }
+static inline bool cs_idstart(u8 c) { return is_alpha(c) || c == '_' || c >= 0x80; }
+
+/* Escape at s[i] == '\\': \x1-4 hex, \uXXXX, \UXXXXXXXX, else one char. */
+static u32 cs_escape(const char *s, u32 n, u32 i)
+{
+	u32 j = i + 1;
+	if (j >= n)
+		return n;
+	u32 max = s[j] == 'x' || s[j] == 'u' ? 4 : s[j] == 'U' ? 8 : 0;
+	j++;
+	for (u32 k = 0; k < max && j < n && is_xdigit((u8)s[j]); k++)
+		j++;
+	return j;
+}
+
+/* Interpolation hole with `nb` opening braces at i: the expression is lexed
+ * as C#, a top-level ":format" is string. Returns the index after the
+ * closing brace(s), or n. */
+static u32 cs_hole(const char *s, u32 n, u32 i, u32 nb, SynSpans *o)
+{
+	u32 a = i + nb, k = a, fmt = 0;
+	int depth = 0;
+	while (k < n) {
+		u8 c = (u8)s[k];
+		if (c == '"' || c == '\'') {
+			k++;
+			while (k < n && (u8)s[k] != c) {
+				if (s[k] == '\\')
+					k++;
+				k++;
+			}
+			k++;
+			continue;
+		}
+		if (c == '(' || c == '[' || c == '{')
+			depth++;
+		else if ((c == ')' || c == ']') && depth)
+			depth--;
+		else if (c == '}') {
+			if (!depth)
+				break;
+			depth--;
+		} else if (c == ':' && !depth && !fmt && !(k + 1 < n && s[k + 1] == ':') && !(k > a && s[k - 1] == ':'))
+			fmt = k;
+		k++;
+	}
+	if (k > n)
+		k = n;
+	u32 ee = fmt ? fmt : k;
+	if (syn_nest < 8) {
+		syn_nest++;
+		lex_shifted(LANG_CSHARP, 0, s, ee, a, o);
+		syn_nest--;
+	}
+	if (fmt)
+		emit(o, fmt, k - fmt, TK_STRING);
+	for (u32 b = 0; b < nb && k < n && s[k] == '}'; b++)
+		k++;
+	return k;
+}
+
+/* String body from i. kind 0 regular (backslash escapes), 1 verbatim
+ * ("" escapes), 2 raw (closes on a run of >= q quotes). d: braces that
+ * open an interpolation hole (0: not interpolated). Returns the end and
+ * sets *closed. */
+static u32 cs_body(const char *s, u32 n, u32 i, u32 kind, u32 q, u32 d, bool *closed, SynSpans *o)
+{
+	u32 j = i, run = i;
+	*closed = false;
+	while (j < n) {
+		u8 c = (u8)s[j];
+		if (kind == 0 && c == '\\') {
+			emit(o, run, j - run, TK_STRING);
+			u32 e = cs_escape(s, n, j);
+			emit(o, j, e - j, TK_ESCAPE);
+			j = run = e;
+			continue;
+		}
+		if (c == '"') {
+			if (kind == 1 && j + 1 < n && s[j + 1] == '"') {
+				emit(o, run, j - run, TK_STRING);
+				emit(o, j, 2, TK_ESCAPE);
+				j = run = j + 2;
+				continue;
+			}
+			u32 r = j;
+			while (r < n && s[r] == '"')
+				r++;
+			if (kind != 2 || r - j >= q) {
+				u32 end = kind == 2 ? r : j + 1;
+				emit(o, run, end - run, TK_STRING);
+				*closed = true;
+				return end;
+			}
+			j = r;
+			continue;
+		}
+		if (d && (c == '{' || c == '}')) {
+			u32 r = j;
+			while (r < n && (u8)s[r] == c)
+				r++;
+			if (kind != 2) {
+				if (r - j >= 2) { /* {{ and }} */
+					emit(o, run, j - run, TK_STRING);
+					emit(o, j, 2, TK_ESCAPE);
+					j = run = j + 2;
+					continue;
+				}
+				if (c == '}') {
+					j++;
+					continue;
+				}
+				emit(o, run, j - run, TK_STRING);
+				j = run = cs_hole(s, n, j, 1, o);
+				continue;
+			}
+			if (c == '}' || r - j < d) { /* fewer braces than '$': content */
+				j = r;
+				continue;
+			}
+			u32 h = r - d;
+			emit(o, run, h - run, TK_STRING);
+			j = run = cs_hole(s, n, h, d, o);
+			continue;
+		}
+		j++;
+	}
+	emit(o, run, n - run, TK_STRING);
+	return n;
+}
+
+/* Does the '<' at i open a type argument list? Returns the index after
+ * the matching '>' or 0. */
+static u32 cs_angle(const char *s, u32 n, u32 i)
+{
+	if (i + 1 >= n || !(cs_idstart((u8)s[i + 1]) || s[i + 1] == '(' || s[i + 1] == '>' || s[i + 1] == ','))
+		return 0;
+	int depth = 0;
+	for (u32 j = i; j < n; j++) {
+		u8 c = (u8)s[j];
+		if (c == '<') {
+			depth++;
+		} else if (c == '>') {
+			if (--depth == 0) {
+				u32 k = skip_ws(s, n, j + 1);
+				if (k < n && !(cs_idstart((u8)s[k]) || (s[k] && strchr("()]}:;,.?|^&[=>@", s[k]))))
+					return 0;
+				return j + 1;
+			}
+		} else if (!(cs_ident(c) || is_space(c) || (c && strchr(",.?[]()*:", c)))) {
+			return 0;
+		}
+	}
+	return 0;
+}
+
+/* Names inside a type argument list (a, b): types; keyword types and
+ * variance modifiers stay keywords. */
+static void cs_type_args(const char *s, u32 a, u32 b, SynSpans *o)
+{
+	for (u32 j = a; j < b;) {
+		if (!cs_idstart((u8)s[j])) {
+			j++;
+			continue;
+		}
+		u32 e = j;
+		while (e < b && cs_ident((u8)s[e]))
+			e++;
+		int k = kw_find(&kw_cs, s + j, e - j);
+		emit(o, j, e - j, k == CSK_TYPE || k == CSK_MOD || k == CSK_IN || k == CSK_CTX ? TK_STORAGE : TK_TYPE);
+		j = e;
+	}
+}
+
+/* A declaration follows a type name ending at e: `Foo x`, `Foo? x`,
+ * `Foo[] x`, `Foo* p`. */
+static bool cs_decl_follows(const char *s, u32 n, u32 e)
+{
+	u32 k = e;
+	if (k < n && s[k] == '?')
+		k++;
+	while (k < n && (s[k] == '[' || s[k] == '*')) {
+		if (s[k] == '*') {
+			k++;
+			continue;
+		}
+		u32 m = k + 1;
+		while (m < n && (s[m] == ',' || is_space((u8)s[m])))
+			m++;
+		if (m >= n || s[m] != ']')
+			return false;
+		k = m + 1;
+	}
+	if (k >= n || !is_space((u8)s[k]))
+		return false;
+	k = skip_ws(s, n, k);
+	if (k < n && s[k] == '@')
+		return k + 1 < n && cs_idstart((u8)s[k + 1]);
+	if (k >= n || !cs_idstart((u8)s[k]))
+		return false;
+	u32 b = k;
+	while (b < n && cs_ident((u8)s[b]))
+		b++;
+	int kw = kw_find(&kw_cs, s + k, b - k);
+	return kw < 0 || kw == CSK_CTX || kw == CSK_ACCESSOR || kw == CSK_RECORD;
+}
+
+/* Cast at the '(' i: (Type)x, (int)y, (List<T>)z. Returns the index of
+ * the ')' or 0. */
+static u32 cs_cast(const char *s, u32 n, u32 i)
+{
+	u32 j = skip_ws(s, n, i + 1);
+	if (j >= n || !cs_idstart((u8)s[j]))
+		return 0;
+	bool kwtype = false;
+	for (;;) {
+		u32 b = j;
+		while (b < n && cs_ident((u8)s[b]))
+			b++;
+		int kw = kw_find(&kw_cs, s + j, b - j);
+		if (kw == CSK_TYPE)
+			kwtype = true;
+		else if (kw > 0 && !(kw == CSK_CTX && word_is(s + j, b - j, "global")))
+			return 0;
+		j = b;
+		if (j < n && s[j] == '<') {
+			u32 g = cs_angle(s, n, j);
+			if (!g)
+				return 0;
+			j = g;
+		}
+		if (j + 1 < n && s[j] == '.' && cs_idstart((u8)s[j + 1])) {
+			j++;
+			continue;
+		}
+		if (j + 2 < n && s[j] == ':' && s[j + 1] == ':' && cs_idstart((u8)s[j + 2])) {
+			j += 2;
+			continue;
+		}
+		break;
+	}
+	while (j < n && (s[j] == '?' || s[j] == '*' || s[j] == '[' || s[j] == ']' || s[j] == ','))
+		j++;
+	j = skip_ws(s, n, j);
+	if (j >= n || s[j] != ')')
+		return 0;
+	u32 k = skip_ws(s, n, j + 1);
+	if (k >= n)
+		return 0;
+	u8 c = (u8)s[k];
+	if (c == '(')
+		return kwtype ? j : 0;
+	if (!(cs_idstart(c) || is_digit(c) || c == '"' || c == '\'' || c == '@' || c == '$'))
+		return 0;
+	if (cs_idstart(c)) {
+		u32 b = k;
+		while (b < n && cs_ident((u8)s[b]))
+			b++;
+		int kw = kw_find(&kw_cs, s + k, b - k);
+		if (kw == CSK_ISAS || kw == CSK_PATTERN || kw == CSK_IN || kw == CSK_WITH || kw == CSK_QUERY ||
+		    kw == CSK_CTXCTRL || word_is(s + k, b - k, "switch"))
+			return 0;
+	}
+	return j;
+}
+
+/* Attribute at the '[' i: [Name], [target: Name(args), Other]. For a
+ * parameter attribute (param) a parameter type must follow the ']'. */
+static bool cs_attr_ok(const char *s, u32 n, u32 i, bool param)
+{
+	u32 j = skip_ws(s, n, i + 1);
+	if (j >= n || !cs_idstart((u8)s[j]))
+		return false;
+	u32 b = j;
+	while (b < n && cs_ident((u8)s[b]))
+		b++;
+	u32 k = skip_ws(s, n, b);
+	if (k < n && s[k] == ':' && !(k + 1 < n && s[k + 1] == ':')) {
+		j = skip_ws(s, n, k + 1);
+		if (j >= n || !cs_idstart((u8)s[j]))
+			return false;
+		b = j;
+		while (b < n && cs_ident((u8)s[b]))
+			b++;
+	}
+	while (b + 1 < n && s[b] == '.' && cs_idstart((u8)s[b + 1])) {
+		b++;
+		while (b < n && cs_ident((u8)s[b]))
+			b++;
+	}
+	if (b < n && s[b] == '<') {
+		u32 g = cs_angle(s, n, b);
+		if (g)
+			b = g;
+	}
+	k = skip_ws(s, n, b);
+	if (k >= n)
+		return !param;
+	if (s[k] != '(' && s[k] != ']' && s[k] != ',')
+		return false;
+	if (!param)
+		return true;
+	int d = 0;
+	for (; k < n; k++) {
+		if (s[k] == '(' || s[k] == '[')
+			d++;
+		else if (s[k] == ')' && d)
+			d--;
+		else if (s[k] == ']' && d-- == 0)
+			break;
+	}
+	k = skip_ws(s, n, k + 1);
+	return k < n && (cs_idstart((u8)s[k]) || s[k] == '[');
+}
+
+/* using at statement start followed by j: a directive (namespace, static
+ * or alias) rather than a using statement/declaration? */
+static bool cs_using_dir(const char *s, u32 n, u32 j)
+{
+	if (j >= n || !cs_idstart((u8)s[j]))
+		return false;
+	u32 b = j;
+	while (b < n && cs_ident((u8)s[b]))
+		b++;
+	if (word_is(s + j, b - j, "var") || word_is(s + j, b - j, "await"))
+		return false;
+	return !memchr(s + j, '(', n - j) && memchr(s + j, ';', n - j);
+}
+
+/* Preprocessor line from the '#' at i. */
+static void cs_pp(const char *s, u32 n, u32 i, SynSpans *o)
+{
+	u32 a = skip_ws(s, n, i + 1), b = a;
+	while (b < n && is_alpha((u8)s[b]))
+		b++;
+	emit(o, i, b - i, TK_PREPROC);
+	const char *w = s + a;
+	u32 wl = b - a;
+	if (word_is(w, wl, "region") || word_is(w, wl, "endregion") || word_is(w, wl, "error") || word_is(w, wl, "warning")) {
+		u32 j = skip_ws(s, n, b), e = n;
+		while (e > j && is_space((u8)s[e - 1]))
+			e--;
+		emit(o, j, e - j, TK_STRING); /* string.unquoted.preprocessor.message */
+		return;
+	}
+	bool cond = word_is(w, wl, "if") || word_is(w, wl, "elif") || word_is(w, wl, "define") || word_is(w, wl, "undef");
+	u32 j = b;
+	while (j < n) {
+		u8 c = (u8)s[j];
+		if (is_space(c)) {
+			j++;
+		} else if (c == '/' && j + 1 < n && s[j + 1] == '/') {
+			emit(o, j, n - j, TK_COMMENT);
+			return;
+		} else if (c == '"') {
+			u32 e = j + 1;
+			while (e < n && s[e] != '"')
+				e++;
+			if (e < n)
+				e++;
+			emit(o, j, e - j, TK_STRING);
+			j = e;
+		} else if (is_digit(c)) {
+			u32 e = j;
+			while (e < n && cs_ident((u8)s[e]))
+				e++;
+			emit(o, j, e - j, TK_NUMBER);
+			j = e;
+		} else if (cs_idstart(c)) {
+			u32 e = j;
+			while (e < n && cs_ident((u8)s[e]))
+				e++;
+			u32 cls = TK_PREPROC;
+			if (word_is(s + j, e - j, "true") || word_is(s + j, e - j, "false"))
+				cls = TK_LANGCONST;
+			else if (cond)
+				cls = TK_VARIABLE; /* entity.name.variable.preprocessor.symbol */
+			emit(o, j, e - j, cls);
+			j = e;
+		} else {
+			if (c == '!' || c == '&' || c == '|' || c == '=')
+				emit(o, j, 1, TK_OPERATOR);
+			j++;
+		}
+	}
+}
+
+static u32 lex_csharp(u32 state, const char *s, u32 n, SynSpans *o)
+{
+	u32 mode = state & 3u;
+	u32 i = 0;
+	bool closed;
+	if (mode == CS_BLOCK) {
+		i = java_comment(s, n, 0, false, &closed, o);
+		if (!closed)
+			return CS_BLOCK;
+	} else if (mode == CS_VERB) {
+		i = cs_body(s, n, 0, 1, 0, (state & CS_INTERP) ? 1 : 0, &closed, o);
+		if (!closed)
+			return state;
+	} else if (mode == CS_RAW) {
+		i = cs_body(s, n, 0, 2, (state >> 3) & 31u, (state >> 8) & 7u, &closed, o);
+		if (!closed)
+			return state;
+	}
+	u32 first = skip_ws(s, n, i);
+	if (mode == CS_CODE && first < n && s[first] == '#') {
+		cs_pp(s, n, first, o);
+		return 0;
+	}
+	int expect = 0;      /* 1 the declared type's name, 2 a type (after new is as typeof() */
+	bool prev_op = true; /* an operand may start here (a '(' may be a cast) */
+	bool line_start = true, ns = false, decl = false, bases = false, deleg = false, pattern = false;
+	bool foreach_line = false, attr_name = false, attr_close = false;
+	u32 attr = 0, attr_p = 0, pdepth = 0;
+	u8 lastc = 0;
+	while (i < n) {
+		u8 c = (u8)s[i];
+		if (is_space(c)) {
+			i++;
+			continue;
+		}
+		bool at_start = line_start, ac = attr_close;
+		u8 pc = lastc;
+		line_start = attr_close = false;
+		lastc = c;
+		if (c == '/' && i + 1 < n && s[i + 1] == '/') {
+			if (i + 2 < n && s[i + 2] == '/' && !(i + 3 < n && s[i + 3] == '/')) {
+				emit(o, i, 3, TK_COMMENT); /* comment.block.documentation */
+				xml_scan(XM_TEXT, s, n, i + 3, true, o);
+			} else {
+				emit(o, i, n - i, TK_COMMENT);
+			}
+			return 0;
+		}
+		if (c == '/' && i + 1 < n && s[i + 1] == '*') {
+			emit(o, i, 2, TK_COMMENT);
+			i = java_comment(s, n, i + 2, false, &closed, o);
+			if (!closed)
+				return CS_BLOCK;
+			continue;
+		}
+		/* strings: "" @"" $"" $@"" @$"" """raw""" $$"""raw""" */
+		if (c == '"' || ((c == '$' || c == '@') && i + 1 < n && (s[i + 1] == '"' || s[i + 1] == '$' || s[i + 1] == '@'))) {
+			u32 p = i, dol = 0;
+			bool at = false;
+			while (p < n && (s[p] == '$' || s[p] == '@')) {
+				if (s[p] == '$')
+					dol++;
+				else
+					at = true;
+				p++;
+			}
+			if (p < n && s[p] == '"') {
+				u32 r = p;
+				while (r < n && s[r] == '"')
+					r++;
+				u32 q = r - p;
+				prev_op = false;
+				expect = 0;
+				if (q >= 3 && !at) {
+					emit(o, i, r - i, TK_STRING);
+					i = cs_body(s, n, r, 2, q, dol, &closed, o);
+					if (!closed)
+						return CS_STATE(CS_RAW, false, q, dol);
+				} else {
+					emit(o, i, p + 1 - i, TK_STRING);
+					i = cs_body(s, n, p + 1, at ? 1 : 0, 0, dol ? 1 : 0, &closed, o);
+					if (!closed && at)
+						return CS_STATE(CS_VERB, dol != 0, 0, 0);
+				}
+				continue;
+			}
+		}
+		if (c == '\'') {
+			u32 j = i + 1, run = i;
+			while (j < n && s[j] != '\'') {
+				if (s[j] == '\\') {
+					emit(o, run, j - run, TK_STRING);
+					u32 e = cs_escape(s, n, j);
+					emit(o, j, e - j, TK_ESCAPE);
+					j = run = e;
+					continue;
+				}
+				j++;
+			}
+			if (j < n)
+				j++;
+			emit(o, run, j - run, TK_STRING);
+			i = j;
+			prev_op = false;
+			expect = 0;
+			continue;
+		}
+		if (is_digit(c) || (c == '.' && i + 1 < n && is_digit((u8)s[i + 1]) && !(i > 0 && s[i - 1] == '.'))) {
+			u32 e = jv_number(s, n, i);
+			if (e > i + 1 && s[e - 1] == '.' && e < n && s[e] == '.')
+				e--; /* 1..2 is a range */
+			if (e < n && (s[e] == 'm' || s[e] == 'M'))
+				e++;
+			emit(o, i, e - i, TK_NUMBER);
+			i = e;
+			prev_op = false;
+			expect = 0;
+			continue;
+		}
+		if (cs_idstart(c) || (c == '@' && i + 1 < n && cs_idstart((u8)s[i + 1]))) {
+			u32 a = i, e = i + (c == '@');
+			while (e < n && cs_ident((u8)s[e]))
+				e++;
+			u32 len = e - a;
+			const char *w = s + a;
+			bool after_dot = a > 0 && s[a - 1] == '.' && !(a > 1 && s[a - 2] == '.');
+			int k = (c == '@' || after_dot) ? -1 : kw_find(&kw_cs, w, len);
+			u32 nx = skip_ws(s, n, e);
+			u8 nc = nx < n ? (u8)s[nx] : 0;
+			bool next_id = nc && (cs_idstart(nc) || nc == '@');
+			u32 cls = TK_TEXT;
+			if (k > 0) {
+				int old = expect;
+				expect = 0;
+				cls = TK_STORAGE;
+				switch (k) {
+				case CSK_CTRL:
+					cls = TK_CONTROL;
+					if (word_is(w, len, "switch"))
+						pattern = true;
+					break;
+				case CSK_CTXCTRL:
+					if (!(next_id || nc == '('))
+						cls = TK_TEXT;
+					else
+						cls = TK_CONTROL;
+					break;
+				case CSK_CONST: cls = TK_LANGCONST; break;
+				case CSK_DECL:
+					if (!bases) {
+						expect = 1;
+						decl = true;
+					}
+					break;
+				case CSK_RECORD:
+					if (next_id) {
+						expect = 1;
+						decl = true;
+					} else {
+						cls = TK_TEXT;
+					}
+					break;
+				case CSK_NS: ns = true; break;
+				case CSK_USING:
+					cls = TK_CONTROL;
+					if (cs_using_dir(s, n, nx))
+						ns = true;
+					break;
+				case CSK_DELEGATE: deleg = true; break;
+				case CSK_CTX:
+					if (!(next_id || nc == '(' || bases ||
+					      (word_is(w, len, "global") && nc == ':' && nx + 1 < n && s[nx + 1] == ':')))
+						cls = TK_TEXT;
+					break;
+				case CSK_QUERY: {
+					bool order = word_is(w, len, "ascending") || word_is(w, len, "descending");
+					if (!(next_id || is_digit(nc) || nc == '"' || nc == '(' || (order && (!nc || nc == ',' || nc == ';'))))
+						cls = TK_TEXT;
+					break;
+				}
+				case CSK_ACCESSOR:
+					if (!(!nc || nc == ';' || nc == '{' || (nc == '=' && nx + 1 < n && s[nx + 1] == '>')))
+						cls = TK_TEXT;
+					break;
+				case CSK_PATTERN:
+					if (!pattern)
+						cls = TK_TEXT;
+					else
+						expect = old;
+					break;
+				case CSK_IN: cls = foreach_line ? TK_CONTROL : TK_STORAGE; break;
+				case CSK_DEFAULT:
+					if (nc == ':' && !(nx + 1 < n && s[nx + 1] == ':'))
+						cls = TK_CONTROL;
+					break;
+				case CSK_NEW: expect = 2; break;
+				case CSK_ISAS:
+					expect = 2;
+					if (w[0] == 'i')
+						pattern = true;
+					break;
+				case CSK_CHECKED:
+					if (!(next_id || nc == '('))
+						cls = TK_CONTROL; /* checked { } */
+					break;
+				case CSK_WITH:
+					if (nc != '{')
+						cls = TK_TEXT;
+					break;
+				case CSK_CASE:
+					cls = TK_CONTROL;
+					pattern = true;
+					break;
+				case CSK_WHERE:
+					if (!next_id) {
+						cls = TK_TEXT;
+					} else {
+						/* where T : constraint (else a query clause) */
+						u32 b = nx;
+						while (b < n && cs_ident((u8)s[b]))
+							b++;
+						b = skip_ws(s, n, b);
+						if (b < n && s[b] == ':' && !(b + 1 < n && s[b + 1] == ':'))
+							bases = true;
+					}
+					break;
+				case CSK_FOREACH:
+					cls = TK_CONTROL;
+					foreach_line = true;
+					break;
+				default: break; /* CSK_MOD CSK_EXPR CSK_TYPE CSK_TYPEOF */
+				}
+				if (cls != TK_TEXT) {
+					emit(o, a, len, cls);
+					i = e;
+					bool paren_ctrl = k == CSK_CTRL && (word_is(w, len, "if") || word_is(w, len, "while") ||
+					                                    word_is(w, len, "for") || word_is(w, len, "switch") ||
+					                                    word_is(w, len, "lock") || word_is(w, len, "catch") ||
+					                                    word_is(w, len, "fixed"));
+					prev_op = !(paren_ctrl || k == CSK_CONST || k == CSK_TYPE || k == CSK_TYPEOF || k == CSK_DEFAULT ||
+					            k == CSK_CHECKED || k == CSK_USING || k == CSK_FOREACH || k == CSK_CTXCTRL ||
+					            k == CSK_ACCESSOR || k == CSK_EXPR);
+					if ((k == CSK_TYPEOF || (k == CSK_DEFAULT && cls == TK_STORAGE)) && nc == '(') {
+						/* typeof(T) sizeof(T) default(T) */
+						i = nx + 1;
+						pdepth++;
+						expect = 2;
+						lastc = '(';
+					}
+					continue;
+				}
+				expect = old;
+			}
+			/* a name */
+			u32 g = (e < n && s[e] == '<') ? cs_angle(s, n, e) : 0;
+			u32 after = g ? skip_ws(s, n, g) : nx;
+			u8 ac2 = after < n ? (u8)s[after] : 0;
+			bool target = attr_name && !g && ac2 == ':' && !(after + 1 < n && s[after + 1] == ':');
+			if (target)
+				cls = TK_STORAGE; /* keyword.other.attribute-specifier */
+			else if (ns || expect || attr_name || (bases && pdepth == 0))
+				cls = TK_TYPE;
+			else if (deleg && ac2 == '(') {
+				cls = TK_TYPE; /* entity.name.type.delegate */
+				deleg = false;
+			} else if (ac2 == '(')
+				cls = TK_FUNCTION;
+			else if (g)
+				cls = TK_TYPE;
+			else if (!after_dot && cs_decl_follows(s, n, e))
+				cls = TK_TYPE;
+			else if (len == 1 && w[0] == '_')
+				cls = TK_LANGCONST; /* variable.language.discard */
+			else
+				cls = TK_VARIABLE;
+			emit(o, a, len, cls);
+			if (g) {
+				cs_type_args(s, e + 1, g - 1, o);
+				e = g;
+			}
+			if (expect && !(e < n && s[e] == '.'))
+				expect = 0;
+			if (attr_name && !target)
+				attr_name = e < n && s[e] == '.';
+			i = e;
+			prev_op = false;
+			continue;
+		}
+		/* punctuation and operators */
+		if (c == '[') {
+			if (attr) {
+				attr++;
+			} else if ((at_start || ac || (pdepth && (pc == '(' || pc == ','))) &&
+			           cs_attr_ok(s, n, i, !(at_start || ac))) {
+				attr = 1;
+				attr_p = pdepth;
+				attr_name = true;
+			}
+			prev_op = true;
+			expect = 0;
+			i++;
+			continue;
+		}
+		if (c == ']') {
+			if (attr && --attr == 0) {
+				attr_close = true;
+				attr_name = false;
+			}
+			prev_op = false;
+			i++;
+			continue;
+		}
+		if (c == '(') {
+			if (prev_op && !attr) {
+				u32 j = cs_cast(s, n, i);
+				if (j) {
+					for (u32 q = i + 1; q < j;) {
+						if (!cs_idstart((u8)s[q])) {
+							q++;
+							continue;
+						}
+						u32 b = q;
+						while (b < j && cs_ident((u8)s[b]))
+							b++;
+						emit(o, q, b - q, kw_find(&kw_cs, s + q, b - q) > 0 ? TK_STORAGE : TK_TYPE);
+						q = b;
+					}
+					i = j + 1;
+					prev_op = true;
+					expect = 0;
+					lastc = ')';
+					continue;
+				}
+			}
+			pdepth++;
+			prev_op = true;
+			expect = 0;
+			i++;
+			continue;
+		}
+		if (c == ')') {
+			if (pdepth)
+				pdepth--;
+			prev_op = false;
+			expect = 0;
+			i++;
+			continue;
+		}
+		if (c == '{' || c == ';') {
+			ns = decl = bases = deleg = false;
+			if (c == ';')
+				pattern = false;
+			prev_op = true;
+			expect = 0;
+			i++;
+			continue;
+		}
+		if (c == ',') {
+			if (attr == 1 && pdepth == attr_p)
+				attr_name = true;
+			prev_op = true;
+			expect = 0;
+			i++;
+			continue;
+		}
+		if (c == '.') {
+			if (i + 1 < n && s[i + 1] == '.') {
+				emit(o, i, 2, TK_OPERATOR); /* range */
+				i += 2;
+				prev_op = true;
+				continue;
+			}
+			i++;
+			continue;
+		}
+		if (c == ':') {
+			if (i + 1 < n && s[i + 1] == ':') {
+				i += 2;
+				continue;
+			}
+			if (decl && pdepth == 0 && !attr)
+				bases = true;
+			else
+				emit(o, i, 1, TK_OPERATOR);
+			prev_op = true;
+			expect = 0;
+			i++;
+			continue;
+		}
+		if (c == '=' && i + 1 < n && s[i + 1] == '>') {
+			emit(o, i, 2, TK_OPERATOR);
+			ns = decl = bases = false;
+			prev_op = true;
+			expect = 0;
+			i += 2;
+			continue;
+		}
+		if (c && strchr("+-*/%=!&|^~?<>", c)) {
+			emit(o, i, 1, TK_OPERATOR);
+			prev_op = true;
+			expect = 0;
+			i++;
+			continue;
+		}
+		prev_op = c != '}';
+		expect = 0;
+		i++;
+	}
+	return 0;
+}
+
+/* ================================================================== */
+/* QML                                                                 */
+/*
+ * VSCodium ships no QML grammar; this follows the Qt extension's
+ * qml.tmLanguage, which embeds JavaScript in bindings, under Dark+/Light+:
+ *   import pragma as, JS control flow (if for return ... yield await),
+ *   JS import/export                                   -> TK_CONTROL
+ *   property readonly required default final signal component enum,
+ *   alias, `on` of `Behavior on x`, JS storage (function var let const
+ *   class), new typeof instanceof in of delete void, the => arrow
+ *                                                       -> TK_STORAGE
+ *   object types (Item {), attached types (Layout.fillWidth:), modules
+ *   and their aliases, property types, PascalCase names -> TK_TYPE
+ *   property names left of ':' and JS names          -> TK_VARIABLE
+ *   on<Signal>: handlers, signal/function names, calls -> TK_FUNCTION
+ *   ALL_CAPS names and enum values (Text.AlignLeft)  -> TK_CONSTANT
+ *   true false null undefined this super NaN ...     -> TK_LANGCONST
+ * `id` is a keyword (TK_STORAGE). Template strings `..${expr}..` (the
+ * ${ } punctuation TK_STORAGE, the expression lexed) and regex literals
+ * (TK_REGEX) follow JavaScript.
+ *
+ * State: bits 0-1 mode (0 code, 1 block comment, 2 template string).
+ * Bit 2 (internal) lexes an expression without QML statement rules. */
+
+enum { QK_CTRL = 1, QK_STORAGE, QK_CTXST, QK_OP, QK_CONST, QK_FUNC, QK_CLASS, QK_NEW, QK_IMPORT };
+#define QML_EXPR 4u
+static KwSet kw_qml;
+static const char qml_ctrl[] = "if else for while do switch case default break continue return throw try catch "
+                               "finally yield await with debugger";
+static const char qml_storage[] = "var let const extends";
+
+static void qml_build(void)
+{
+	kw_list(&kw_qml, qml_ctrl, QK_CTRL);
+	kw_list(&kw_qml, qml_storage, QK_STORAGE);
+	kw_list(&kw_qml, "get set static async of", QK_CTXST);
+	kw_list(&kw_qml, "typeof instanceof in delete void", QK_OP);
+	kw_list(&kw_qml, "true false null undefined this super NaN Infinity arguments", QK_CONST);
+	kw_add(&kw_qml, "function", 8, QK_FUNC);
+	kw_add(&kw_qml, "class", 5, QK_CLASS);
+	kw_add(&kw_qml, "new", 3, QK_NEW);
+	kw_list(&kw_qml, "import export", QK_IMPORT);
+}
+
+static inline bool js_ident(u8 c) { return is_alpha(c) || is_digit(c) || c == '_' || c == '$' || c >= 0x80; }
+static inline bool js_idstart(u8 c) { return is_alpha(c) || c == '_' || c == '$' || c >= 0x80; }
+static inline bool is_upper(u8 c) { return (unsigned)(c - 'A') < 26u; }
+
+/* JavaScript escape at s[i] == '\\': \xHH, \uXXXX, \u{...}, else one char. */
+static u32 js_escape(const char *s, u32 n, u32 i)
+{
+	u32 j = i + 1;
+	if (j >= n)
+		return n;
+	if (s[j] == 'u' && j + 1 < n && s[j + 1] == '{') {
+		j += 2;
+		while (j < n && is_xdigit((u8)s[j]))
+			j++;
+		return j < n && s[j] == '}' ? j + 1 : j;
+	}
+	u32 max = s[j] == 'x' ? 2 : s[j] == 'u' ? 4 : 0;
+	j++;
+	for (u32 k = 0; k < max && j < n && is_xdigit((u8)s[j]); k++)
+		j++;
+	return j;
+}
+
+/* '...' or "..." from the quote at i (one line); returns its end. */
+static u32 js_quoted(const char *s, u32 n, u32 i, SynSpans *o)
+{
+	u8 q = (u8)s[i];
+	u32 j = i + 1, run = i;
+	while (j < n && (u8)s[j] != q) {
+		if (s[j] == '\\') {
+			emit(o, run, j - run, TK_STRING);
+			u32 e = js_escape(s, n, j);
+			emit(o, j, e - j, TK_ESCAPE);
+			j = run = e;
+			continue;
+		}
+		j++;
+	}
+	if (j < n)
+		j++;
+	emit(o, run, j - run, TK_STRING);
+	return j;
+}
+
+/* Template string body from i; ${expr} holes are lexed. */
+static u32 js_template(const char *s, u32 n, u32 i, bool *closed, SynSpans *o)
+{
+	u32 j = i, run = i;
+	*closed = false;
+	while (j < n) {
+		if (s[j] == '\\') {
+			emit(o, run, j - run, TK_STRING);
+			u32 e = js_escape(s, n, j);
+			emit(o, j, e - j, TK_ESCAPE);
+			j = run = e;
+			continue;
+		}
+		if (s[j] == '`') {
+			emit(o, run, j + 1 - run, TK_STRING);
+			*closed = true;
+			return j + 1;
+		}
+		if (s[j] == '$' && j + 1 < n && s[j + 1] == '{') {
+			emit(o, run, j - run, TK_STRING);
+			u32 k = j + 2;
+			int d = 0;
+			while (k < n) {
+				u8 c = (u8)s[k];
+				if (c == '{') {
+					d++;
+				} else if (c == '}') {
+					if (!d)
+						break;
+					d--;
+				} else if (c == '"' || c == '\'' || c == '`') {
+					k++;
+					while (k < n && (u8)s[k] != c) {
+						if (s[k] == '\\')
+							k++;
+						k++;
+					}
+					if (k >= n)
+						break;
+				}
+				k++;
+			}
+			if (k > n)
+				k = n;
+			emit(o, j, 2, TK_STORAGE);
+			if (syn_nest < 8) {
+				syn_nest++;
+				lex_shifted(LANG_QML, QML_EXPR, s, k, j + 2, o);
+				syn_nest--;
+			}
+			if (k < n) {
+				emit(o, k, 1, TK_STORAGE);
+				k++;
+			}
+			j = run = k;
+			continue;
+		}
+		j++;
+	}
+	emit(o, run, n - run, TK_STRING);
+	return n;
+}
+
+/* Regex literal at the '/' i (an operand is expected): its end or 0. */
+static u32 js_regex(const char *s, u32 n, u32 i)
+{
+	if (i + 1 >= n || s[i + 1] == '/' || s[i + 1] == '*' || s[i + 1] == ' ')
+		return 0;
+	bool cls = false;
+	for (u32 j = i + 1; j < n; j++) {
+		if (s[j] == '\\') {
+			j++;
+		} else if (s[j] == '[') {
+			cls = true;
+		} else if (s[j] == ']') {
+			cls = false;
+		} else if (s[j] == '/' && !cls) {
+			j++;
+			while (j < n && is_alpha((u8)s[j]))
+				j++;
+			return j;
+		}
+	}
+	return 0;
+}
+
+static u32 qml_word_end(const char *s, u32 n, u32 i)
+{
+	while (i < n && js_ident((u8)s[i]))
+		i++;
+	return i;
+}
+
+/* QML statement at i (a name at the start of a line, after '{' or ';'):
+ * import/pragma lines, property and signal declarations, object
+ * declarations and bindings. Returns where JavaScript lexing goes on
+ * (i when nothing QML-specific was found). */
+static u32 qml_stmt(const char *s, u32 n, u32 i, SynSpans *o)
+{
+	u32 e = qml_word_end(s, n, i);
+	const char *w = s + i;
+	u32 wl = e - i;
+	if (word_is(w, wl, "import") || word_is(w, wl, "pragma")) {
+		bool imp = w[0] == 'i';
+		emit(o, i, wl, TK_CONTROL);
+		u32 j = e;
+		while (j < n) {
+			u8 c = (u8)s[j];
+			if (c == '/' && j + 1 < n && s[j + 1] == '/') {
+				emit(o, j, n - j, TK_COMMENT);
+				return n;
+			}
+			if (c == '"' || c == '\'') {
+				j = js_quoted(s, n, j, o);
+			} else if (is_digit(c)) {
+				u32 b = j;
+				while (b < n && (is_digit((u8)s[b]) || s[b] == '.'))
+					b++;
+				emit(o, j, b - j, TK_NUMBER);
+				j = b;
+			} else if (js_idstart(c)) {
+				u32 b = qml_word_end(s, n, j);
+				emit(o, j, b - j, imp && word_is(s + j, b - j, "as") ? TK_CONTROL : TK_TYPE);
+				j = b;
+			} else {
+				j++;
+			}
+		}
+		return n;
+	}
+	/* modifiers, then property / signal / component / enum */
+	u32 j = i;
+	bool mods = false;
+	while (word_is(w, wl, "readonly") || word_is(w, wl, "required") || word_is(w, wl, "default") ||
+	       word_is(w, wl, "final") || word_is(w, wl, "virtual") || word_is(w, wl, "override")) {
+		u32 nx = skip_ws(s, n, j + wl);
+		if (nx >= n || !js_idstart((u8)s[nx]) || nx == j + wl)
+			break;
+		emit(o, j, wl, TK_STORAGE);
+		mods = true;
+		j = nx;
+		w = s + j;
+		wl = qml_word_end(s, n, j) - j;
+	}
+	u32 nx = skip_ws(s, n, j + wl);
+	bool next_id = nx < n && nx > j + wl && js_idstart((u8)s[nx]);
+	if (word_is(w, wl, "property") && next_id) {
+		emit(o, j, wl, TK_STORAGE);
+		u32 a = nx, b = qml_word_end(s, n, a);
+		emit(o, a, b - a, word_is(s + a, b - a, "alias") ? TK_STORAGE : TK_TYPE);
+		if (b < n && s[b] == '<') { /* list<Item> */
+			u32 c = b + 1;
+			while (c < n && s[c] != '>') {
+				if (js_idstart((u8)s[c])) {
+					u32 d = qml_word_end(s, n, c);
+					emit(o, c, d - c, TK_TYPE);
+					c = d;
+				} else {
+					c++;
+				}
+			}
+			b = c < n ? c + 1 : n;
+		}
+		a = skip_ws(s, n, b);
+		if (a < n && js_idstart((u8)s[a])) {
+			b = qml_word_end(s, n, a);
+			emit(o, a, b - a, TK_VARIABLE);
+			return b;
+		}
+		return a;
+	}
+	if (mods) {
+		u32 b = qml_word_end(s, n, j);
+		emit(o, j, b - j, TK_VARIABLE); /* required name */
+		return b;
+	}
+	if (word_is(w, wl, "signal") && next_id) {
+		emit(o, j, wl, TK_STORAGE);
+		u32 b = qml_word_end(s, n, nx);
+		emit(o, nx, b - nx, TK_FUNCTION);
+		u32 p = skip_ws(s, n, b);
+		if (p >= n || s[p] != '(')
+			return p;
+		bool type = false;
+		for (p++; p < n && s[p] != ')';) {
+			if (js_idstart((u8)s[p])) {
+				u32 d = qml_word_end(s, n, p);
+				u32 q = skip_ws(s, n, d);
+				bool decl = q > d && q < n && js_idstart((u8)s[q]);
+				emit(o, p, d - p, type || decl ? TK_TYPE : TK_VARIABLE);
+				type = false;
+				p = d;
+			} else {
+				if (s[p] == ':')
+					type = true;
+				p++;
+			}
+		}
+		return p;
+	}
+	if ((word_is(w, wl, "component") || word_is(w, wl, "enum")) && next_id) {
+		emit(o, j, wl, TK_STORAGE);
+		u32 b = qml_word_end(s, n, nx);
+		emit(o, nx, b - nx, TK_TYPE);
+		return b;
+	}
+	if (kw_find(&kw_qml, w, wl) > 0)
+		return i;
+	/* a dotted name: Type {, Type on prop {, name: */
+	u32 b = j + wl;
+	while (b + 1 < n && s[b] == '.' && js_idstart((u8)s[b + 1]))
+		b = qml_word_end(s, n, b + 1);
+	u32 m = skip_ws(s, n, b);
+	u32 cls = 0;
+	if (m < n && s[m] == '{') {
+		cls = TK_TYPE;
+	} else if (m < n && s[m] == ':' && !(m + 1 < n && s[m + 1] == ':')) {
+		cls = TK_VARIABLE;
+	} else if (m < n && m > b && n - m > 3 && memcmp(s + m, "on", 2) == 0 && is_space((u8)s[m + 2])) {
+		/* Behavior on width { */
+		u32 p = skip_ws(s, n, m + 2), q = p;
+		while (q < n && (js_ident((u8)s[q]) || s[q] == '.'))
+			q++;
+		u32 r = skip_ws(s, n, q);
+		if (q > p && r < n && s[r] == '{') {
+			for (u32 a = j; a < b;) {
+				u32 d = qml_word_end(s, n, a);
+				emit(o, a, d - a, TK_TYPE);
+				a = d + 1;
+			}
+			emit(o, m, 2, TK_STORAGE);
+			emit(o, p, q - p, TK_VARIABLE);
+			return q;
+		}
+		return i;
+	} else {
+		return i;
+	}
+	for (u32 a = j; a < b;) {
+		u32 d = qml_word_end(s, n, a);
+		u32 c = cls;
+		if (cls == TK_VARIABLE) {
+			if (word_is(s + a, d - a, "id") && a == j && d == b)
+				c = TK_STORAGE;
+			else if (d - a > 2 && s[a] == 'o' && s[a + 1] == 'n' && is_upper((u8)s[a + 2]))
+				c = TK_FUNCTION; /* signal handler */
+			else if (is_upper((u8)s[a]))
+				c = TK_TYPE; /* attached property type */
+		}
+		emit(o, a, d - a, c);
+		a = d + 1;
+	}
+	return b;
+}
+
+static u32 lex_qml(u32 state, const char *s, u32 n, SynSpans *o)
+{
+	u32 mode = state & 3u;
+	u32 i = 0;
+	bool closed;
+	if (mode == 1) {
+		i = java_comment(s, n, 0, false, &closed, o);
+		if (!closed)
+			return 1;
+	} else if (mode == 2) {
+		i = js_template(s, n, 0, &closed, o);
+		if (!closed)
+			return 2;
+	}
+	bool stmt = !(state & QML_EXPR), prev_op = true;
+	int expect = 0; /* 1 function name, 2 type (class / new) */
+	while (i < n) {
+		u8 c = (u8)s[i];
+		if (is_space(c)) {
+			i++;
+			continue;
+		}
+		if (stmt && js_idstart(c)) {
+			stmt = false;
+			u32 j = qml_stmt(s, n, i, o);
+			if (j != i) {
+				i = j;
+				prev_op = false;
+				continue;
+			}
+		}
+		stmt = false;
+		if (c == '/' && i + 1 < n && s[i + 1] == '/') {
+			emit(o, i, n - i, TK_COMMENT);
+			break;
+		}
+		if (c == '/' && i + 1 < n && s[i + 1] == '*') {
+			emit(o, i, 2, TK_COMMENT);
+			i = java_comment(s, n, i + 2, false, &closed, o);
+			if (!closed)
+				return 1;
+			continue;
+		}
+		if (c == '"' || c == '\'') {
+			i = js_quoted(s, n, i, o);
+			prev_op = false;
+			continue;
+		}
+		if (c == '`') {
+			emit(o, i, 1, TK_STRING);
+			i = js_template(s, n, i + 1, &closed, o);
+			if (!closed)
+				return 2;
+			prev_op = false;
+			continue;
+		}
+		if (c == '/' && prev_op) {
+			u32 e = js_regex(s, n, i);
+			if (e) {
+				emit(o, i, e - i, TK_REGEX);
+				i = e;
+				prev_op = false;
+				continue;
+			}
+		}
+		if (is_digit(c) || (c == '.' && i + 1 < n && is_digit((u8)s[i + 1]))) {
+			u32 e = jv_number(s, n, i);
+			if (e < n && s[e] == 'n')
+				e++; /* BigInt */
+			emit(o, i, e - i, TK_NUMBER);
+			i = e;
+			prev_op = false;
+			continue;
+		}
+		if (js_idstart(c)) {
+			u32 a = i, e = qml_word_end(s, n, i), len = e - a;
+			bool after_dot = a > 0 && s[a - 1] == '.' && !(a > 1 && s[a - 2] == '.');
+			int k = after_dot ? -1 : kw_find(&kw_qml, s + a, len);
+			u32 nx = skip_ws(s, n, e);
+			u8 nc = nx < n ? (u8)s[nx] : 0;
+			if (k == QK_CTXST && !(nc && (js_idstart(nc) || (nc == '(' && s[a] == 'a'))))
+				k = -1;
+			u32 cls;
+			prev_op = k > 0 && k != QK_CONST;
+			if (expect == 1) {
+				cls = TK_FUNCTION;
+			} else if (expect == 2) {
+				cls = TK_TYPE;
+			} else if (k == QK_CTRL || k == QK_IMPORT) {
+				cls = TK_CONTROL;
+			} else if (k == QK_CONST) {
+				cls = TK_LANGCONST;
+			} else if (k > 0) {
+				cls = TK_STORAGE;
+			} else if (nc == '(') {
+				cls = TK_FUNCTION;
+			} else {
+				bool caps = len >= 2 && is_upper((u8)s[a]);
+				for (u32 q = a; q < e && caps; q++)
+					if (!(is_upper((u8)s[q]) || is_digit((u8)s[q]) || s[q] == '_'))
+						caps = false;
+				bool enum_val = false;
+				if (after_dot && is_upper((u8)s[a])) {
+					u32 p = a - 1;
+					while (p > 0 && js_ident((u8)s[p - 1]))
+						p--;
+					enum_val = p < a - 1 && is_upper((u8)s[p]);
+				}
+				cls = caps || enum_val ? TK_CONSTANT : is_upper((u8)s[a]) ? TK_TYPE : TK_VARIABLE;
+			}
+			if (expect == 2 && e < n && s[e] == '.')
+				; /* new A.B: keep expecting */
+			else
+				expect = k == QK_FUNC ? 1 : k == QK_CLASS || k == QK_NEW ? 2 : 0;
+			emit(o, a, len, cls);
+			i = e;
+			continue;
+		}
+		if (c == '=' && i + 1 < n && s[i + 1] == '>') {
+			emit(o, i, 2, TK_STORAGE); /* storage.type.function.arrow */
+			i += 2;
+			prev_op = true;
+			continue;
+		}
+		if (c == '{' || c == ';' || c == '}')
+			stmt = true;
+		if (c == '.' && expect == 2) {
+			i++;
+			continue;
+		}
+		expect = 0;
+		if (c && strchr("+-*/%=!&|^~?:<>", c))
+			emit(o, i, 1, TK_OPERATOR);
+		prev_op = !(c == ')' || c == ']');
+		i++;
+	}
+	return 0;
+}
+
+/* ================================================================== */
+/* qmake                                                               */
+/*
+ * VSCodium ships no qmake grammar; this follows the Qt extension's
+ * qmake grammar under Dark+/Light+:
+ *   assigned variables (QT += ...), $$var $${var} $$[QT_INSTALL_...]
+ *   $$(ENV) and $(MAKEVAR) references                 -> TK_VARIABLE
+ *   = += -= *= ~= and the : | ! of scopes             -> TK_OPERATOR
+ *   test functions (contains(...)) and $$replace(...) -> TK_FUNCTION
+ *   else for return break next defineTest defineReplace -> TK_CONTROL
+ *   scope conditions (win32 {, unix:!macx:)           -> TK_TYPE
+ *   "strings" (with references inside), # comments, and the \ that
+ *   continues a line (TK_ESCAPE).
+ *
+ * State: bit 0 the previous line ended with a continuation (the values
+ * of an assignment go on). */
+
+static inline bool qm_word(u8 c) { return is_alpha(c) || is_digit(c) || c == '_' || c == '.' || c == '-' || c >= 0x80; }
+
+/* $$name $${name} $$[prop] $$(env) $(make) reference at i: its end or i. */
+static u32 qm_ref(const char *s, u32 n, u32 i, SynSpans *o)
+{
+	bool dd = i + 1 < n && s[i + 1] == '$';
+	u32 j = i + (dd ? 2 : 1);
+	if (j >= n)
+		return i;
+	if (s[j] == '{' || s[j] == '[' || s[j] == '(') {
+		u8 cl = s[j] == '{' ? '}' : s[j] == '[' ? ']' : ')';
+		if (!dd && s[j] != '(')
+			return i;
+		u32 e = j + 1;
+		while (e < n && (u8)s[e] != cl)
+			e++;
+		if (e >= n)
+			return i;
+		emit(o, i, e + 1 - i, TK_VARIABLE);
+		return e + 1;
+	}
+	if (!dd)
+		return i;
+	u32 e = j;
+	while (e < n && (is_alpha((u8)s[e]) || is_digit((u8)s[e]) || s[e] == '_' || s[e] == '.'))
+		e++;
+	if (e == j)
+		return i;
+	emit(o, i, e - i, e < n && s[e] == '(' ? TK_FUNCTION : TK_VARIABLE);
+	return e;
+}
+
+static u32 lex_qmake(u32 state, const char *s, u32 n, SynSpans *o)
+{
+	bool cond = !(state & 1u); /* names are conditions, variables or calls */
+	bool incall = false, cont = false;
+	u32 i = 0, depth = 0;
+	while (i < n) {
+		u8 c = (u8)s[i];
+		if (is_space(c)) {
+			i++;
+			continue;
+		}
+		if (c == '#') {
+			emit(o, i, n - i, TK_COMMENT);
+			break;
+		}
+		if (c == '\\' && skip_ws(s, n, i + 1) == n) {
+			emit(o, i, 1, TK_ESCAPE);
+			cont = true;
+			break;
+		}
+		if (c == '"') {
+			u32 j = i + 1, run = i;
+			while (j < n && s[j] != '"') {
+				if (s[j] == '\\' && j + 1 < n) {
+					emit(o, run, j - run, TK_STRING);
+					emit(o, j, 2, TK_ESCAPE);
+					j = run = j + 2;
+					continue;
+				}
+				if (s[j] == '$' && qm_ref(s, n, j, NULL) > j) {
+					emit(o, run, j - run, TK_STRING);
+					j = run = qm_ref(s, n, j, o);
+					continue;
+				}
+				j++;
+			}
+			if (j < n)
+				j++;
+			emit(o, run, j - run, TK_STRING);
+			i = j;
+			continue;
+		}
+		if (c == '$') {
+			u32 e = qm_ref(s, n, i, o);
+			i = e > i ? e : i + 1;
+			continue;
+		}
+		if (cond && (is_alpha(c) || is_digit(c) || c == '_' || c >= 0x80)) {
+			u32 e = i;
+			while (e < n && qm_word((u8)s[e]))
+				e++;
+			u32 m = skip_ws(s, n, e), wl = e - i;
+			const char *w = s + i;
+			u8 nc = m < n ? (u8)s[m] : 0;
+			if (nc == '(') {
+				bool ctl = word_is(w, wl, "for") || word_is(w, wl, "return") || word_is(w, wl, "break") ||
+				           word_is(w, wl, "next") || word_is(w, wl, "defineTest") || word_is(w, wl, "defineReplace");
+				emit(o, i, wl, ctl ? TK_CONTROL : TK_FUNCTION);
+				cond = false;
+				incall = true;
+				depth = 0;
+				i = e;
+				continue;
+			}
+			bool op = nc == '=' ||
+			          ((nc == '+' || nc == '-' || nc == '*' || nc == '~') && m + 1 < n && s[m + 1] == '=');
+			if (op) {
+				u32 ol = nc == '=' ? 1 : 2;
+				emit(o, i, wl, TK_VARIABLE);
+				emit(o, m, ol, TK_OPERATOR);
+				i = m + ol;
+				cond = false;
+				continue;
+			}
+			if (word_is(w, wl, "else"))
+				emit(o, i, wl, TK_CONTROL);
+			else if (nc == ':' || nc == '|' || nc == '{')
+				emit(o, i, wl, TK_TYPE);
+			i = e;
+			continue;
+		}
+		if (cond && (c == ':' || c == '|' || c == '!')) {
+			emit(o, i, 1, TK_OPERATOR);
+			i++;
+			continue;
+		}
+		if (c == '{' || c == '}') {
+			cond = true;
+			incall = false;
+		} else if (c == '(') {
+			depth++;
+		} else if (c == ')') {
+			if (depth)
+				depth--;
+			if (incall && depth == 0) {
+				incall = false;
+				cond = true;
+			}
+		}
+		i++;
+	}
+	return cont ? 1u : 0u;
+}
+
+/* ================================================================== */
+/* GDScript                                                            */
+/*
+ * VSCodium ships no GDScript grammar; this follows godot-tools'
+ * GDScript.tmLanguage under Dark+/Light+:
+ *   keyword.control (if elif else for while match when break continue
+ *   pass return await), the $ / % of node paths      -> TK_CONTROL
+ *   keyword.language (func class class_name extends signal enum const var
+ *   static is as in and or not void ...), get/set of properties
+ *                                                     -> TK_STORAGE
+ *   built-in and PascalCase types, class names        -> TK_TYPE
+ *   func / signal names, calls, @annotations          -> TK_FUNCTION
+ *   names (var names, properties)                     -> TK_VARIABLE
+ *   const names, ALL_CAPS, enum members, the & of &"StringName" and the
+ *   ^ of ^"NodePath"                                  -> TK_CONSTANT
+ *   true false null self super PI TAU INF NAN         -> TK_LANGCONST
+ *   node path names ($Path/To/Node, %Unique)          -> TK_ESCAPE
+ * Strings are Python's ('', "", ''' ''', """ """, r'' raw, % and {}
+ * placeholders).
+ *
+ * State: bits 0-1 triple-quoted string (1 ''', 2 """), bit 2 raw. */
+
+enum { GDK_CTRL = 1, GDK_KW, GDK_CONST, GDK_TYPE, GDK_FUNC, GDK_CLASS, GDK_SIGNAL, GDK_CONSTDECL, GDK_VAR, GDK_GETSET };
+static KwSet kw_gd;
+static const char gd_ctrl[] = "if elif else for while match when break continue pass return await yield";
+static const char gd_kw[] = "static is as in and or not void breakpoint assert setget tool onready export remote "
+                            "master puppet remotesync mastersync puppetsync sync trait namespace";
+static const char gd_type[] = "bool int float String StringName NodePath Vector2 Vector2i Vector3 Vector3i Vector4 "
+                              "Vector4i Rect2 Rect2i Transform2D Transform3D Plane Quaternion AABB Basis Projection "
+                              "Color RID Object Callable Signal Dictionary Array Variant";
+
+static void gd_build(void)
+{
+	kw_list(&kw_gd, gd_ctrl, GDK_CTRL);
+	kw_list(&kw_gd, gd_kw, GDK_KW);
+	kw_list(&kw_gd, "true false null self super PI TAU INF NAN", GDK_CONST);
+	kw_list(&kw_gd, gd_type, GDK_TYPE);
+	kw_add(&kw_gd, "func", 4, GDK_FUNC);
+	kw_list(&kw_gd, "class class_name extends enum", GDK_CLASS);
+	kw_add(&kw_gd, "signal", 6, GDK_SIGNAL);
+	kw_add(&kw_gd, "const", 5, GDK_CONSTDECL);
+	kw_add(&kw_gd, "var", 3, GDK_VAR);
+	kw_list(&kw_gd, "get set", GDK_GETSET);
+}
+
+static u32 lex_gdscript(u32 state, const char *s, u32 n, SynSpans *o)
+{
+	u32 mode = state & 3u, i = 0;
+	bool closed;
+	if (mode == 1 || mode == 2) {
+		i = py_string_body(s, n, 0, mode == 1 ? '\'' : '"', true, (state & 4u) ? PYF_RAW : 0, &closed, o);
+		if (!closed)
+			return state;
+	}
+	int expect = 0; /* 1 function name, 2 type name, 3 variable name, 4 constant name */
+	bool prev_op = true, line_start = mode == 0;
+	while (i < n) {
+		u8 c = (u8)s[i];
+		if (is_space(c)) {
+			i++;
+			continue;
+		}
+		bool at_start = line_start;
+		line_start = false;
+		if (c == '#') {
+			emit(o, i, n - i, TK_COMMENT);
+			break;
+		}
+		/* strings: "" '' """ """ r"" &"StringName" ^"NodePath" */
+		u32 p = i;
+		if ((c == 'r' || c == '&' || c == '^') && i + 1 < n && (s[i + 1] == '"' || s[i + 1] == '\'') &&
+		    (c != 'r' || i == 0 || !py_ident((u8)s[i - 1])))
+			p = i + 1;
+		if (s[p] == '"' || s[p] == '\'') {
+			u8 q = (u8)s[p];
+			bool tri = p + 2 < n && (u8)s[p + 1] == q && (u8)s[p + 2] == q;
+			u32 fl = c == 'r' && p > i ? PYF_RAW : 0;
+			if (p > i)
+				emit(o, i, 1, c == 'r' ? TK_STORAGE : TK_CONSTANT);
+			u32 body = p + (tri ? 3 : 1);
+			emit(o, p, body - p, TK_STRING);
+			i = py_string_body(s, n, body, q, tri, fl, &closed, o);
+			if (!closed && tri)
+				return (q == '\'' ? 1u : 2u) | (fl ? 4u : 0u);
+			prev_op = false;
+			expect = 0;
+			continue;
+		}
+		/* $Node/Path, $"Path", %Unique */
+		if (c == '$' || (c == '%' && prev_op && i + 1 < n && (py_ident((u8)s[i + 1]) || s[i + 1] == '"'))) {
+			emit(o, i, 1, TK_CONTROL);
+			u32 j = i + 1;
+			if (j < n && (s[j] == '"' || s[j] == '\'')) {
+				u32 e = j + 1;
+				while (e < n && s[e] != s[j])
+					e++;
+				if (e < n)
+					e++;
+				emit(o, j, e - j, TK_STRING);
+				i = e;
+			} else {
+				u32 e = j;
+				while (e < n && (py_ident((u8)s[e]) || s[e] == '/' || s[e] == '%'))
+					e++;
+				emit(o, j, e - j, TK_ESCAPE);
+				i = e;
+			}
+			prev_op = false;
+			continue;
+		}
+		if (is_digit(c) || (c == '.' && i + 1 < n && is_digit((u8)s[i + 1]))) {
+			i = py_number(s, n, i, o);
+			prev_op = false;
+			continue;
+		}
+		if (c == '@' && i + 1 < n && py_ident((u8)s[i + 1])) {
+			u32 e = i + 1;
+			while (e < n && py_ident((u8)s[e]))
+				e++;
+			emit(o, i, e - i, TK_FUNCTION); /* entity.name.function.decorator */
+			i = e;
+			prev_op = true;
+			continue;
+		}
+		if (py_ident(c)) {
+			u32 a = i, e = i;
+			while (e < n && py_ident((u8)s[e]))
+				e++;
+			u32 len = e - a;
+			bool after_dot = a > 0 && s[a - 1] == '.';
+			int k = after_dot ? -1 : kw_find(&kw_gd, s + a, len);
+			u32 nx = skip_ws(s, n, e);
+			u8 nc = nx < n ? (u8)s[nx] : 0;
+			if (k == GDK_GETSET && !(at_start && (nc == ':' || nc == '(')))
+				k = -1;
+			u32 cls;
+			int next = 0;
+			if (expect == 1) {
+				cls = TK_FUNCTION;
+			} else if (expect == 2) {
+				cls = TK_TYPE;
+				if (nc == '.')
+					next = 2;
+			} else if (expect == 3) {
+				cls = TK_VARIABLE;
+			} else if (expect == 4) {
+				cls = TK_CONSTANT;
+			} else if (k == GDK_CTRL) {
+				cls = TK_CONTROL;
+			} else if (k == GDK_CONST) {
+				cls = TK_LANGCONST;
+			} else if (k == GDK_TYPE) {
+				cls = TK_TYPE;
+			} else if (k > 0) {
+				cls = TK_STORAGE;
+				next = k == GDK_FUNC || k == GDK_SIGNAL ? 1 : k == GDK_CLASS ? 2 : k == GDK_VAR ? 3 : k == GDK_CONSTDECL ? 4 : 0;
+			} else {
+				bool caps = len >= 2 && is_upper((u8)s[a]);
+				for (u32 q = a; q < e && caps; q++)
+					if (!(is_upper((u8)s[q]) || is_digit((u8)s[q]) || s[q] == '_'))
+						caps = false;
+				if (nc == '(')
+					cls = is_upper((u8)s[a]) && !caps ? TK_TYPE : TK_FUNCTION;
+				else if (caps)
+					cls = TK_CONSTANT;
+				else if (is_upper((u8)s[a]))
+					cls = TK_TYPE;
+				else
+					cls = TK_VARIABLE;
+			}
+			emit(o, a, len, cls);
+			expect = next;
+			prev_op = k > 0 && k != GDK_CONST && k != GDK_TYPE;
+			i = e;
+			continue;
+		}
+		if (c == '.' && expect == 2) {
+			i++;
+			continue;
+		}
+		expect = 0;
+		if (c && strchr("+-*/%=<>!&|^~", c)) {
+			u32 k = i + 1;
+			while (k < n && s[k] && strchr("+-*/%=<>!&|^~", s[k]) && k - i < 3)
+				k++;
+			emit(o, i, k - i, TK_OPERATOR);
+			i = k;
+			prev_op = true;
+			continue;
+		}
+		prev_op = !(c == ')' || c == ']' || c == '}');
+		i++;
+	}
+	return 0;
+}
+
+/* ================================================================== */
+/* Godot resources                                                     */
+/*
+ * .tscn .tres .godot .import (godot-tools' GodotResource grammar, INI-like)
+ * under Dark+/Light+:
+ *   [section key=value ...] headers: the section TK_TAG, header keys
+ *   TK_ATTR; key = value lines: keys (path/like/keys too) TK_PROPERTY;
+ *   values: strings with escapes, numbers (inf nan too), true/false/null
+ *   TK_LANGCONST, constructors Vector2(...) PackedStringArray(...) TK_TYPE,
+ *   ExtResource(...) SubResource(...) Resource(...) TK_FUNCTION, the & / ^
+ *   of &"StringName" / ^"NodePath" TK_CONSTANT; ; comments.
+ *
+ * State: 1 inside a string that spans lines (Godot writes multi-line text
+ * literally), 0 otherwise. */
+
+static u32 gr_string(const char *s, u32 n, u32 i, u32 st, bool *closed, SynSpans *o)
+{
+	u32 j = i, run = st;
+	*closed = false;
+	while (j < n) {
+		if (s[j] == '\\') {
+			emit(o, run, j - run, TK_STRING);
+			u32 e = js_escape(s, n, j);
+			emit(o, j, e - j, TK_ESCAPE);
+			j = run = e;
+			continue;
+		}
+		if (s[j] == '"') {
+			emit(o, run, j + 1 - run, TK_STRING);
+			*closed = true;
+			return j + 1;
+		}
+		j++;
+	}
+	emit(o, run, n - run, TK_STRING);
+	return n;
+}
+
+/* Values from i; in a header, stops at the closing ']' (its index). */
+static u32 gr_values(const char *s, u32 n, u32 i, bool header, bool *open, SynSpans *o)
+{
+	int depth = 0;
+	*open = false;
+	while (i < n) {
+		u8 c = (u8)s[i];
+		if (is_space(c)) {
+			i++;
+			continue;
+		}
+		if (c == ';' && !header) {
+			emit(o, i, n - i, TK_COMMENT);
+			return n;
+		}
+		if (c == '"' || ((c == '&' || c == '^') && i + 1 < n && s[i + 1] == '"')) {
+			u32 q = i;
+			if (c != '"') {
+				emit(o, i, 1, TK_CONSTANT);
+				q++;
+			}
+			bool closed;
+			i = gr_string(s, n, q + 1, q, &closed, o);
+			if (!closed) {
+				*open = true;
+				return n;
+			}
+			continue;
+		}
+		if (is_digit(c) || ((c == '-' || c == '+' || c == '.') && i + 1 < n && is_digit((u8)s[i + 1]))) {
+			u32 e = i + 1;
+			while (e < n && (is_digit((u8)s[e]) || s[e] == '.' || s[e] == '_' || (s[e] | 32) == 'e' ||
+			                 ((s[e] == '-' || s[e] == '+') && (s[e - 1] | 32) == 'e')))
+				e++;
+			emit(o, i, e - i, TK_NUMBER);
+			i = e;
+			continue;
+		}
+		if (is_alpha(c) || c == '_') {
+			u32 e = i;
+			while (e < n && (is_alpha((u8)s[e]) || is_digit((u8)s[e]) || s[e] == '_' || s[e] == '/'))
+				e++;
+			u32 m = skip_ws(s, n, e), wl = e - i;
+			const char *w = s + i;
+			u32 cls = TK_TEXT;
+			if (header && m < n && s[m] == '=')
+				cls = TK_ATTR;
+			else if (word_is(w, wl, "true") || word_is(w, wl, "false") || word_is(w, wl, "null"))
+				cls = TK_LANGCONST;
+			else if (word_is(w, wl, "inf") || word_is(w, wl, "nan") || word_is(w, wl, "inf_neg"))
+				cls = TK_NUMBER;
+			else if (m < n && s[m] == '(')
+				cls = word_is(w, wl, "ExtResource") || word_is(w, wl, "SubResource") || word_is(w, wl, "Resource")
+				          ? TK_FUNCTION
+				          : TK_TYPE;
+			emit(o, i, wl, cls);
+			i = e;
+			continue;
+		}
+		if (c == '[' || c == '{' || c == '(') {
+			depth++;
+		} else if (c == ']' || c == '}' || c == ')') {
+			if (header && depth == 0 && c == ']')
+				return i;
+			if (depth)
+				depth--;
+		}
+		i++;
+	}
+	return n;
+}
+
+static u32 lex_godot_res(u32 state, const char *s, u32 n, SynSpans *o)
+{
+	u32 i = 0;
+	bool closed, open;
+	if (state & 1u) {
+		i = gr_string(s, n, 0, 0, &closed, o);
+		if (!closed)
+			return 1;
+		gr_values(s, n, i, false, &open, o);
+		return open ? 1u : 0u;
+	}
+	i = skip_ws(s, n, 0);
+	if (i >= n)
+		return 0;
+	if (s[i] == ';' || s[i] == '#') {
+		emit(o, i, n - i, TK_COMMENT);
+		return 0;
+	}
+	if (s[i] == '[') {
+		u32 e = i + 1;
+		while (e < n && (is_alpha((u8)s[e]) || is_digit((u8)s[e]) || s[e] == '_' || s[e] == '.' || s[e] == '/' || s[e] == '-'))
+			e++;
+		if (e > i + 1) {
+			emit(o, i, e - i, TK_TAG);
+			u32 j = gr_values(s, n, e, true, &open, o);
+			if (open)
+				return 1;
+			if (j < n && s[j] == ']') {
+				emit(o, j, 1, TK_TAG);
+				j = skip_ws(s, n, j + 1);
+				if (j < n && s[j] == ';')
+					emit(o, j, n - j, TK_COMMENT);
+			}
+			return 0;
+		}
+	}
+	/* key = value */
+	u32 e = i;
+	while (e < n && (is_alpha((u8)s[e]) || is_digit((u8)s[e]) || s[e] == '_' || s[e] == '/' || s[e] == '.' ||
+	                 s[e] == ':' || s[e] == '-'))
+		e++;
+	u32 m = skip_ws(s, n, e);
+	if (e > i && m < n && s[m] == '=') {
+		emit(o, i, e - i, TK_PROPERTY);
+		i = m + 1;
+	}
+	gr_values(s, n, i, false, &open, o);
+	return open ? 1u : 0u;
+}
+
 static u32 lex_any(int lang, u32 state, const char *s, u32 n, SynSpans *o)
 {
 	switch (lang) {
@@ -7420,6 +9602,12 @@ static u32 lex_any(int lang, u32 state, const char *s, u32 n, SynSpans *o)
 	case LANG_TOML: return lex_toml(state, s, n, o);
 	case LANG_CPP: return lex_cpp(state, s, n, o);
 	case LANG_RUST: return lex_rust(state, s, n, o);
+	case LANG_CSHARP: return lex_csharp(state, s, n, o);
+	case LANG_QML: return lex_qml(state, s, n, o);
+	case LANG_QMAKE: return lex_qmake(state, s, n, o);
+	case LANG_GDSCRIPT: return lex_gdscript(state, s, n, o);
+	case LANG_GODOT_RES: return lex_godot_res(state, s, n, o);
+	case LANG_XML: return lex_xml(state, s, n, o);
 	default: return 0;
 	}
 }
@@ -7456,6 +9644,9 @@ static void syn_build2(void)
 	kt_build();
 	cpp_build();
 	rs_build();
+	cs_build();
+	qml_build();
+	gd_build();
 }
 
 /* ================================================================== */
@@ -7496,6 +9687,12 @@ const char *syn_lang_name(int lang)
 	case LANG_TOML: return "TOML";
 	case LANG_CPP: return "C++";
 	case LANG_RUST: return "Rust";
+	case LANG_CSHARP: return "C#";
+	case LANG_QML: return "QML";
+	case LANG_QMAKE: return "qmake";
+	case LANG_GDSCRIPT: return "GDScript";
+	case LANG_GODOT_RES: return "Godot Resource";
+	case LANG_XML: return "XML";
 	default: return "Plain Text";
 	}
 }
@@ -7526,6 +9723,10 @@ const char *syn_lang_lsp_id(int lang)
 	case LANG_TOML: return "toml";
 	case LANG_CPP: return "cpp";
 	case LANG_RUST: return "rust";
+	case LANG_CSHARP: return "csharp";
+	case LANG_QML: return "qml";
+	case LANG_GDSCRIPT: return "gdscript";
+	case LANG_XML: return "xml";
 	default: return NULL;
 	}
 }
@@ -7545,13 +9746,18 @@ const char *syn_line_comment(int lang)
 	case LANG_PYTHON:
 	case LANG_YAML:
 	case LANG_CODEOWNERS:
+	case LANG_QMAKE:
+	case LANG_GDSCRIPT:
 	case LANG_TOML: return "#";
 	case LANG_JSONC:
 	case LANG_JAVA:
 	case LANG_KOTLIN:
 	case LANG_CPP:
+	case LANG_CSHARP:
+	case LANG_QML:
 	case LANG_RUST: return "//";
 	case LANG_ASM_INTEL:
+	case LANG_GODOT_RES:
 	case LANG_LISP: return ";";
 	case LANG_TROFF: return ".\\\"";
 	default: return NULL;
@@ -7751,6 +9957,7 @@ int syn_lang_for_path(const char *path, const char *head, size_t headlen)
 	    {".clang-format", LANG_YAML},     {"_clang-format", LANG_YAML},     {".clang-tidy", LANG_YAML},
 	    {".clangd", LANG_YAML},           {"Cargo.lock", LANG_TOML},        {"Pipfile", LANG_TOML},
 	    {"poetry.lock", LANG_TOML},       {"uv.lock", LANG_TOML},           {"Gopkg.lock", LANG_TOML},
+	    {"project.godot", LANG_GODOT_RES},
 	};
 	for (size_t i = 0; i < VX_COUNT(names); i++)
 		if (!strcmp(base, names[i].name))
@@ -7779,12 +9986,14 @@ int syn_lang_for_path(const char *path, const char *head, size_t headlen)
 			return LANG_MAKE;
 		if (!bang && head && headlen >= 10 && memcmp(head, "diff --git", 10) == 0)
 			return LANG_DIFF;
+		if (!bang && xml_head(head, headlen))
+			return LANG_XML;
 		return bang;
 	}
 	char e[12];
 	size_t el = strlen(dot + 1);
 	if (el == 0 || el >= sizeof e)
-		return bang;
+		return bang ? bang : xml_head(head, headlen) ? LANG_XML : LANG_NONE;
 	for (size_t i = 0; i <= el; i++)
 		e[i] = (char)lower((u8)dot[1 + i]);
 	if (!strcmp(e, "c"))
@@ -7797,6 +10006,24 @@ int syn_lang_for_path(const char *path, const char *head, size_t headlen)
 			return LANG_CPP;
 	if (!strcmp(e, "rs"))
 		return LANG_RUST;
+	if (!strcmp(e, "cs") || !strcmp(e, "csx"))
+		return LANG_CSHARP;
+	if (!strcmp(e, "qml"))
+		return LANG_QML;
+	if (!strcmp(e, "pro") || !strcmp(e, "pri") || !strcmp(e, "prf") || !strcmp(e, "prl"))
+		return LANG_QMAKE;
+	if (!strcmp(e, "gd"))
+		return LANG_GDSCRIPT;
+	if (!strcmp(e, "tscn") || !strcmp(e, "tres") || !strcmp(e, "godot") || !strcmp(e, "import"))
+		return LANG_GODOT_RES;
+	if (!strcmp(e, "ts")) /* Qt Linguist translations; TypeScript has no lexer here */
+		return !head || !headlen || xml_head(head, headlen) || head[0] == '<' ? LANG_XML : bang;
+	static const char *const xml[] = {"xml", "ui", "qrc", "csproj", "props", "targets", "svg", "xsd",
+	                                  "xsl", "xslt", "plist", "resx", "xaml", "vcxproj", "fsproj",
+	                                  "vbproj", "nuspec", "wsdl"};
+	for (size_t i = 0; i < VX_COUNT(xml); i++)
+		if (!strcmp(e, xml[i]))
+			return LANG_XML;
 	if (!strcmp(e, "py") || !strcmp(e, "pyi") || !strcmp(e, "pyw") || !strcmp(e, "gyp") || !strcmp(e, "gypi"))
 		return LANG_PYTHON;
 	if (!strcmp(e, "yml") || !strcmp(e, "yaml"))
@@ -7862,5 +10089,7 @@ int syn_lang_for_path(const char *path, const char *head, size_t headlen)
 		if (ok && (el <= 4 || roff_head(head, headlen)))
 			return LANG_TROFF;
 	}
+	if (!bang && xml_head(head, headlen))
+		return LANG_XML;
 	return bang;
 }

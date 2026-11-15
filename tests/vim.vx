@@ -1,0 +1,134 @@
+# Vim emulation (VSCodeVim-like); run by tests/t_ui.sh.
+# Each section works on its own file and saves it with :w; t_ui.sh then
+# compares the files byte for byte.
+open src/ops.txt
+key ctrl+shift+p
+type toggle vim
+key Return
+# operators, motions, dot, undo/redo
+type dw
+expect text beta gamma\none
+type .
+expect text gamma\none two three
+type u
+expect text beta gamma\none
+key ctrl+r
+expect text gamma\none two three
+type j
+type cwONE
+key Escape
+expect text ONE two three
+type w.
+expect text ONE ONE three
+# text objects
+type j0f(
+type di(
+expect text x() y
+type j
+type ci"bye
+key Escape
+expect text say "bye" ok
+# yank / put (linewise), counts
+type yyp
+expect text say "bye" ok\nsay "bye" ok\nlast
+type 3x
+expect text \n "bye" ok\nlast
+# G goes to the empty line after the final newline, as in VSCodeVim
+type Gk
+type gUiw
+expect text LAST line
+type >>
+expect text     LAST line
+type <<
+type ggJ
+expect text gamma ONE ONE three
+# ex substitutions: current line, whole file with a group
+type :s/ONE/1/g\n
+expect text gamma 1 1 three
+type :%s/b(y)e/B\\1E/\n
+expect text say "ByE" ok\n "ByE" ok
+type :w\n
+
+# visual mode, registers, replace mode, marks, search
+open src/vis.txt
+type vey
+type $p
+expect text one two three fourone
+type u
+type 0"ayiw
+type j"aP
+expect text onefive six seven
+type Vjd
+expect text four\nten
+type P
+expect text four\nonefive six seven\neight nine\nten
+type ggwviwU
+expect text one TWO three
+type wvllohd
+expect text one TWOee four
+type 0d2w
+expect text four\nonefive
+type j0Rxyz
+key Escape
+expect text xyzfive six
+type 0Rab
+key Backspace
+key Escape
+expect text ayzfive six
+type r!
+expect text !yzfive six
+type 3~
+expect text !YZfive six
+type majj
+expect line 4
+type 'a
+expect line 2
+type /nine\n
+expect line 3
+type ?four\n
+expect line 1
+# the command line shows in the status bar with a caret
+type :wq
+shot build/vim-cmdline.png
+key Escape
+type :w\n
+
+# counted inserts, o + dot, block objects, %, f/;, Ctrl+W, "+ clipboard
+open src/misc.c
+type 3Ax
+key Escape
+expect text int f(int a)xxx
+type oadd
+key Escape
+expect text xxx\nadd\n{
+type .
+expect text add\nadd\n{
+type jj
+type di{
+expect text add\n{\n}\nfoo
+type u
+expect text {\n\treturn a;\n}
+type k%
+expect line 6
+type j0*
+type x
+expect text foo oo bar
+type 0tbD
+expect text \nfoo oo\n
+type 0fo;;x
+expect text \nfoo o\n
+type A bar baz
+key ctrl+w
+key Escape
+expect text \nfoo o bar \n
+type 0"+yiw
+type $"+p
+expect text \nfoo o bar foo\n
+type :w\n
+# block cursor in normal mode, visual selection
+type ggvj
+shot build/vim-visual.png
+key Escape
+shot build/vim-normal.png
+type :e src/ops.txt\n
+expect file ops.txt

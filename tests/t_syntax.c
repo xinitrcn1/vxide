@@ -1662,7 +1662,7 @@ static void test_detect5(void)
 static void test_cpp(void)
 {
 	u32 s;
-	CHECK(LANG_CPP == 23 && LANG_RUST == 24 && LANG_COUNT == 25);
+	CHECK(LANG_CPP == 23 && LANG_RUST == 24);
 	s = lex(LANG_CPP, 0, "#include <vector> // std");
 	T("#include", TK_CONTROL);
 	T("<vector>", TK_STRING);
@@ -2011,6 +2011,862 @@ static void test_detect6(void)
 	CHECK(lex(LANG_CPP, 0, "R\"0123456789abcdef(") < (1u << SYN_STATE_BITS));
 }
 
+static void test_csharp(void)
+{
+	u32 s;
+	CHECK(LANG_CSHARP == 25 && LANG_QML == 26 && LANG_QMAKE == 27 && LANG_GDSCRIPT == 28 && LANG_GODOT_RES == 29 &&
+	      LANG_XML == 30 && LANG_COUNT == 31);
+	/* using directives, namespaces, aliases */
+	lex(LANG_CSHARP, 0, "using System.Collections.Generic;");
+	T("using", TK_CONTROL);
+	T("System", TK_TYPE);
+	T("Generic", TK_TYPE);
+	lex(LANG_CSHARP, 0, "global using static System.Math; using Foo = Bar.Baz;");
+	T("global", TK_STORAGE);
+	T("static", TK_STORAGE);
+	T("Math", TK_TYPE);
+	T("Foo", TK_TYPE);
+	T("Baz", TK_TYPE);
+	lex(LANG_CSHARP, 0, "namespace App.Core;");
+	T("namespace", TK_STORAGE);
+	T("App", TK_TYPE);
+	T("Core", TK_TYPE);
+	lex(LANG_CSHARP, 0, "using (var f = File.Open(p)) { }");
+	T("using", TK_CONTROL);
+	T("var", TK_STORAGE);
+	T("f", TK_VARIABLE);
+	T("File", TK_VARIABLE);
+	T("Open", TK_FUNCTION);
+	/* declarations: modifiers, generics, base lists, constraints */
+	lex(LANG_CSHARP, 0, "public sealed partial class Repo<T> : IRepo<T>, IDisposable where T : class, new()");
+	T("public", TK_STORAGE);
+	T("sealed", TK_STORAGE);
+	T("partial", TK_STORAGE);
+	TN("class", 0, TK_STORAGE);
+	T("Repo", TK_TYPE);
+	TN("T", 0, TK_TYPE);
+	T("IRepo", TK_TYPE);
+	T("IDisposable", TK_TYPE);
+	T("where", TK_STORAGE);
+	TN("T", 2, TK_TYPE);
+	TN("class", 1, TK_STORAGE);
+	T("new", TK_STORAGE);
+	lex(LANG_CSHARP, 0, "file record struct Point(int X, int Y) : IShape;");
+	T("file", TK_STORAGE);
+	T("record", TK_STORAGE);
+	T("struct", TK_STORAGE);
+	T("Point", TK_TYPE);
+	TN("int", 1, TK_STORAGE);
+	T("X", TK_VARIABLE);
+	T("IShape", TK_TYPE);
+	lex(LANG_CSHARP, 0, "public required string Name { get; init; } = \"\";");
+	T("required", TK_STORAGE);
+	T("string", TK_STORAGE);
+	T("Name", TK_VARIABLE);
+	T("get", TK_STORAGE);
+	T("init", TK_STORAGE);
+	lex(LANG_CSHARP, 0, "private readonly Dictionary<string, List<int>> _map = new();");
+	T("Dictionary", TK_TYPE);
+	T("List", TK_TYPE);
+	T("int", TK_STORAGE);
+	T("_map", TK_VARIABLE);
+	T("new", TK_STORAGE);
+	lex(LANG_CSHARP, 0, "public async Task<int> GetAsync(int id, CancellationToken ct = default) => await Get<int>(id);");
+	T("async", TK_STORAGE);
+	T("Task", TK_TYPE);
+	T("GetAsync", TK_FUNCTION);
+	T("id", TK_VARIABLE);
+	T("CancellationToken", TK_TYPE);
+	T("ct", TK_VARIABLE);
+	T("default", TK_STORAGE);
+	T("await", TK_STORAGE);
+	T("Get", TK_FUNCTION);
+	T("=>", TK_OPERATOR);
+	lex(LANG_CSHARP, 0, "delegate void Handler(object sender); scoped ref Span<byte> b = ref x;");
+	T("delegate", TK_STORAGE);
+	T("void", TK_STORAGE);
+	T("Handler", TK_TYPE);
+	T("object", TK_STORAGE);
+	T("sender", TK_VARIABLE);
+	T("scoped", TK_STORAGE);
+	TN("ref", 0, TK_STORAGE);
+	T("Span", TK_TYPE);
+	T("byte", TK_STORAGE);
+	/* contextual keywords stay names elsewhere */
+	lex(LANG_CSHARP, 0, "var var = file + record; get = value; where.x = select;");
+	TN("var", 0, TK_STORAGE);
+	TN("var", 1, TK_VARIABLE);
+	T("file", TK_VARIABLE);
+	T("record", TK_VARIABLE);
+	T("get", TK_VARIABLE);
+	T("where", TK_VARIABLE);
+	T("select", TK_VARIABLE);
+	/* statements, patterns, casts */
+	lex(LANG_CSHARP, 0, "if (obj is not null and Foo fx) return (int)fx.Count;");
+	T("if", TK_CONTROL);
+	T("is", TK_STORAGE);
+	T("not", TK_STORAGE);
+	T("null", TK_LANGCONST);
+	T("and", TK_STORAGE);
+	T("Foo", TK_TYPE);
+	T("fx", TK_VARIABLE);
+	T("return", TK_CONTROL);
+	T("int", TK_STORAGE);
+	T("Count", TK_VARIABLE);
+	lex(LANG_CSHARP, 0, "var n = (List<Item>)obj; if (ok) Run(); var s = x as string;");
+	T("List", TK_TYPE);
+	T("Item", TK_TYPE);
+	T("ok", TK_VARIABLE);
+	T("Run", TK_FUNCTION);
+	T("as", TK_STORAGE);
+	lex(LANG_CSHARP, 0, "foreach (var item in items) { yield return item; } x = y switch { > 0 or < -1 => 1, _ => 0 };");
+	T("foreach", TK_CONTROL);
+	T("in", TK_CONTROL);
+	T("yield", TK_CONTROL);
+	T("switch", TK_CONTROL);
+	TN("or", 1, TK_STORAGE);
+	T("_", TK_LANGCONST);
+	lex(LANG_CSHARP, 0, "switch (k) { case Foo x when x.Ok: break; default: goto case 1; }");
+	T("case", TK_CONTROL);
+	T("Foo", TK_TYPE);
+	T("when", TK_CONTROL);
+	T("default", TK_CONTROL);
+	T("goto", TK_CONTROL);
+	lex(LANG_CSHARP, 0, "var t = typeof(Dictionary<,>); var z = default(T); var nm = nameof(x); checked { }");
+	T("typeof", TK_STORAGE);
+	T("Dictionary", TK_TYPE);
+	T("default", TK_STORAGE);
+	T("T", TK_TYPE);
+	T("nameof", TK_STORAGE);
+	T("checked", TK_CONTROL);
+	lex(LANG_CSHARP, 0, "var p = point with { X = 1 }; Foo? maybe = null; Foo[] arr = [a, b]; this.x = base.y;");
+	T("with", TK_STORAGE);
+	TN("Foo", 0, TK_TYPE);
+	TN("Foo", 1, TK_TYPE);
+	T("this", TK_LANGCONST);
+	T("base", TK_LANGCONST);
+	lex(LANG_CSHARP, 0, "var q = from c in list where c.Age > 1 orderby c.Name descending select c;");
+	T("from", TK_STORAGE);
+	T("in", TK_STORAGE);
+	T("where", TK_STORAGE);
+	T("orderby", TK_STORAGE);
+	T("descending", TK_STORAGE);
+	T("select", TK_STORAGE);
+	lex(LANG_CSHARP, 0, "var x = new Foo.Bar<int>(1); throw new InvalidOperationException();");
+	T("Foo", TK_TYPE);
+	T("Bar", TK_TYPE);
+	T("throw", TK_CONTROL);
+	T("InvalidOperationException", TK_TYPE);
+	lex(LANG_CSHARP, 0, "lock (o) { } fixed (byte* p = buf) { } unsafe { } int @class = 1;");
+	T("lock", TK_CONTROL);
+	T("fixed", TK_CONTROL);
+	T("unsafe", TK_CONTROL);
+	T("@class", TK_VARIABLE);
+	/* numbers */
+	lex(LANG_CSHARP, 0, "x = 0xFF_FFu + 0b1010_1010 + 1_000UL + 3.14e-2f + 1.5m + .5d + 10L; r = 1..^2;");
+	T("0xFF_FFu", TK_NUMBER);
+	T("0b1010_1010", TK_NUMBER);
+	T("1_000UL", TK_NUMBER);
+	T("3.14e-2f", TK_NUMBER);
+	T("1.5m", TK_NUMBER);
+	T(".5d", TK_NUMBER);
+	T("10L", TK_NUMBER);
+	T("..", TK_OPERATOR);
+	/* strings and chars */
+	lex(LANG_CSHARP, 0, "s = \"a\\tb\\u0041\\x7\"; c = '\\n'; d = 'x'; e = '\\'';");
+	T("\"a", TK_STRING);
+	T("\\t", TK_ESCAPE);
+	T("\\u0041", TK_ESCAPE);
+	T("\\x7", TK_ESCAPE);
+	T("\\n", TK_ESCAPE);
+	T("'x'", TK_STRING);
+	lex(LANG_CSHARP, 0, "p = @\"C:\\tmp\\\"\"q\"\"\"; ok = 1;");
+	T("@\"C:\\tmp\\", TK_STRING);
+	TN("\"\"", 0, TK_ESCAPE);
+	T("ok", TK_VARIABLE);
+	lex(LANG_CSHARP, 0, "t = $\"Hi {name,10:N2} {{x}} {(a ? b : c)} {Get(\"k\")}\";");
+	T("$\"Hi ", TK_STRING);
+	T("name", TK_VARIABLE);
+	T("10", TK_NUMBER);
+	T(":N2", TK_STRING);
+	T("{{", TK_ESCAPE);
+	T("}}", TK_ESCAPE);
+	T("a", TK_VARIABLE);
+	T("Get", TK_FUNCTION);
+	T("\"k\"", TK_STRING);
+	lex(LANG_CSHARP, 0, "u = @$\"{a}\\n\" + $@\"{b}\";");
+	T("@$\"", TK_STRING);
+	T("a", TK_VARIABLE);
+	T("\\n\"", TK_STRING);
+	T("b", TK_VARIABLE);
+	lex(LANG_CSHARP, 0, "r = \"\"\"say \"hi\" \"\"\"; e = \"\"; r2 = $$\"\"\"{\"a\": {{v}}}\"\"\";");
+	T("\"\"\"say \"hi\" \"\"\"", TK_STRING);
+	T("e", TK_VARIABLE);
+	T("{\"a\": ", TK_STRING);
+	T("v", TK_VARIABLE);
+	T("}\"\"\"", TK_STRING);
+	/* multi-line: raw strings keep their quote and '$' counts */
+	s = lex(LANG_CSHARP, 0, "var raw = $$\"\"\"\"");
+	CHECK((s & 3u) == 3u && ((s >> 3) & 31u) == 4u && ((s >> 8) & 7u) == 2u);
+	s = lex(LANG_CSHARP, s, "  text \"\"\" {x} {{y}}");
+	T("  text \"\"\" {x} ", TK_STRING);
+	T("y", TK_VARIABLE);
+	CHECK((s & 3u) == 3u);
+	s = lex(LANG_CSHARP, s, "  \"\"\"\"; int z = 1;");
+	T("  \"\"\"\"", TK_STRING);
+	T("int", TK_STORAGE);
+	CHECK(s == 0);
+	/* verbatim strings span lines; interpolated ones keep the flag */
+	s = lex(LANG_CSHARP, 0, "var v = $@\"multi {x}");
+	CHECK((s & 3u) == 2u && (s & 4u));
+	s = lex(LANG_CSHARP, s, "\"\"q\"\" {y} line\"; z = 2;");
+	T("\"\"", TK_ESCAPE);
+	T("y", TK_VARIABLE);
+	T("z", TK_VARIABLE);
+	CHECK(s == 0);
+	s = lex(LANG_CSHARP, 0, "var w = @\"no {x}");
+	CHECK(s == 2u);
+	s = lex(LANG_CSHARP, s, "{y}\";");
+	T("{y}\"", TK_STRING);
+	CHECK(s == 0);
+	/* a regular string ends at the line */
+	s = lex(LANG_CSHARP, 0, "var bad = \"open");
+	CHECK(s == 0);
+	/* block comments */
+	s = lex(LANG_CSHARP, 0, "int a; /* block");
+	CHECK(s == 1u);
+	s = lex(LANG_CSHARP, s, "still */ int b;");
+	T("still */", TK_COMMENT);
+	T("int", TK_STORAGE);
+	CHECK(s == 0);
+	/* doc comments, attributes, preprocessor */
+	lex(LANG_CSHARP, 0, "/// <param name=\"x\">The <see cref=\"T\"/> &amp; more</param>");
+	T("/// ", TK_COMMENT);
+	T("<", TK_TAGPUNCT);
+	T("param", TK_TAG);
+	T("name", TK_ATTR);
+	T("\"x\"", TK_STRING);
+	T("The ", TK_COMMENT);
+	T("/>", TK_TAGPUNCT);
+	T("&amp;", TK_LANGCONST);
+	T("</", TK_TAGPUNCT);
+	lex(LANG_CSHARP, 0, "// plain <b>not</b> xml");
+	T("// plain <b>not</b> xml", TK_COMMENT);
+	lex(LANG_CSHARP, 0, "[assembly: InternalsVisibleTo(\"Tests\")]");
+	T("assembly", TK_STORAGE);
+	T("InternalsVisibleTo", TK_TYPE);
+	lex(LANG_CSHARP, 0, "[Serializable, Obsolete(\"x\"), Foo.Bar] void M([NotNull] string text, int[] nums) { nums[0] = 1; }");
+	T("Serializable", TK_TYPE);
+	T("Obsolete", TK_TYPE);
+	T("Foo", TK_TYPE);
+	T("Bar", TK_TYPE);
+	T("M", TK_FUNCTION);
+	T("NotNull", TK_TYPE);
+	T("text", TK_VARIABLE);
+	T("nums", TK_VARIABLE);
+	lex(LANG_CSHARP, 0, "#if DEBUG && !TRACE // why");
+	T("#if", TK_PREPROC);
+	T("DEBUG", TK_VARIABLE);
+	T("&&", TK_OPERATOR);
+	T("TRACE", TK_VARIABLE);
+	T("// why", TK_COMMENT);
+	lex(LANG_CSHARP, 0, "  #region Helper methods  ");
+	T("#region", TK_PREPROC);
+	T("Helper methods", TK_STRING);
+	lex(LANG_CSHARP, 0, "#nullable enable");
+	T("#nullable", TK_PREPROC);
+	T("enable", TK_PREPROC);
+	lex(LANG_CSHARP, 0, "#pragma warning disable CS0168");
+	T("warning", TK_PREPROC);
+	lex(LANG_CSHARP, 0, "#define X");
+	T("X", TK_VARIABLE);
+	/* states stay within the embeddable width */
+	CHECK(lex(LANG_CSHARP, 0, "x = $$$$$$$$$$\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"") < (1u << SYN_STATE_BITS));
+	/* deep interpolation nesting is bounded */
+	char deep[2048];
+	u32 dl = 0;
+	for (int k = 0; k < 200; k++) {
+		memcpy(deep + dl, "$\"{", 3);
+		dl += 3;
+	}
+	deep[dl] = 0;
+	lex(LANG_CSHARP, 0, deep);
+}
+
+static void test_qml(void)
+{
+	u32 s;
+	lex(LANG_QML, 0, "import QtQuick.Controls 2.15 as QQC");
+	T("import", TK_CONTROL);
+	T("QtQuick", TK_TYPE);
+	T("Controls", TK_TYPE);
+	T("2.15", TK_NUMBER);
+	T("as", TK_CONTROL);
+	T("QQC", TK_TYPE);
+	lex(LANG_QML, 0, "import \"util.js\" as Util");
+	T("\"util.js\"", TK_STRING);
+	T("Util", TK_TYPE);
+	lex(LANG_QML, 0, "pragma Singleton");
+	T("pragma", TK_CONTROL);
+	T("Singleton", TK_TYPE);
+	lex(LANG_QML, 0, "Item {");
+	T("Item", TK_TYPE);
+	lex(LANG_QML, 0, "    id: root");
+	T("id", TK_STORAGE);
+	T("root", TK_VARIABLE);
+	lex(LANG_QML, 0, "    readonly property int count: 3 * 2");
+	T("readonly", TK_STORAGE);
+	T("property", TK_STORAGE);
+	T("int", TK_TYPE);
+	T("count", TK_VARIABLE);
+	T("3", TK_NUMBER);
+	lex(LANG_QML, 0, "required property list<Item> kids; default property alias content: box.data");
+	T("required", TK_STORAGE);
+	T("list", TK_TYPE);
+	T("Item", TK_TYPE);
+	T("kids", TK_VARIABLE);
+	T("default", TK_STORAGE);
+	T("alias", TK_STORAGE);
+	T("content", TK_VARIABLE);
+	T("data", TK_VARIABLE);
+	lex(LANG_QML, 0, "signal clicked(int x, y: real)");
+	T("signal", TK_STORAGE);
+	T("clicked", TK_FUNCTION);
+	T("int", TK_TYPE);
+	T("x", TK_VARIABLE);
+	T("y", TK_VARIABLE);
+	T("real", TK_TYPE);
+	lex(LANG_QML, 0, "Layout.fillWidth: true; anchors.fill: parent");
+	T("Layout", TK_TYPE);
+	T("fillWidth", TK_VARIABLE);
+	T("true", TK_LANGCONST);
+	T("anchors", TK_VARIABLE);
+	T("fill", TK_VARIABLE);
+	T("parent", TK_VARIABLE);
+	lex(LANG_QML, 0, "onClicked: console.log(`n=${count + 1}`, /ab+c/gi.test(name), a / b)");
+	T("onClicked", TK_FUNCTION);
+	T("console", TK_VARIABLE);
+	T("log", TK_FUNCTION);
+	T("`n=", TK_STRING);
+	T("${", TK_STORAGE);
+	T("count", TK_VARIABLE);
+	T("1", TK_NUMBER);
+	T("}", TK_STORAGE);
+	T("/ab+c/gi", TK_REGEX);
+	T("test", TK_FUNCTION);
+	TN("/", 2, TK_OPERATOR);
+	lex(LANG_QML, 0, "Component.onCompleted: { var x = Text.AlignLeft; if (x) return MAX_N }");
+	T("Component", TK_TYPE);
+	T("onCompleted", TK_FUNCTION);
+	T("var", TK_STORAGE);
+	T("Text", TK_TYPE);
+	T("AlignLeft", TK_CONSTANT);
+	T("if", TK_CONTROL);
+	T("return", TK_CONTROL);
+	T("MAX_N", TK_CONSTANT);
+	lex(LANG_QML, 0, "Behavior on opacity { NumberAnimation { duration: 200 } }");
+	T("Behavior", TK_TYPE);
+	T("on", TK_STORAGE);
+	T("opacity", TK_VARIABLE);
+	T("NumberAnimation", TK_TYPE);
+	T("duration", TK_VARIABLE);
+	lex(LANG_QML, 0, "QQC.Button { text: qsTr(\"Hi\\n\") }");
+	T("QQC", TK_TYPE);
+	T("Button", TK_TYPE);
+	T("qsTr", TK_FUNCTION);
+	T("\\n", TK_ESCAPE);
+	lex(LANG_QML, 0, "function doIt(a, b) { let r = new Date(); return typeof a === 'x' ? null : r }");
+	T("function", TK_STORAGE);
+	T("doIt", TK_FUNCTION);
+	T("let", TK_STORAGE);
+	T("new", TK_STORAGE);
+	T("Date", TK_TYPE);
+	T("typeof", TK_STORAGE);
+	T("'x'", TK_STRING);
+	T("null", TK_LANGCONST);
+	lex(LANG_QML, 0, "component Tag: Rectangle { color: \"red\" }");
+	T("component", TK_STORAGE);
+	T("Tag", TK_TYPE);
+	T("Rectangle", TK_TYPE);
+	T("color", TK_VARIABLE);
+	lex(LANG_QML, 0, "enum Mode { Idle, Busy }");
+	T("enum", TK_STORAGE);
+	T("Mode", TK_TYPE);
+	lex(LANG_QML, 0, "onPressed: (mouse) => { for (const p of pts) mouse.accepted = false }");
+	T("onPressed", TK_FUNCTION);
+	T("=>", TK_STORAGE);
+	T("for", TK_CONTROL);
+	T("const", TK_STORAGE);
+	T("of", TK_STORAGE);
+	T("accepted", TK_VARIABLE);
+	/* switch/default stay JavaScript */
+	lex(LANG_QML, 0, "switch (k) { case 1: break; default: x = 0 }");
+	T("switch", TK_CONTROL);
+	T("case", TK_CONTROL);
+	T("default", TK_CONTROL);
+	/* block comments and template strings span lines */
+	s = lex(LANG_QML, 0, "/* multi");
+	CHECK(s == 1u);
+	s = lex(LANG_QML, s, "   line */ width: 10");
+	T("   line */", TK_COMMENT);
+	T("width", TK_VARIABLE);
+	CHECK(s == 0);
+	s = lex(LANG_QML, 0, "property string t: `first ${a}");
+	CHECK(s == 2u);
+	T("a", TK_VARIABLE);
+	s = lex(LANG_QML, s, "second ${b} \\` end` + x");
+	T("second ", TK_STRING);
+	T("b", TK_VARIABLE);
+	T("\\`", TK_ESCAPE);
+	T("x", TK_VARIABLE);
+	CHECK(s == 0);
+}
+
+static void test_qmake(void)
+{
+	u32 s;
+	lex(LANG_QMAKE, 0, "QT += core gui widgets  # comment");
+	T("QT", TK_VARIABLE);
+	T("+=", TK_OPERATOR);
+	T("core gui widgets", TK_TEXT);
+	T("# comment", TK_COMMENT);
+	lex(LANG_QMAKE, 0, "TEMPLATE = app");
+	T("TEMPLATE", TK_VARIABLE);
+	T("=", TK_OPERATOR);
+	lex(LANG_QMAKE, 0, "CONFIG -= x; DEFINES *= A; LIST ~= s/a/b/");
+	T("-=", TK_OPERATOR);
+	lex(LANG_QMAKE, 0, "DEFINES ~= s/FOO/BAR/");
+	T("~=", TK_OPERATOR);
+	lex(LANG_QMAKE, 0, "QMAKE_CXXFLAGS *= -O2");
+	T("QMAKE_CXXFLAGS", TK_VARIABLE);
+	T("*=", TK_OPERATOR);
+	lex(LANG_QMAKE, 0, "win32:CONFIG += console");
+	T("win32", TK_TYPE);
+	T(":", TK_OPERATOR);
+	T("CONFIG", TK_VARIABLE);
+	lex(LANG_QMAKE, 0, "unix:!macx|freebsd {");
+	T("unix", TK_TYPE);
+	T("!", TK_OPERATOR);
+	T("macx", TK_TYPE);
+	T("|", TK_OPERATOR);
+	T("freebsd", TK_TYPE);
+	lex(LANG_QMAKE, 0, "LIBS += -L$$PWD/lib $${EXTRA} $$[QT_INSTALL_LIBS] $$(HOME) $(MAKEFILE)");
+	T("$$PWD", TK_VARIABLE);
+	T("/lib", TK_TEXT);
+	T("$${EXTRA}", TK_VARIABLE);
+	T("$$[QT_INSTALL_LIBS]", TK_VARIABLE);
+	T("$$(HOME)", TK_VARIABLE);
+	T("$(MAKEFILE)", TK_VARIABLE);
+	lex(LANG_QMAKE, 0, "contains(QT_ARCH, x86_64):message(\"64 bit $$TARGET \\\"q\\\"\")");
+	T("contains", TK_FUNCTION);
+	T("QT_ARCH", TK_TEXT);
+	T("message", TK_FUNCTION);
+	T("\"64 bit ", TK_STRING);
+	T("$$TARGET", TK_VARIABLE);
+	T("\\\"", TK_ESCAPE);
+	lex(LANG_QMAKE, 0, "} else:unix {");
+	T("else", TK_CONTROL);
+	T("unix", TK_TYPE);
+	lex(LANG_QMAKE, 0, "target.path = $$[QT_INSTALL_BINS]");
+	T("target.path", TK_VARIABLE);
+	lex(LANG_QMAKE, 0, "FILES = $$files(*.cpp, true) contains");
+	T("$$files", TK_FUNCTION);
+	T("contains", TK_TEXT);
+	lex(LANG_QMAKE, 0, "for(f, FILES) { !exists($$f): error(missing) }");
+	T("for", TK_CONTROL);
+	T("exists", TK_FUNCTION);
+	T("$$f", TK_VARIABLE);
+	T("error", TK_FUNCTION);
+	lex(LANG_QMAKE, 0, "defineTest(check) {");
+	T("defineTest", TK_CONTROL);
+	/* line continuation keeps listing values */
+	s = lex(LANG_QMAKE, 0, "SOURCES += main.cpp \\");
+	T("\\", TK_ESCAPE);
+	CHECK(s == 1u);
+	s = lex(LANG_QMAKE, s, "    win32:a.cpp \\");
+	T("win32:a.cpp", TK_TEXT);
+	CHECK(s == 1u);
+	s = lex(LANG_QMAKE, s, "    b.cpp");
+	CHECK(s == 0);
+	s = lex(LANG_QMAKE, s, "HEADERS = x.h # not continued \\");
+	CHECK(s == 0);
+}
+
+static void test_gdscript(void)
+{
+	u32 s;
+	lex(LANG_GDSCRIPT, 0, "@tool");
+	T("@tool", TK_FUNCTION);
+	lex(LANG_GDSCRIPT, 0, "class_name Player extends CharacterBody2D");
+	T("class_name", TK_STORAGE);
+	T("Player", TK_TYPE);
+	T("extends", TK_STORAGE);
+	T("CharacterBody2D", TK_TYPE);
+	lex(LANG_GDSCRIPT, 0, "## Doc comment");
+	T("## Doc comment", TK_COMMENT);
+	lex(LANG_GDSCRIPT, 0, "signal health_changed(old: int, new_value)");
+	T("signal", TK_STORAGE);
+	T("health_changed", TK_FUNCTION);
+	T("old", TK_VARIABLE);
+	T("int", TK_TYPE);
+	lex(LANG_GDSCRIPT, 0, "enum State { IDLE, RUN = 2 }");
+	T("enum", TK_STORAGE);
+	T("State", TK_TYPE);
+	T("IDLE", TK_CONSTANT);
+	lex(LANG_GDSCRIPT, 0, "const SPEED := 300.0");
+	T("const", TK_STORAGE);
+	T("SPEED", TK_CONSTANT);
+	T("300.0", TK_NUMBER);
+	lex(LANG_GDSCRIPT, 0, "@export_range(0, 10) var speed: float = 1.5e2");
+	T("@export_range", TK_FUNCTION);
+	T("var", TK_STORAGE);
+	T("speed", TK_VARIABLE);
+	T("float", TK_TYPE);
+	T("1.5e2", TK_NUMBER);
+	lex(LANG_GDSCRIPT, 0, "@onready var sprite: Sprite2D = $Body/Sprite2D");
+	T("@onready", TK_FUNCTION);
+	T("Sprite2D", TK_TYPE);
+	T("$", TK_CONTROL);
+	T("Body/Sprite2D", TK_ESCAPE);
+	lex(LANG_GDSCRIPT, 0, "var hud = %HUD; var n = $\"Quoted Node\"; var m = a % b");
+	T("%", TK_CONTROL);
+	T("HUD", TK_ESCAPE);
+	T("\"Quoted Node\"", TK_STRING);
+	TN("%", 1, TK_OPERATOR);
+	lex(LANG_GDSCRIPT, 0, "var path := ^\"../Node\"; var sn = &\"jump\"");
+	T("^", TK_CONSTANT);
+	T("\"../Node\"", TK_STRING);
+	T("&", TK_CONSTANT);
+	T("\"jump\"", TK_STRING);
+	lex(LANG_GDSCRIPT, 0, "\tset(value):");
+	T("set", TK_STORAGE);
+	lex(LANG_GDSCRIPT, 0, "\tget:");
+	T("get", TK_STORAGE);
+	lex(LANG_GDSCRIPT, 0, "\tdict.get(\"k\")");
+	T("get", TK_FUNCTION);
+	lex(LANG_GDSCRIPT, 0, "func _ready() -> void:");
+	T("func", TK_STORAGE);
+	T("_ready", TK_FUNCTION);
+	T("void", TK_STORAGE);
+	lex(LANG_GDSCRIPT, 0, "\tif not is_on_floor() and hp % 2 == 0: velocity = Vector2(0, -SPEED)");
+	T("if", TK_CONTROL);
+	T("not", TK_STORAGE);
+	T("is_on_floor", TK_FUNCTION);
+	T("and", TK_STORAGE);
+	T("%", TK_OPERATOR);
+	T("Vector2", TK_TYPE);
+	T("SPEED", TK_CONSTANT);
+	lex(LANG_GDSCRIPT, 0, "\tawait get_tree().create_timer(1.0).timeout; super._ready(); self.x = null");
+	T("await", TK_CONTROL);
+	T("get_tree", TK_FUNCTION);
+	T("timeout", TK_VARIABLE);
+	T("super", TK_LANGCONST);
+	T("self", TK_LANGCONST);
+	T("null", TK_LANGCONST);
+	lex(LANG_GDSCRIPT, 0, "\tprint(\"hp=%d\\n\" % hp, r\"raw\\n\")");
+	T("print", TK_FUNCTION);
+	T("%d", TK_STORAGE);
+	T("\\n", TK_ESCAPE);
+	TN("r", 1, TK_STORAGE);
+	T("\"raw\\n\"", TK_STRING);
+	lex(LANG_GDSCRIPT, 0, "\tmatch state: State.IDLE when hp > 0: pass");
+	T("match", TK_CONTROL);
+	T("when", TK_CONTROL);
+	T("pass", TK_CONTROL);
+	lex(LANG_GDSCRIPT, 0, "for i in range(3): x += 0x1F + 0b10 + 1_000");
+	T("for", TK_CONTROL);
+	T("in", TK_STORAGE);
+	T("range", TK_FUNCTION);
+	T("0x1F", TK_NUMBER);
+	T("0b10", TK_NUMBER);
+	T("1_000", TK_NUMBER);
+	/* triple-quoted strings span lines (raw ones too) */
+	s = lex(LANG_GDSCRIPT, 0, "var doc = \"\"\"multi");
+	CHECK(s == 2u);
+	s = lex(LANG_GDSCRIPT, s, "line 'q' \\t");
+	T("\\t", TK_ESCAPE);
+	CHECK(s == 2u);
+	s = lex(LANG_GDSCRIPT, s, "\"\"\" + x");
+	T("x", TK_VARIABLE);
+	CHECK(s == 0);
+	s = lex(LANG_GDSCRIPT, 0, "var r = r'''raw \\d");
+	CHECK(s == (1u | 4u));
+	s = lex(LANG_GDSCRIPT, s, "\\n'''");
+	T("\\n'''", TK_STRING);
+	CHECK(s == 0);
+}
+
+static void test_godot_res(void)
+{
+	u32 s;
+	lex(LANG_GODOT_RES, 0, "[gd_scene load_steps=3 format=3 uid=\"uid://b1x\"]");
+	T("[gd_scene", TK_TAG);
+	T("load_steps", TK_ATTR);
+	T("3", TK_NUMBER);
+	T("uid", TK_ATTR);
+	T("\"uid://b1x\"", TK_STRING);
+	T("]", TK_TAG);
+	lex(LANG_GODOT_RES, 0, "[node name=\"P\" type=\"Node2D\" groups=[\"a\", \"b\"] instance=ExtResource(\"1\")] ; c");
+	T("name", TK_ATTR);
+	T("groups", TK_ATTR);
+	T("\"b\"", TK_STRING);
+	T("ExtResource", TK_FUNCTION);
+	TN("]", 1, TK_TAG);
+	T("; c", TK_COMMENT);
+	lex(LANG_GODOT_RES, 0, "; comment line");
+	T("; comment line", TK_COMMENT);
+	lex(LANG_GODOT_RES, 0, "[application]");
+	T("[application]", TK_TAG);
+	lex(LANG_GODOT_RES, 0, "config/features=PackedStringArray(\"4.2\", \"Forward Plus\")");
+	T("config/features", TK_PROPERTY);
+	T("PackedStringArray", TK_TYPE);
+	T("\"4.2\"", TK_STRING);
+	lex(LANG_GODOT_RES, 0, "position = Vector2(10.5, -2e3)");
+	T("position", TK_PROPERTY);
+	T("Vector2", TK_TYPE);
+	T("10.5", TK_NUMBER);
+	T("-2e3", TK_NUMBER);
+	lex(LANG_GODOT_RES, 0, "metadata/_edit_lock_ = true");
+	T("metadata/_edit_lock_", TK_PROPERTY);
+	T("true", TK_LANGCONST);
+	lex(LANG_GODOT_RES, 0, "script = SubResource(\"x\"); v = inf");
+	T("SubResource", TK_FUNCTION);
+	lex(LANG_GODOT_RES, 0, "tags = [&\"y\", ^\"z\", null, \"a\\tb\"]");
+	T("&", TK_CONSTANT);
+	T("^", TK_CONSTANT);
+	T("null", TK_LANGCONST);
+	T("\\t", TK_ESCAPE);
+	lex(LANG_GODOT_RES, 0, "config_version=5");
+	T("config_version", TK_PROPERTY);
+	T("5", TK_NUMBER);
+	/* multi-line string values */
+	s = lex(LANG_GODOT_RES, 0, "text = \"line one");
+	T("\"line one", TK_STRING);
+	CHECK(s == 1u);
+	s = lex(LANG_GODOT_RES, s, "[not a header] = \\\"two\\\"");
+	T("[not a header] = ", TK_STRING);
+	T("\\\"", TK_ESCAPE);
+	CHECK(s == 1u);
+	s = lex(LANG_GODOT_RES, s, "end\" ; c");
+	T("end\"", TK_STRING);
+	T("; c", TK_COMMENT);
+	CHECK(s == 0);
+	/* dictionary entries over several lines are values, not keys */
+	s = lex(LANG_GODOT_RES, 0, "\"a\": 1,");
+	T("\"a\"", TK_STRING);
+	T("1", TK_NUMBER);
+	CHECK(s == 0);
+}
+
+static void test_xml(void)
+{
+	u32 s;
+	lex(LANG_XML, 0, "<?xml version=\"1.0\" encoding='UTF-8'?>");
+	T("<?", TK_TAGPUNCT);
+	T("xml", TK_TAG);
+	T("version", TK_ATTR);
+	T("\"1.0\"", TK_UNQUOTED);
+	T("'UTF-8'", TK_UNQUOTED);
+	T("?>", TK_TAGPUNCT);
+	lex(LANG_XML, 0, "<ui:root xmlns:ui=\"urn:x\">text &amp; &#65; &#x41; & bare</ui:root>");
+	T("<", TK_TAGPUNCT);
+	TN("ui", 0, TK_TAG);
+	T("root", TK_TAG);
+	T("xmlns", TK_ATTR);
+	TN("ui", 1, TK_ATTR);
+	T(":", TK_TEXT);
+	T("text ", TK_TEXT);
+	T("&amp;", TK_LANGCONST);
+	T("&#65;", TK_LANGCONST);
+	T("&#x41;", TK_LANGCONST);
+	T("&", TK_LANGCONST);
+	TN("&", 3, TK_INVALID);
+	T("</", TK_TAGPUNCT);
+	lex(LANG_XML, 0, "<br/><a href=\"x?a=1&amp;b\">a < b</a>");
+	T("/>", TK_TAGPUNCT);
+	T("\"x?a=1", TK_UNQUOTED);
+	T("a < b", TK_TEXT);
+	/* comments span lines */
+	s = lex(LANG_XML, 0, "<a/> <!-- a comment");
+	T("<!-- a comment", TK_COMMENT);
+	CHECK(s == 1u);
+	s = lex(LANG_XML, s, "  <b>still</b> --> <c/>");
+	T("  <b>still</b> -->", TK_COMMENT);
+	T("c", TK_TAG);
+	CHECK(s == 0);
+	/* CDATA spans lines */
+	s = lex(LANG_XML, 0, "<x><![CDATA[ raw <stuff>");
+	T("<![CDATA[ raw <stuff>", TK_UNQUOTED);
+	CHECK(s == 2u);
+	s = lex(LANG_XML, s, "  more ]]></x>");
+	T("  more ]]>", TK_UNQUOTED);
+	T("x", TK_TAG);
+	CHECK(s == 0);
+	/* attributes and values across lines */
+	s = lex(LANG_XML, 0, "<widget class=\"QPushButton\"");
+	CHECK(s == 3u);
+	s = lex(LANG_XML, s, "        name=\"multi");
+	T("name", TK_ATTR);
+	CHECK(s == 4u);
+	s = lex(LANG_XML, s, "line &lt; v\" other='q");
+	T("line ", TK_UNQUOTED);
+	T("&lt;", TK_LANGCONST);
+	T("other", TK_ATTR);
+	CHECK(s == 5u);
+	s = lex(LANG_XML, s, "x'>text</widget>");
+	T("x'", TK_UNQUOTED);
+	T(">", TK_TAGPUNCT);
+	T("widget", TK_TAG);
+	CHECK(s == 0);
+	/* processing instructions across lines close on ?> */
+	s = lex(LANG_XML, 0, "<?xml-stylesheet type=\"text/xsl\"");
+	CHECK(s == (3u | 8u));
+	s = lex(LANG_XML, s, "  href=\"a.xsl\"?>");
+	T("?>", TK_TAGPUNCT);
+	CHECK(s == 0);
+	/* DOCTYPE with an internal subset */
+	s = lex(LANG_XML, 0, "<!DOCTYPE note SYSTEM \"note.dtd\" [");
+	T("<!", TK_TAGPUNCT);
+	T("DOCTYPE", TK_STORAGE);
+	T("note", TK_LANGCONST);
+	T("SYSTEM", TK_STORAGE);
+	T("\"note.dtd\"", TK_STRING);
+	CHECK(s == (6u | 16u));
+	s = lex(LANG_XML, s, "  <!ENTITY writer \"Me\"> %pe; <!-- c");
+	T("ENTITY", TK_STORAGE);
+	T("\"Me\"", TK_STRING);
+	T(">", TK_TAGPUNCT);
+	T("%pe;", TK_LANGCONST);
+	CHECK(s == (1u | 16u));
+	s = lex(LANG_XML, s, "--> ]>");
+	T("-->", TK_COMMENT);
+	CHECK(s == 0);
+	s = lex(LANG_XML, 0, "<!DOCTYPE html>");
+	T("html", TK_LANGCONST);
+	CHECK(s == 0);
+	/* an unclosed tag gives way to the next '<' */
+	s = lex(LANG_XML, 0, "<a <b>");
+	T("b", TK_TAG);
+	CHECK(s == 0);
+}
+
+static void test_detect7(void)
+{
+	CHECK(syn_lang_for_path("src/Program.cs", NULL, 0) == LANG_CSHARP);
+	CHECK(syn_lang_for_path("build.csx", NULL, 0) == LANG_CSHARP);
+	CHECK(syn_lang_for_path("A.CS", NULL, 0) == LANG_CSHARP);
+	CHECK(syn_lang_for_path("qml/Main.qml", NULL, 0) == LANG_QML);
+	static const char *const pro[] = {"app.pro", "common.pri", "feature.prf", "libQt6Core.prl"};
+	for (size_t i = 0; i < VX_COUNT(pro); i++)
+		CHECK(syn_lang_for_path(pro[i], NULL, 0) == LANG_QMAKE);
+	CHECK(syn_lang_for_path("player.gd", NULL, 0) == LANG_GDSCRIPT);
+	static const char *const gres[] = {"main.tscn", "theme.tres", "x.godot", "icon.svg.import", "/g/project.godot"};
+	for (size_t i = 0; i < VX_COUNT(gres); i++)
+		CHECK(syn_lang_for_path(gres[i], NULL, 0) == LANG_GODOT_RES);
+	static const char *const xml[] = {"a.xml", "form.ui", "res.qrc", "App.csproj", "Directory.Build.props",
+	                                  "x.targets", "icon.svg", "s.xsd", "t.xsl", "Info.plist", "Strings.resx"};
+	for (size_t i = 0; i < VX_COUNT(xml); i++)
+		CHECK(syn_lang_for_path(xml[i], NULL, 0) == LANG_XML);
+	const char *ts = "<?xml version=\"1.0\"?>\n<!DOCTYPE TS>\n<TS version=\"2.1\">\n";
+	CHECK(syn_lang_for_path("app_de.ts", ts, strlen(ts)) == LANG_XML);
+	CHECK(syn_lang_for_path("app_de.ts", NULL, 0) == LANG_XML);
+	const char *tsc = "export const x: number = 1;\n";
+	CHECK(syn_lang_for_path("index.ts", tsc, strlen(tsc)) == LANG_NONE);
+	/* an XML head names the language of unknown files */
+	const char *xh = "\xEF\xBB\xBF\n  <?xml version=\"1.0\"?>\n<root/>\n";
+	CHECK(syn_lang_for_path("config", xh, strlen(xh)) == LANG_XML);
+	CHECK(syn_lang_for_path("data.weird", xh, strlen(xh)) == LANG_XML);
+	CHECK(syn_lang_for_path("data.weird", "hello", 5) == LANG_NONE);
+	CHECK(syn_lang_for_path("x.c", xh, strlen(xh)) == LANG_C);
+	CHECK_STR(syn_lang_name(LANG_CSHARP), "C#");
+	CHECK_STR(syn_lang_name(LANG_QML), "QML");
+	CHECK_STR(syn_lang_name(LANG_QMAKE), "qmake");
+	CHECK_STR(syn_lang_name(LANG_GDSCRIPT), "GDScript");
+	CHECK_STR(syn_lang_name(LANG_GODOT_RES), "Godot Resource");
+	CHECK_STR(syn_lang_name(LANG_XML), "XML");
+	CHECK_STR(syn_lang_lsp_id(LANG_CSHARP), "csharp");
+	CHECK_STR(syn_lang_lsp_id(LANG_QML), "qml");
+	CHECK_STR(syn_lang_lsp_id(LANG_GDSCRIPT), "gdscript");
+	CHECK_STR(syn_lang_lsp_id(LANG_XML), "xml");
+	CHECK(syn_lang_lsp_id(LANG_QMAKE) == NULL);
+	CHECK(syn_lang_lsp_id(LANG_GODOT_RES) == NULL);
+	CHECK_STR(syn_line_comment(LANG_CSHARP), "//");
+	CHECK_STR(syn_line_comment(LANG_QML), "//");
+	CHECK_STR(syn_line_comment(LANG_QMAKE), "#");
+	CHECK_STR(syn_line_comment(LANG_GDSCRIPT), "#");
+	CHECK_STR(syn_line_comment(LANG_GODOT_RES), ";");
+	CHECK(syn_line_comment(LANG_XML) == NULL);
+	CHECK(LANG_COUNT <= 32);
+	/* Markdown fences embed the new languages and carry their states */
+	u32 s = lex(LANG_MARKDOWN, 0, "```csharp");
+	s = lex(LANG_MARKDOWN, s, "var r = $$\"\"\"\"");
+	s = lex(LANG_MARKDOWN, s, "class X \"\"\" {{v}}");
+	T("class X \"\"\" ", TK_STRING);
+	T("v", TK_VARIABLE);
+	s = lex(LANG_MARKDOWN, s, "\"\"\"\"; int z;");
+	T("int", TK_STORAGE);
+	s = lex(LANG_MARKDOWN, s, "```");
+	CHECK(s == 0);
+	static const struct {
+		const char *fence, *line, *sub;
+		int cls;
+	} fences[] = {
+	    {"```cs", "public int X;", "public", TK_STORAGE},
+	    {"```c#", "namespace N;", "N", TK_TYPE},
+	    {"```qml", "Item { id: r }", "Item", TK_TYPE},
+	    {"```gdscript", "func go(): pass", "go", TK_FUNCTION},
+	    {"```gd", "var x = $Node", "Node", TK_ESCAPE},
+	    {"```xml", "<a b=\"c\"/>", "b", TK_ATTR},
+	    {"```qmake", "QT += core", "QT", TK_VARIABLE},
+	    {"```tscn", "[node name=\"x\"]", "name", TK_ATTR},
+	};
+	for (size_t i = 0; i < VX_COUNT(fences); i++) {
+		s = lex(LANG_MARKDOWN, 0, fences[i].fence);
+		CHECK(s != 0);
+		s = lex(LANG_MARKDOWN, s, fences[i].line);
+		T(fences[i].sub, fences[i].cls);
+	}
+	s = lex(LANG_MARKDOWN, 0, "```xml");
+	s = lex(LANG_MARKDOWN, s, "<!-- open");
+	s = lex(LANG_MARKDOWN, s, "still -->");
+	T("still -->", TK_COMMENT);
+	s = lex(LANG_MARKDOWN, s, "```");
+	CHECK(s == 0);
+}
+
+/* Random lines over each new lexer: spans stay ordered and in bounds (lex
+ * checks) and states stay within SYN_STATE_BITS (for Markdown: the fenced
+ * state it carries above bit 12). */
+static void test_fuzz_new(void)
+{
+	static const char alpha[] = "\"'`$@{}[]()<>/\\*#;:=!?&%^.,+-_ \tabcxyzABC019"
+	                            "\"\"\"$$$@@{{}}<!--]]>?>/*///";
+	static const int langs[] = {LANG_CSHARP, LANG_QML, LANG_QMAKE, LANG_GDSCRIPT, LANG_GODOT_RES, LANG_XML, LANG_MARKDOWN};
+	u32 rng = 12345;
+	char line[200];
+	int bad = 0;
+	for (size_t l = 0; l < VX_COUNT(langs); l++) {
+		u32 s = 0;
+		for (int it = 0; it < 4000; it++) {
+			rng = rng * 1103515245u + 12345u;
+			u32 len = (rng >> 16) % (sizeof line - 1);
+			for (u32 k = 0; k < len; k++) {
+				rng = rng * 1103515245u + 12345u;
+				line[k] = alpha[(rng >> 16) % (sizeof alpha - 1)];
+			}
+			line[len] = 0;
+			if (it == 0 && langs[l] == LANG_MARKDOWN)
+				strcpy(line, "```cs");
+			if (langs[l] == LANG_MARKDOWN && (s >> 12) >= (1u << SYN_STATE_BITS))
+				bad++;
+			s = lex(langs[l], s, line);
+			if (langs[l] != LANG_MARKDOWN && s >= (1u << SYN_STATE_BITS))
+				bad++;
+		}
+	}
+	CHECK(bad == 0);
+}
+
 int main(void)
 {
 	test_c();
@@ -2040,6 +2896,14 @@ int main(void)
 	test_cpp();
 	test_rust();
 	test_detect6();
+	test_csharp();
+	test_qml();
+	test_qmake();
+	test_gdscript();
+	test_godot_res();
+	test_xml();
+	test_detect7();
+	test_fuzz_new();
 	bench();
 	bench_more();
 	bench3();

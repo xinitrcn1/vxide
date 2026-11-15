@@ -14,6 +14,7 @@ typedef struct {
 
 #define QUAD_SOLID 0xFFFFu
 #define QUAD_SQUIGGLE 0xFFFEu
+#define QUAD_IMAGE 0xFFFDu /* samples the background image (gpu_set_background) */
 #define ATLAS_SIZE 2048
 
 struct SDL_Window;
@@ -26,6 +27,11 @@ void gpu_resize(int w, int h);
  * frame uploads their union. */
 void gpu_set_atlas(const u8 *pixels);
 void gpu_atlas_dirty(int x, int y, int w, int h);
+/* Background image (RGBA8, straight alpha), NULL to clear; copied. */
+void gpu_set_background(const u8 *rgba, int w, int h);
+/* Where the image lies on screen for this frame (QUAD_IMAGE quads sample
+ * it by pixel position, so clipping them needs no texture coordinates). */
+void gpu_background_place(float x, float y, float w, float h);
 /* Draw and present. clear = 0xRRGGBBAA. Returns false when the frame was
  * skipped (minimized / out of date; it recreates the swapchain). */
 bool gpu_frame(const Quad *q, u32 n, u32 clear);

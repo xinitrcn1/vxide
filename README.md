@@ -1,15 +1,17 @@
 # vxide
 
-A project-based code editor in C11, built with BSD make, whose whole UI is
+A project-based code editor in C11, built with CMake, whose whole UI is
 drawn with Vulkan. Its look and its keyboard shortcuts follow VSCodium
 (Dark Modern / Light Modern themes, Dark+ / Light+ syntax colours). It
 talks to clangd and rust-analyzer over LSP and to git through libgit2.
 
 ```
-make            # build/vxide
-make test       # unit tests + a headless scripted UI test
+cmake -B build && cmake --build build -j       # build/vxide
+ctest --test-dir build --output-on-failure      # unit tests + headless UI scripts
 ./build/vxide [--scale N] [--light] [DIR]
 ```
+
+`-DVXIDE_SANITIZE=ON` builds with AddressSanitizer and UBSan.
 
 There is no project file: the folder you open is the project. The
 explorer hides `.git`, `.svn`, `.hg`, `.jj`, `CVS`, `.DS_Store` and
@@ -26,9 +28,11 @@ DejaVu Sans Mono for code, with DejaVu Sans as the fallback.
 
 ## What it does
 
-- **Workbench**: a row of top-level tabs (Project, Git, Search, Settings;
-  clicking the active one hides the side bar) over a side bar, up to three
-  editor groups with tabs that wrap into rows and breadcrumbs, a panel
+- **Workbench**: a row of top-level tabs. Project, Git and Search show
+  their side bar next to the editors (clicking the active one hides it);
+  Manpages and Settings are workspaces of their own that fill the main
+  area. Up to three editor groups with tabs that wrap into rows and
+  breadcrumbs, a panel
   (Problems, Output) and a status bar. The side bar and panel can be
   resized by dragging their edges. Everything is square: solid rects, 1 px
   borders, glyphs, and icons drawn from distance fields at start-up.
@@ -58,6 +62,31 @@ DejaVu Sans Mono for code, with DejaVu Sans as the fallback.
   scripts, proc-macro expansion and cache priming are off, so it only
   reads sources and `cargo metadata` (a build would churn a slow disk).
   `VXIDE_CLANGD` / `VXIDE_RUST_ANALYZER` pick other server binaries.
+- **Manpages**: a workspace with a search bar (apropos, as you type) and
+  its own tabs: "Index" (every page, or the matches, as links; it cannot
+  be closed) and one tab per open page. Pages are rendered by mandoc
+  (no pager) with bold / italic kept, and every `name(sec)` is a link
+  (click or Enter, like info). "Open Manpage" in the editor's context
+  menu looks up the word under the mouse (`socket(` -> socket(2); C and
+  C++ files try sections 2, 3, 9, 4 first).
+- **Settings**: a workspace with a search bar and one fixed tab per
+  category (Appearance, Editor, Git, Languages); a search goes to the
+  setting's tab and marks it (Enter / Down for the next match). Saved in
+  `$XDG_CONFIG_HOME/vxide/settings.conf`. Includes an editor background
+  image (PNG / JPEG, scaled to cover the editor area, drawn over the
+  text at an adjustable opacity, as VSCodium's background extensions do)
+  and vim keybindings (off by default).
+- **Qt**: QML language features from qmlls (with `-b` pointing at a CMake
+  build folder when there is one), "Open in Qt Widgets Designer" for .ui
+  files and "Open in Qt Linguist" for .ts files (explorer context menu or
+  the palette), "Qt: Preview QML File" (runs `qml`, output in Output).
+- **Godot**: GDScript language features from the Godot editor's language
+  server over TCP (127.0.0.1:6005 for Godot 4, 6008 for Godot 3; it
+  reconnects while GDScript files are open), "Godot Tools: Open Workspace
+  with Godot Editor", Run Project (F5), Run Current Scene (F6; a script
+  runs the scene next to it), Stop (Shift+F5), output in the Output panel,
+  and an opt-in headless language server for when the editor is closed.
+  `project.godot` is looked for in the folder and one level below it.
 - **Binary files** (read-only): a hex editor like HxD (offset, hex and
   text columns with a shared selection, Tab switches column, a data
   inspector for the bytes at the cursor in little or big endian, named
@@ -230,7 +259,10 @@ one quad buffer.
 | `src/ui.c` | Layout, input routing, keybindings, commands, tabs, status bar, quick input |
 | `src/editor.c` | Editor drawing and editing, find, completion, hover |
 | `src/binfile.c`, `src/binview.c` | ELF/PE/Mach-O sections and symbols, capstone disassembly, data inspector; the hex editor and section subtabs |
-| `src/panes.c` | Explorer, Search, Source Control, Settings, Problems, Output, wrapping input box |
+| `src/panes.c` | Explorer, Search, Source Control, Settings workspace, Problems, Output, wrapping input box |
+| `src/man.c` | Manpages workspace: mandoc rendering, links, apropos Index |
+| `src/projtools.c` | Qt and Godot: tools, project detection, run/stop with output |
+| `src/imgload.c` | PNG / JPEG decoding for the background image |
 
 ## Testing without a display
 
@@ -241,7 +273,8 @@ image and runs a script of `open`, `key ctrl+shift+p`, `type text\n`,
 windowed path without a display, set `SDL_VIDEO_DRIVER=offscreen` (NVIDIA
 supplies `VK_EXT_headless_surface`).
 
-Environment variables: `VXIDE_NO_LSP`, `VXIDE_CLANGD`, `VXIDE_RUST_ANALYZER`, `VXIDE_THEME=light`,
+Environment variables: `VXIDE_NO_LSP`, `VXIDE_CLANGD`, `VXIDE_RUST_ANALYZER`, `VXIDE_QMLLS`,
+`VXIDE_GODOT`, `VXIDE_GODOT_PORT`, `VXIDE_BG` / `VXIDE_BG_OPACITY`, `VXIDE_SETTINGS` (settings file; headless runs read none unless it is set), `VXIDE_THEME=light`,
 `VXIDE_GPU=<name substring>`, `VXIDE_VALIDATE` (Khronos validation layer),
 `VXIDE_LOG` (copy the Output log to stderr), `VXIDE_NO_BLAME`,
 `VXIDE_BLAME_LIBGIT2` (force the libgit2 blame).

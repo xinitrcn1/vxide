@@ -10,6 +10,10 @@
 #include <signal.h>
 #include <stdio.h>
 #include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -27,6 +31,7 @@ struct Lsp {
 	bool init_done; /* initialize answered and `initialized` sent */
 	bool utf8;
 	bool stopping;
+	bool tcp; /* connected to a server that runs elsewhere (Godot's editor) */
 	char *root_uri;
 	char *settings; /* initializationOptions / workspace/configuration reply (JSON), or NULL */
 
@@ -577,6 +582,55 @@ int lsp_fd(Lsp *l)
 	if (!l || l->out_eof)
 		return -1;
 	return l->fd_out;
+}
+
+Lsp *lsp_connect(const char *root, const char *host, int port, const char *settings)
+{
+	struct sigaction sa;
+	if (sigaction(SIGPIPE, NULL, &sa) == 0 && sa.sa_handler == SIG_DFL) {
+		memset(&sa, 0, sizeof sa);
+		sa.sa_handler = SIG_IGN;
+		sigaction(SIGPIPE, &sa, NULL);
+	}
+	struct sockaddr_in a;
+	memset(&a, 0, sizeof a);
+	a.sin_family = AF_INET;
+	a.sin_port = htons((u16)port);
+	if (inet_pton(AF_INET, host, &a.sin_addr) != 1)
+		return NULL;
+	int fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0)
+		return NULL;
+	set_cloexec(fd);
+	/* a local server answers (or refuses) at once: a blocking connect is fine */
+	if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) {
+		close(fd);
+		return NULL;
+	}
+	int one = 1;
+	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+	int fd2 = dup(fd);
+	if (fd2 < 0) {
+		close(fd);
+		return NULL;
+	}
+	set_cloexec(fd2);
+	Lsp *l = vx_alloc(sizeof *l);
+	l->pid = -1;
+	l->tcp = true;
+	l->reaped = true;
+	l->fd_in = fd;
+	l->fd_out = fd2;
+	l->fd_err = -1;
+	l->err_eof = true;
+	set_nonblock(l->fd_in);
+	set_nonblock(l->fd_out);
+	l->next_id = 1;
+	l->utf8 = false;
+	l->root_uri = lsp_path_to_uri(root ? root : ".");
+	l->settings = settings ? vx_strdup(settings) : NULL;
+	send_initialize(l, root ? root : ".");
+	return l;
 }
 
 bool lsp_ready(Lsp *l) { return l && l->init_done && !l->out_eof; }
@@ -1372,7 +1426,8 @@ void lsp_stop(Lsp *l)
 	if (!l)
 		return;
 	l->stopping = true;
-	if (l->fd_in >= 0 && !l->out_eof) {
+	/* a shared server (Godot's editor) is not ours to shut down: just hang up */
+	if (l->fd_in >= 0 && !l->out_eof && !l->tcp) {
 		i32 id = msg_begin_request(l, "shutdown", RQ_SHUTDOWN, NULL);
 		jb_raw(&l->msg, "null}");
 		send_msg(l, true);
@@ -1402,7 +1457,7 @@ void lsp_stop(Lsp *l)
 		close(l->fd_in);
 		l->fd_in = -1;
 	}
-	if (!wait_exit(l, 500)) {
+	if (l->pid > 0 && !wait_exit(l, 500)) {
 		kill(l->pid, SIGTERM);
 		if (!wait_exit(l, 200)) {
 			kill(l->pid, SIGKILL);
@@ -1411,7 +1466,8 @@ void lsp_stop(Lsp *l)
 		}
 	}
 	close(l->fd_out);
-	close(l->fd_err);
+	if (l->fd_err >= 0)
+		close(l->fd_err);
 	for (u32 i = 0; i < l->rq_n; i++)
 		free(l->rq_path[i]);
 	free(l->rq_id);

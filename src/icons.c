@@ -144,6 +144,23 @@ static void art_scm(float W)
 	line(16.5f, 10.8f, 16.5f, 13.0f, W);
 }
 
+/* an open book, square like everything else */
+static void art_book(float W)
+{
+	begin((int)(24.0f * G + 0.5f));
+	line(3.5f, 5.5f, 10.5f, 5.5f, W);
+	line(10.5f, 5.5f, 12.0f, 7.0f, W);
+	line(12.0f, 7.0f, 13.5f, 5.5f, W);
+	line(13.5f, 5.5f, 20.5f, 5.5f, W);
+	line(20.5f, 5.5f, 20.5f, 18.5f, W);
+	line(20.5f, 18.5f, 13.5f, 18.5f, W);
+	line(13.5f, 18.5f, 12.0f, 20.0f, W);
+	line(12.0f, 20.0f, 10.5f, 18.5f, W);
+	line(10.5f, 18.5f, 3.5f, 18.5f, W);
+	line(3.5f, 18.5f, 3.5f, 5.5f, W);
+	line(12.0f, 7.0f, 12.0f, 20.0f, W);
+}
+
 static void art_gear(float W)
 {
 	const float PI = 3.14159265f;
@@ -175,6 +192,10 @@ void icons_init(void)
 		store(pass ? ICON_SCM_S : ICON_SCM);
 		art_gear(W);
 		store(pass ? ICON_GEAR_S : ICON_GEAR);
+		if (pass) {
+			art_book(W);
+			store(ICON_BOOK_S);
+		}
 	}
 	G = 1.0f;
 
