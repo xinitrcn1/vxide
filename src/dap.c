@@ -813,6 +813,20 @@ static void on_response(Dap *d, u32 root)
 			d->th_name[d->nth] = tok_sp(d, json_get(j, t, "name"));
 			d->nth++;
 		}
+		/* lldb on FreeBSD may leave the thread that stopped out of the list */
+		i64 must[2] = {d->stop_thread, d->cur_thread};
+		for (int k = 0; k < 2; k++) {
+			bool have = must[k] < 0;
+			for (u32 i = 0; i < d->nth && !have; i++)
+				have = d->th_id[i] == must[k];
+			if (!have) {
+				SoaCol c[] = {TH_COLS(d)};
+				soa_grow(c, 2, &d->thcap, d->nth + 1, d->nth);
+				d->th_id[d->nth] = must[k];
+				d->th_name[d->nth] = pool_add(&d->sp, "thread", 6);
+				d->nth++;
+			}
+		}
 		if (d->cur_thread < 0 && d->nth) {
 			d->cur_thread = d->th_id[0];
 			request_stack(d, d->cur_thread);
@@ -840,10 +854,11 @@ static void on_response(Dap *d, u32 root)
 				ip[json_unescape(j->src + j->start[it], j->end[it] - j->start[it], ip)] = 0;
 			d->fr_ip[k] = strtoull(ip, NULL, 16);
 		}
-		/* the first frame with source is the interesting one */
+		/* the first frame with real source is the interesting one (lldb names
+		 * disassembly "libsys.so.7`_umtx_op_err": not a file) */
 		d->cur_frame = 0;
 		for (u32 i = 0; i < d->nfr; i++)
-			if (*sstr(d, d->fr_path[i]) && d->fr_line[i]) {
+			if (sstr(d, d->fr_path[i])[0] == '/' && d->fr_line[i] && access(sstr(d, d->fr_path[i]), R_OK) == 0) {
 				d->cur_frame = i;
 				break;
 			}
