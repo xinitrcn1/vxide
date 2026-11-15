@@ -48,7 +48,7 @@ out (and the ucas tab says so).
 
 - **Workbench**: a row of top-level tabs. Project, Git and Search show
   their side bar next to the editors (clicking the active one hides it);
-  Manpages and Settings are workspaces of their own that fill the main
+  Manpages, ucas, LLM agent and Settings are workspaces of their own that fill the main
   area. Up to three editor groups with tabs that wrap into rows and
   breadcrumbs, a panel
   (Problems, Output) and a status bar. The side bar and panel can be
@@ -211,6 +211,36 @@ out (and the ucas tab says so).
   `(C x + B) >> s`; while it runs, the cell shows the candidates as ucas finds
   them and its progress (`auto` reports only the closest at the end). The
   patches are applied once, in order, by `cmake/ucas_patch.cmake`.
+- **LLM agent**: a top-level tab where a local model works on the open
+  project. It fills the window: on the left New Chat, the project's chats
+  (newest first, kept as JSON in `$XDG_STATE_HOME/vxide/llm/<project>/`)
+  and the harness; on the right, over the whole width that is left, the
+  transcript and the question box (Enter sends, Shift+Enter a new line, Esc
+  stops, Up recalls the last question). Answers are Markdown, drawn by the
+  preview's renderer (code highlighted by its fence, tables, links; a
+  `path:line` link opens the file there); the model's reasoning is folded,
+  and each tool call is a row (running, done, failed, its time) that opens
+  to its arguments and answer.
+  The default harness is the tools of mcp-fbsd (a small MCP server in C)
+  built in (`src/llmtools.c`): `read write edit ls stat mv mkdir
+  search exec`, with its names, arguments and terse answers, every path
+  confined to the project (links out of it too); exec runs `/bin/sh` in the
+  project with `TERM=dumb NO_COLOR=1 PAGER=cat`, cleaned output, a timeout,
+  and is killed by Stop. Read-only leaves only `read ls stat search`.
+  The model is an OpenAI-compatible server, `POST /v1/chat/completions`
+  streamed, by default llama.cpp's `llama-server` at
+  `http://127.0.0.1:8080` (tool calls need `--jinja`); the server and the
+  model are set in the tab. Auto uses the server when it answers and
+  otherwise a mock model, which is not a language model: it reads the
+  question for a command in backticks, a word to search for, or a file or
+  folder of the project, calls that tool through the same harness and
+  writes up the answer in Markdown, so the tab works end to end without a
+  model. Server and Mock force one. The system prompt is three lines and
+  the user's to change: "System Prompt..." opens
+  `$XDG_CONFIG_HOME/vxide/llm-system.md` (written from the default the
+  first time), read at every turn, `{root}` being the project folder.
+  "LLM Agent: Ask About the Selection" puts an editor's selection in the
+  box as a fenced block with its file.
 - **Markdown preview**: Markdown tabs have Edit and Preview subtabs
   (Ctrl+Shift+V): headings, emphasis, code (highlighted by the fence's
   language), lists and task lists, quotes, tables, links (anchors, files,
@@ -394,6 +424,7 @@ the script command `heap` measure it.
 | `src/imgload.c` | PNG / JPEG decoding for the background image |
 | `cmake/ucas.cmake`, `cmake/CPM.cmake` | ucas fetched by CPM, its sources read from its Makefile, linked into one object whose only global is `ucas_main` |
 | `src/ucasproto.c`, `src/ucasview.c`, `src/ucasimg.c` | ucas's JSON frontend (requests, responses, base64); the ucas tab (worker process, transcript, View, Session); its GIFs and PNGs decoded by ucas's stb_image |
+| `src/llmtools.c`, `src/llmchat.c`, `src/llmview.c` | The LLM agent: the built-in harness (mcp-fbsd's tools, confined to the project); chats, their JSON, the streamed OpenAI-compatible client, the mock model, a turn's loop; the tab (chats, transcript, harness, the turn's thread) |
 
 ## Testing without a display
 
@@ -408,6 +439,8 @@ Environment variables: `VXIDE_NO_LSP`, `VXIDE_CLANGD`, `VXIDE_RUST_ANALYZER`, `V
 `VXIDE_GODOT`, `VXIDE_GODOT_PORT`, `VXIDE_BG` / `VXIDE_BG_OPACITY`, `VXIDE_SETTINGS` (settings file; headless runs read none unless it is set), `VXIDE_THEME=light`,
 `VXIDE_GPU=<name substring>`, `VXIDE_VALIDATE` (Khronos validation layer),
 `VXIDE_LOG` (copy the Output log to stderr), `VXIDE_NO_BLAME`,
+`VXIDE_LLM_SERVER`, `VXIDE_LLM_BACKEND=auto|server|mock`, `VXIDE_LLM_API_KEY`
+(sent as a bearer token), `VXIDE_LLM_SYSTEM` (the system prompt's file),
 `VXIDE_BLAME_LIBGIT2` (force the libgit2 blame), `VXIDE_ADDR2LINE` / `VXIDE_GCOV` (the
 symboliser / gcov used for profiles).
 
