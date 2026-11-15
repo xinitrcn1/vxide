@@ -100,11 +100,13 @@ DejaVu Sans Mono for code, with DejaVu Sans as the fallback.
   text columns with a shared selection, Tab switches column, a data
   inspector for the bytes at the cursor in little or big endian, named
   coloured tags from the context menu, Ctrl+G to an offset, Ctrl+C copies
-  hex). Executables (ELF, PE, Mach-O) get a subtab per section that has
+  hex, Ctrl+F finds bytes such as `7f 45 4c 46`, or text). Executables (ELF, PE, Mach-O) get a subtab per section that has
   bytes in the file, plus "File": code sections are disassembled with
   capstone on a background thread (labels from symbols, branch targets
   annotated; Enter or double-click follows a branch), data sections open
-  in the hex editor.
+  in the hex editor. Ctrl+F in a disassembly searches the decoded
+  instructions and labels (regex too) in steps, so big sections stay
+  responsive.
 - **Profiles** (read-only tabs): valgrind massif (`massif.out.*`),
   jemalloc heap profiles (`*.heap`, `heap_v2` and the older
   `heap profile:` text, unbiased for sampling like jeprof), gprof
@@ -197,7 +199,8 @@ DejaVu Sans Mono for code, with DejaVu Sans as the fallback.
   Ctrl+K Ctrl+N, Ctrl+K Ctrl+R) apply every change touching the selection,
   in normal editors as well. Clicking a quick-diff mark in the gutter offers
   Stage Change / Revert Change / Open Changes; Alt+F5 / Shift+Alt+F5 go to
-  the next / previous difference. Source Control opens diffs on click.
+  the next / previous difference. Ctrl+F finds in the new side. Source
+  Control opens diffs on click.
 - **Merge conflicts**: the markers stay as plain, editable text (no Accept
   buttons); current / base / incoming regions are shaded with VSCodium's
   merge colours and labelled. Conflicted files are listed under "Merge
