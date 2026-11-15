@@ -1,0 +1,9 @@
+# Side-by-side diff, then stage only the last change (Ctrl+K Ctrl+Alt+S)
+open m.c
+key ctrl+shift+p
+type git: open changes
+key Return
+wait 100
+key ctrl+End Up
+key ctrl+k ctrl+alt+s
+wait 300

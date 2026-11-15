@@ -352,7 +352,7 @@ void explorer_draw(int x, int y, int w, int h)
 			          COL(C_SIDEBAR_FG));
 			tx = ix + PX(20);
 		} else {
-			tx = file_icon_draw(nm, ix + PX(16), ry, rh);
+			tx = file_icon_draw(nm, ix, ry, rh); /* the icon takes the twistie slot */
 		}
 		/* errors/warnings colour files like VSCodium's problem decorations */
 		int right = x + w - PX(12);
@@ -578,11 +578,19 @@ static const char *box_text(Input *in) { return in->b ? in->b : ""; }
 void search_run(void)
 {
 	ui_ensure_files();
+	/* the UI keeps its own matcher (errors, replace previews); the search
+	 * itself runs on a background thread over a snapshot of the file list */
 	matcher_free(&app.search_m);
 	matcher_init(&app.search_m, box_text(&app.search_in), app.search_in.n, app.search_flags);
 	const char *inc = app.search_show_details ? box_text(&app.search_inc_in) : NULL;
 	const char *exc = app.search_show_details ? box_text(&app.search_exc_in) : NULL;
-	search_text(&app.results, app.root, &app.files, &app.search_m, inc, exc, 20000);
+	if (!app.files_ok && app.files.n == 0) {
+		app.search_pending = true; /* starts when the file list lands */
+	} else if (app.search_in.n && !app.search_m.err[0]) {
+		bg_search_start(box_text(&app.search_in), app.search_flags, inc, exc);
+	} else {
+		search_free(&app.results);
+	}
 	free(app.search_collapsed);
 	app.search_collapsed = vx_alloc(app.files.n + 1);
 	app.search_scroll = 0;
@@ -730,7 +738,14 @@ void search_draw(int x, int y, int w, int h)
 	} else if (app.search_in.n && r->n)
 		snprintf(msg, sizeof msg, "%u result%s in %u file%s%s", r->n, r->n == 1 ? "" : "s", r->files_hit,
 		         r->files_hit == 1 ? "" : "s", r->truncated ? " - more results exist, refine your search" : "");
-	else if (app.search_in.n && search_hash() == search_last_hash)
+	else if (app.search_in.n && (bg_search_busy(NULL, NULL) || app.search_pending)) {
+		u32 done = 0, total = 0;
+		bg_search_busy(&done, &total);
+		if (total)
+			snprintf(msg, sizeof msg, "Searching... (%u of %u files)", done, total);
+		else
+			snprintf(msg, sizeof msg, "Searching...");
+	} else if (app.search_in.n && search_hash() == search_last_hash)
 		snprintf(msg, sizeof msg, "No results found. Review your settings for configured exclusions.");
 	else
 		msg[0] = 0;
@@ -1224,7 +1239,7 @@ bool search_event(const Event *e, int x, int y, int w, int h)
 /* rows: section header (staged / changes) then files */
 static u32 scm_n, scm_cap;
 static u32 *scm_item; /* status index | 0x40000000 staged | 0x80000000 header (0 changes, 1 staged) */
-static bool scm_closed[2];
+static bool scm_closed[3];
 
 void scm_refresh(void)
 {
@@ -1243,9 +1258,17 @@ static bool st_staged(u16 f)
 	return f & (GS_INDEX_NEW | GS_INDEX_MODIFIED | GS_INDEX_DELETED | GS_INDEX_RENAMED);
 }
 
+static bool st_conflict(u16 f) { return f & GS_CONFLICT; }
+
 static bool st_changed(u16 f)
 {
-	return f & (GS_WT_NEW | GS_WT_MODIFIED | GS_WT_DELETED | GS_WT_RENAMED | GS_CONFLICT);
+	return !(f & GS_CONFLICT) && (f & (GS_WT_NEW | GS_WT_MODIFIED | GS_WT_DELETED | GS_WT_RENAMED));
+}
+
+/* Sections like VSCodium: 2 Merge Changes, 1 Staged Changes, 0 Changes. */
+static bool in_sec(int sec, u16 f)
+{
+	return sec == 2 ? st_conflict(f) : sec == 1 ? (st_staged(f) && !st_conflict(f)) : st_changed(f);
 }
 
 static void scm_rows(void)
@@ -1254,10 +1277,10 @@ static void scm_rows(void)
 	if (!app.git)
 		return;
 	const GitStatus *st = git_status(app.git);
-	for (int sec = 1; sec >= 0; sec--) {
+	for (int sec = 2; sec >= 0; sec--) {
 		u32 cnt = 0;
 		for (u32 i = 0; i < st->count; i++)
-			cnt += sec ? st_staged(st->flags[i]) : st_changed(st->flags[i]);
+			cnt += in_sec(sec, st->flags[i]);
 		if (!cnt)
 			continue;
 		VX_GROW(scm_item, scm_cap, scm_n + 1);
@@ -1265,11 +1288,10 @@ static void scm_rows(void)
 		if (scm_closed[sec])
 			continue;
 		for (u32 i = 0; i < st->count; i++) {
-			bool in = sec ? st_staged(st->flags[i]) : st_changed(st->flags[i]);
-			if (!in)
+			if (!in_sec(sec, st->flags[i]))
 				continue;
 			VX_GROW(scm_item, scm_cap, scm_n + 1);
-			scm_item[scm_n++] = i | (sec ? 0x40000000u : 0);
+			scm_item[scm_n++] = i | (sec == 1 ? 0x40000000u : 0) | (sec == 2 ? 0x20000000u : 0);
 		}
 	}
 }
@@ -1279,7 +1301,7 @@ static u32 sec_count(int sec)
 	const GitStatus *st = git_status(app.git);
 	u32 cnt = 0;
 	for (u32 i = 0; i < st->count; i++)
-		cnt += sec ? st_staged(st->flags[i]) : st_changed(st->flags[i]);
+		cnt += in_sec(sec, st->flags[i]);
 	return cnt;
 }
 
@@ -1379,14 +1401,14 @@ void scm_draw(int x, int y, int w, int h)
 		list_row_bg(x, ry, w, rh, i == app.scm_sel && focused, focused, hover);
 		int ty = ry + (rh - font_m[FONT_UI].line) / 2;
 		if (it & 0x80000000u) {
-			int sec = (int)(it & 1);
+			int sec = (int)(it & 3);
 			draw_icon(scm_closed[sec] ? ICON_CHEVRON_RIGHT : ICON_CHEVRON_DOWN, x + PX(8), ry + (rh - PX(16)) / 2,
 			          COL(C_SIDEBAR_FG));
-			const char *t = sec ? "Staged Changes" : "Changes";
+			const char *t = sec == 2 ? "Merge Changes" : sec ? "Staged Changes" : "Changes";
 			draw_text(FONT_UI, x + PX(26), ty, t, strlen(t), COL(C_SIDEBAR_FG));
 			char b[16];
 			snprintf(b, sizeof b, "%u", sec_count(sec));
-			if (hover) {
+			if (hover && sec != 2) {
 				/* section actions: stage all / unstage all */
 				draw_icon(sec ? ICON_MINUS : ICON_PLUS, x + w - PX(56), ry + (rh - PX(16)) / 2, COL(C_SIDEBAR_FG));
 			}
@@ -1394,7 +1416,7 @@ void scm_draw(int x, int y, int w, int h)
 			continue;
 		}
 		bool staged = it & 0x40000000u;
-		u32 si = it & 0x3FFFFFFFu;
+		u32 si = it & 0x1FFFFFFFu;
 		const char *p = st->pool.b + st->path[si];
 		const char *sl = strrchr(p, '/');
 		const char *base = sl ? sl + 1 : p;
@@ -1483,8 +1505,8 @@ bool scm_event(const Event *e, int x, int y, int w, int h)
 		u32 it = scm_item[i];
 		const GitStatus *st = git_status(app.git);
 		if (it & 0x80000000u) {
-			int sec = (int)(it & 1);
-			if (e->x >= x + w - PX(60) && e->x < x + w - PX(36)) {
+			int sec = (int)(it & 3);
+			if (sec != 2 && e->x >= x + w - PX(60) && e->x < x + w - PX(36)) {
 				if (sec == 0)
 					git_stage_all(app.git);
 				else
@@ -1498,13 +1520,18 @@ bool scm_event(const Event *e, int x, int y, int w, int h)
 			return true;
 		}
 		bool staged = it & 0x40000000u;
-		u32 si = it & 0x3FFFFFFFu;
+		u32 si = it & 0x1FFFFFFFu;
 		char path[4096];
 		snprintf(path, sizeof path, "%s", st->pool.b + st->path[si]);
 		char lb[2] = {'M', 0};
 		int right = x + w - PX(14) - font_width(FONT_UI, lb, 1) - PX(10);
 		if (e->x >= right - PX(18) && e->x < right) {
-			if (staged)
+			if (it & 0x20000000u) {
+				/* "+" on a conflicted file = mark as resolved */
+				app.ctx = CTX_SCM_FILE;
+				snprintf(app.ctx_path, sizeof app.ctx_path, "%s", path);
+				run_command(CMD_GIT_MARK_RESOLVED);
+			} else if (staged)
 				git_unstage(app.git, path);
 			else
 				git_stage(app.git, path);
@@ -1530,9 +1557,17 @@ bool scm_event(const Event *e, int x, int y, int w, int h)
 			scm_refresh();
 			return true;
 		}
+		/* like VSCodium: a click opens the changes (a diff), new and
+		 * conflicted files open as themselves */
+		u16 fl = st->flags[si];
 		char abs[8192];
 		snprintf(abs, sizeof abs, "%s%s", git_workdir(app.git), path);
-		open_file(abs, e->clicks < 2, UINT32_MAX, 0);
+		if (it & 0x20000000u || (!staged && (fl & GS_WT_NEW)) || (staged && (fl & GS_INDEX_NEW)))
+			open_file(abs, e->clicks < 2, UINT32_MAX, 0);
+		else if (staged)
+			diff_open_staged(path);
+		else
+			diff_open_worktree(path);
 		if (e->clicks < 2)
 			app.focus = FOCUS_SIDEBAR;
 		return true;
@@ -1576,7 +1611,7 @@ bool scm_event(const Event *e, int x, int y, int w, int h)
 		case SDLK_SPACE:
 			if (app.scm_sel < scm_n && !(scm_item[app.scm_sel] & 0x80000000u)) {
 				const GitStatus *st = git_status(app.git);
-				u32 si = scm_item[app.scm_sel] & 0x3FFFFFFFu;
+				u32 si = scm_item[app.scm_sel] & 0x1FFFFFFFu;
 				char abs[8192];
 				snprintf(abs, sizeof abs, "%s%s", git_workdir(app.git), st->pool.b + st->path[si]);
 				open_file(abs, e->key == SDLK_SPACE, UINT32_MAX, 0);
@@ -1783,7 +1818,7 @@ bool scm_context(int x, int y, int w, int h, int mx, int my)
 		return false;
 	app.scm_sel = i;
 	const GitStatus *st = git_status(app.git);
-	u32 si = scm_item[i] & 0x3FFFFFFFu;
+	u32 si = scm_item[i] & 0x1FFFFFFFu;
 	ctx_menu_scm_file(mx, my, st->pool.b + st->path[si], (scm_item[i] & 0x40000000u) != 0);
 	return true;
 }

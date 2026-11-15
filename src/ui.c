@@ -159,7 +159,12 @@ u32 doc_open(const char *abs)
 u32 doc_new_untitled(void)
 {
 	Docs *D = &app.docs;
-	u32 d = D->n < MAX_DOCS ? D->n++ : UINT32_MAX;
+	u32 d = UINT32_MAX;
+	for (u32 i = 0; i < D->n && d == UINT32_MAX; i++)
+		if (!D->path[i] && !D->rel[i] && !D->untitled[i] && !D->readonly[i] && !D->refs[i])
+			d = i; /* reuse a released slot (diff originals come and go) */
+	if (d == UINT32_MAX)
+		d = D->n < MAX_DOCS ? D->n++ : UINT32_MAX;
 	if (d == UINT32_MAX)
 		return d;
 	text_init(&D->text[d]);
@@ -180,6 +185,12 @@ u32 doc_new_untitled(void)
 	D->dn[d] = D->sn[d] = D->gm_n[d] = 0;
 	D->lsp_open[d] = false;
 	return d;
+}
+
+void doc_release_unref(u32 d)
+{
+	app.docs.refs[d] = 1;
+	doc_release(d);
 }
 
 void doc_release(u32 d)
@@ -367,6 +378,8 @@ void close_tab(u32 gi, u32 t)
 		return;
 	View *v = g->tab[t];
 	u32 d = v->doc;
+	if (v->diff_left != UINT32_MAX)
+		diff_view_closed(v);
 	free(v);
 	memmove(g->tab + t, g->tab + t + 1, (g->nt - t - 1) * sizeof(View *));
 	/* fix MRU: drop t, shift indices above it */
@@ -431,7 +444,7 @@ static u32 show_doc(u32 d, bool preview)
 {
 	Group *g = &app.groups[app.active_group];
 	for (u32 t = 0; t < g->nt; t++)
-		if (g->tab[t]->doc == d) {
+		if (g->tab[t]->doc == d && g->tab[t]->diff_left == UINT32_MAX) {
 			if (!preview)
 				g->tab[t]->preview = false;
 			activate_tab(app.active_group, t);
@@ -444,6 +457,7 @@ static u32 show_doc(u32 d, bool preview)
 				View *v = g->tab[t];
 				doc_release(v->doc);
 				memset(v, 0, sizeof *v);
+				v->diff_left = UINT32_MAX;
 				v->doc = d;
 				v->nc = 1;
 				v->want_x[0] = -1;
@@ -455,6 +469,7 @@ static u32 show_doc(u32 d, bool preview)
 	if (g->nt == MAX_TABS)
 		close_tab(app.active_group, g->mru[g->nt - 1]);
 	View *v = vx_alloc(sizeof *v);
+	v->diff_left = UINT32_MAX;
 	v->doc = d;
 	v->nc = 1;
 	v->want_x[0] = -1;
@@ -471,6 +486,45 @@ static u32 show_doc(u32 d, bool preview)
 	g->nt++;
 	activate_tab(app.active_group, at);
 	return at;
+}
+
+/* Open (or focus) a diff tab: doc on the right, left = original. */
+View *show_view_diff(u32 d, u32 left, u8 kind, const char *rel)
+{
+	Group *g = &app.groups[app.active_group];
+	for (u32 t = 0; t < g->nt; t++) {
+		View *o = g->tab[t];
+		if (o->doc == d && o->diff_left != UINT32_MAX && o->diff_kind == kind && !strcmp(o->diff_rel, rel)) {
+			/* already open: drop the new original, keep the tab */
+			if (app.docs.refs[left] == 0)
+				doc_release_unref(left);
+			activate_tab(app.active_group, t);
+			app.focus = FOCUS_EDITOR;
+			return o;
+		}
+	}
+	if (g->nt == MAX_TABS)
+		close_tab(app.active_group, g->mru[g->nt - 1]);
+	View *v = vx_alloc(sizeof *v);
+	v->doc = d;
+	v->nc = 1;
+	v->want_x[0] = -1;
+	v->diff_left = left;
+	v->diff_kind = kind;
+	snprintf(v->diff_rel, sizeof v->diff_rel, "%s", rel);
+	app.docs.refs[d]++;
+	app.docs.refs[left]++;
+	u32 at = g->nt ? g->active + 1 : 0;
+	memmove(g->tab + at + 1, g->tab + at, (g->nt - at) * sizeof(View *));
+	for (u32 i = 0; i < g->nt; i++)
+		if (g->mru[i] >= at)
+			g->mru[i]++;
+	g->tab[at] = v;
+	g->mru[g->nt] = at;
+	g->nt++;
+	activate_tab(app.active_group, at);
+	app.focus = FOCUS_EDITOR;
+	return v;
 }
 
 void open_file(const char *abs, bool preview, u32 line, u32 col)
@@ -624,6 +678,12 @@ static const Binding bindings[] = {
     {C, SDLK_I, W_EDITOR, CMD_SHOW_HOVER, 1},
     {C, SDLK_T, W_ANY, CMD_TOGGLE_THEME, 1},
     {C, SDLK_Q, W_ANY, CMD_QUIT, 0},
+    {0, SDLK_INSERT, W_EDITOR, CMD_TOGGLE_OVERTYPE, 0},
+    {C | A, SDLK_S, W_EDITOR, CMD_GIT_STAGE_RANGES, 1},
+    {C, SDLK_N, W_EDITOR, CMD_GIT_UNSTAGE_RANGES, 1},
+    {C, SDLK_R, W_EDITOR, CMD_GIT_REVERT_RANGES, 1},
+    {A, SDLK_F5, W_EDITOR, CMD_DIFF_NEXT_CHANGE, 0},
+    {S | A, SDLK_F5, W_EDITOR, CMD_DIFF_PREV_CHANGE, 0},
     {S, SDLK_F12, W_EDITOR, CMD_GOTO_REFERENCES, 0},
     {S | A, SDLK_F12, W_EDITOR, CMD_FIND_ALL_REFERENCES, 0},
     {C, SDLK_F2, W_EDITOR, CMD_CHANGE_ALL_OCCURRENCES, 0},
@@ -772,6 +832,15 @@ static const char *cmd_titles[CMD_COUNT] = {
     [CMD_TRANSFORM_TITLE] = "Transform to Title Case",
     [CMD_TRANSFORM_SNAKE] = "Transform to Snake Case",
     [CMD_TRANSFORM_KEBAB] = "Transform to Kebab Case",
+    [CMD_TOGGLE_OVERTYPE] = "Toggle Overtype/Insert Mode",
+    [CMD_GIT_STAGE_RANGES] = "Git: Stage Selected Ranges",
+    [CMD_GIT_UNSTAGE_RANGES] = "Git: Unstage Selected Ranges",
+    [CMD_GIT_REVERT_RANGES] = "Git: Revert Selected Ranges",
+    [CMD_GIT_MARK_RESOLVED] = "Git: Mark as Resolved (stage the file)",
+    [CMD_CONFLICT_NEXT] = "Merge Conflict: Next Conflict",
+    [CMD_CONFLICT_PREV] = "Merge Conflict: Previous Conflict",
+    [CMD_DIFF_NEXT_CHANGE] = "Go to Next Difference",
+    [CMD_DIFF_PREV_CHANGE] = "Go to Previous Difference",
 };
 
 const char *command_title(int cmd) { return cmd_titles[cmd] ? cmd_titles[cmd] : ""; }
@@ -804,6 +873,7 @@ const char *command_keys(int cmd)
 
 static void quick_close(void)
 {
+	app.quick_accept_pending = false;
 	app.quick = QUICK_NONE;
 	app.focus = active_view() ? FOCUS_EDITOR : FOCUS_SIDEBAR;
 	app.dirty = true;
@@ -831,12 +901,11 @@ void ui_ensure_files(void) { ensure_files(); }
 
 static void ensure_files(void)
 {
-	if (app.files_ok)
-		return;
-	files_scan(&app.files, app.root, app.git ? skip_ignored : NULL, app.git, 200000);
-	app.files_ok = true;
-	free(app.search_collapsed);
-	app.search_collapsed = vx_alloc(app.files.n + 1);
+	/* scanned on a background thread; until it lands the previous list
+	 * (or none) is used and the views refresh when it arrives */
+	if (!app.files_ok)
+		bg_files_request();
+	(void)skip_ignored;
 }
 
 static void quick_reserve(u32 n)
@@ -1189,6 +1258,10 @@ static void quick_accept(void)
 		return;
 	}
 	if (app.quick_n == 0) {
+		if (kind == QUICK_FILES && bg_files_busy()) {
+			app.quick_accept_pending = true; /* accept when the scan lands */
+			return;
+		}
 		quick_close();
 		return;
 	}
@@ -1302,7 +1375,9 @@ static void quick_draw(void)
 		} else if (app.quick == QUICK_PROMPT) {
 			snprintf(msg, sizeof msg, "Press 'Enter' to confirm or 'Escape' to cancel");
 		} else {
-			snprintf(msg, sizeof msg, app.quick == QUICK_COMMANDS ? "No matching commands" : "No matching results");
+			snprintf(msg, sizeof msg, app.quick == QUICK_COMMANDS ? "No matching commands"
+			                          : bg_files_busy()          ? "Scanning files..."
+			                                                     : "No matching results");
 		}
 		draw_text_fit(FONT_UI, x + pad + PX(6), cy + (rh - font_m[FONT_UI].line) / 2, msg, strlen(msg),
 		              w - 2 * pad - PX(12), COL(C_DESCRIPTION_FG));
@@ -1482,7 +1557,10 @@ static void restart_lsp(void)
 	for (u32 d = 0; d < app.docs.n; d++)
 		app.docs.lsp_open[d] = false;
 	const char *cmd = getenv("VXIDE_CLANGD");
-	char *argv[] = {(char *)(cmd ? cmd : "clangd"), "--log=error", "--background-index", NULL};
+	/* the background indexer reads every source file: keep it behind the
+	 * editor's own I/O (matters on a slow disk) */
+	char *argv[] = {(char *)(cmd ? cmd : "clangd"), "--log=error", "--background-index",
+	                "--background-index-priority=low", NULL};
 	app.lsp = lsp_start(app.root, argv);
 	if (!app.lsp)
 		ui_log("[lsp] could not start %s", argv[0]);
@@ -1498,6 +1576,8 @@ void run_command(int cmd)
 	View *v = active_view();
 	app.dirty = true;
 	if (v && ed_command(v, cmd))
+		return;
+	if (diff_command(v, cmd))
 		return;
 	if (actions_command(cmd))
 		return;
@@ -1783,6 +1863,9 @@ void run_command(int cmd)
 	case CMD_QUIT:
 		app.running = false;
 		break;
+	case CMD_TOGGLE_OVERTYPE:
+		app.overtype = !app.overtype;
+		break;
 	default:
 		break;
 	}
@@ -1864,6 +1947,7 @@ static void panel_area(int *x, int *y, int *w, int *h)
 }
 
 static bool tabs_mouse(Group *g, u32 gi, const Event *e);
+static void doc_external_change(u32 d);
 static int tab_width(View *v);
 static int tabs_scroll_for(Group *g);
 
@@ -1979,6 +2063,13 @@ void ui_event(const Event *e)
 	}
 	if (e->type == EV_QUIT) {
 		app.running = false;
+		return;
+	}
+	if (e->type == EV_FOCUS) {
+		/* coming back to the window: things may have changed outside */
+		git_request_refresh(0);
+		for (u32 d = 0; d < app.docs.n; d++)
+			doc_external_change(d);
 		return;
 	}
 	if (e->type == EV_KEY) {
@@ -2315,11 +2406,23 @@ int file_icon_draw(const char *name, int x, int y, int h)
 
 /* ---- tabs, breadcrumbs ------------------------------------------------- */
 
-static int tab_width(View *v)
+/* Tab label: the file name, or "name (Working Tree)" for a diff of it. */
+static const char *view_label(View *v, char *buf, size_t cap)
 {
 	const char *rel = app.docs.rel[v->doc];
 	const char *base = strrchr(rel, '/');
 	base = base ? base + 1 : rel;
+	if (v->diff_left != UINT32_MAX && v->diff_kind == DIFF_WORKTREE) {
+		snprintf(buf, cap, "%s (Working Tree)", base);
+		return buf;
+	}
+	return base;
+}
+
+static int tab_width(View *v)
+{
+	char lb[600];
+	const char *base = view_label(v, lb, sizeof lb);
 	return PX(10) + PX(22) + font_width(FONT_UI, base, strlen(base)) + PX(4) + PX(28);
 }
 
@@ -2464,10 +2567,11 @@ static void draw_tabs(Group *g, u32 gi)
 		if (active && group_active)
 			draw_rect(x, y, w, PX(1), COL(C_TAB_ACTIVE_BORDER_TOP));
 		draw_rect(x + w - PX(1), y, PX(1), app.tabs_h, COL(C_TAB_BORDER));
-		const char *rel = app.docs.rel[v->doc];
-		const char *base = strrchr(rel, '/');
-		base = base ? base + 1 : rel;
-		int tx = file_icon_draw(base, x + PX(10), y, app.tabs_h);
+		char lb[600];
+		const char *base = view_label(v, lb, sizeof lb);
+		const char *iname = v->diff_left != UINT32_MAX ? v->diff_rel : app.docs.rel[v->doc];
+		const char *isl = strrchr(iname, '/');
+		int tx = file_icon_draw(isl ? isl + 1 : iname, x + PX(10), y, app.tabs_h);
 		char letter;
 		bool has;
 		u32 gc = doc_git_color(v->doc, &letter, &has);
@@ -2789,6 +2893,8 @@ static void draw_status(void)
 		Text *t = &D->text[v->doc];
 		const char *ln = syn_lang_name(D->lang[v->doc]);
 		rx = status_item(rx, y, ln, strlen(ln), true);
+		if (app.overtype)
+			rx = status_item(rx, y, "OVR", 3, true);
 		const char *eol = t->crlf ? "CRLF" : "LF";
 		rx = status_item(rx, y, eol, strlen(eol), true);
 		rx = status_item(rx, y, "UTF-8", 5, true);
@@ -3035,19 +3141,39 @@ static void blame_tick(void)
 	app.blame_key = key;
 }
 
+/* Ask for a git status refresh after delay_ms (requests coalesce). */
+void git_request_refresh(u64 delay_ms)
+{
+	u64 due = vx_now_ns() + delay_ms * 1000000ull;
+	if (!app.git_due_ns || due < app.git_due_ns)
+		app.git_due_ns = due;
+}
+
 static void git_tick(void)
 {
 	u64 now = vx_now_ns();
-	if (app.git && now - app.git_ns > 3000000000ull) {
-		git_refresh(app.git);
+	if (!app.git)
+		return;
+	/* legacy "refresh soon" marker used by older call sites */
+	if (app.git_ns == 0) {
 		app.git_ns = now;
+		git_request_refresh(100);
+	}
+	/* no polling of the whole work tree: events (save, git ops, .git
+	 * changes, focus) ask for refreshes; a slow fallback catches the rest */
+	if (now - app.git_req_ns > 60000000000ull)
+		git_request_refresh(0);
+	if (app.git_due_ns && now >= app.git_due_ns && !git_refreshing(app.git)) {
+		app.git_due_ns = 0;
+		app.git_req_ns = now;
+		git_refresh_async(app.git);
+	}
+	if (git_poll(app.git)) {
 		app.blame_gen++;
 		app.dirty = true;
 		for (u32 d = 0; d < app.docs.n; d++)
 			app.docs.gm_for[d] = UINT32_MAX; /* index may have changed */
 	}
-	if (!app.git)
-		return;
 	Docs *D = &app.docs;
 	const char *wd = git_workdir(app.git);
 	size_t wl = strlen(wd);
@@ -3060,7 +3186,7 @@ static void git_tick(void)
 		u32 nl = text_lines(t);
 		VX_GROW(D->gm[d], D->gm_cap[d], nl);
 		u16 pf = git_path_flags(app.git, D->path[d] + wl);
-		if (pf & (GS_WT_NEW | GS_IGNORED))
+		if (pf & (GS_WT_NEW | GS_IGNORED | GS_CONFLICT))
 			D->gm_n[d] = 0; /* no quick diff for untracked or ignored files */
 		else if (git_line_marks(app.git, D->path[d] + wl, text_flat(t), t->len, D->gm[d], nl) == 0)
 			D->gm_n[d] = nl;
@@ -3072,20 +3198,167 @@ static void git_tick(void)
 	}
 }
 
+/* ---- file-system watches ------------------------------------------------- */
+
+enum { TAG_GIT_DIR = 1, TAG_GIT_REFS, TAG_GIT_HEADS, TAG_DIR = 0x10000000u, TAG_DOC = 0x20000000u };
+
+static void watch_dirs_sync(void)
+{
+	/* the explorer's open folders (the root included) are watched */
+	char rel[4096], abs[8192];
+	u32 want[1024], nwant = 0;
+	for (u32 i = 0; i < app.tree.n && nwant < 1024; i++) {
+		u8 f = app.tree.flags[i];
+		if (!(f & FS_DIR) || !(f & FS_LOADED) || (i && !(f & FS_OPEN)))
+			continue;
+		/* only folders whose ancestors are open (reachable rows) */
+		bool vis = true;
+		for (u32 p = app.tree.parent[i]; p != FS_NONE && p != 0; p = app.tree.parent[p])
+			if (!(app.tree.flags[p] & FS_OPEN))
+				vis = false;
+		if (!vis)
+			continue;
+		want[nwant++] = i;
+	}
+	/* drop watches for folders no longer shown */
+	for (u32 k = 0; k < app.nwatch;) {
+		const char *wr = app.watch_pool.b + app.watch_rel[k];
+		bool keep = false;
+		for (u32 j = 0; j < nwant && !keep; j++) {
+			fs_relpath(&app.tree, want[j], rel, sizeof rel);
+			keep = !strcmp(rel, wr);
+		}
+		if (!keep) {
+			fsw_remove(app.fsw, TAG_DIR | k);
+			app.watch_rel[k] = app.watch_rel[--app.nwatch];
+			if (fsw_has(app.fsw, TAG_DIR | app.nwatch)) {
+				/* renumber the moved entry */
+				fsw_remove(app.fsw, TAG_DIR | app.nwatch);
+				snprintf(abs, sizeof abs, "%s/%s", app.root, app.watch_pool.b + app.watch_rel[k]);
+				fsw_add(app.fsw, abs, TAG_DIR | k);
+			}
+			continue;
+		}
+		k++;
+	}
+	for (u32 j = 0; j < nwant && app.nwatch < 1024; j++) {
+		fs_relpath(&app.tree, want[j], rel, sizeof rel);
+		bool have = false;
+		for (u32 k = 0; k < app.nwatch && !have; k++)
+			have = !strcmp(app.watch_pool.b + app.watch_rel[k], rel);
+		if (have)
+			continue;
+		snprintf(abs, sizeof abs, "%s%s%s", app.root, rel[0] ? "/" : "", rel);
+		u32 k = app.nwatch;
+		if (fsw_add(app.fsw, abs, TAG_DIR | k) == 0) {
+			app.watch_rel[k] = pool_add(&app.watch_pool, rel, (u32)strlen(rel));
+			app.nwatch++;
+		}
+	}
+	if (app.watch_pool.n > (1u << 20)) {
+		/* compact the string pool now and then */
+		Pool np = {0};
+		for (u32 k = 0; k < app.nwatch; k++) {
+			const char *r = app.watch_pool.b + app.watch_rel[k];
+			app.watch_rel[k] = pool_add(&np, r, (u32)strlen(r));
+		}
+		pool_free(&app.watch_pool);
+		app.watch_pool = np;
+	}
+}
+
+static void watch_docs_sync(void)
+{
+	for (u32 d = 0; d < app.docs.n && d < 4096; d++) {
+		bool want = app.docs.path[d] && app.docs.refs[d];
+		bool have = fsw_has(app.fsw, TAG_DOC | d);
+		if (want && !have)
+			fsw_add(app.fsw, app.docs.path[d], TAG_DOC | d);
+		else if (!want && have)
+			fsw_remove(app.fsw, TAG_DOC | d);
+	}
+}
+
+/* An open document changed on disk: reload it when it has no unsaved edits. */
+static void doc_external_change(u32 d)
+{
+	Docs *D = &app.docs;
+	if (d >= D->n || !D->path[d] || !text_changed_on_disk(&D->text[d], D->path[d]))
+		return;
+	if (text_dirty(&D->text[d])) {
+		ui_status("'%s' changed on disk (unsaved changes kept)", D->rel[d]);
+		return;
+	}
+	size_t n = 0;
+	char *s = vx_read_file(D->path[d], &n);
+	if (!s)
+		return;
+	Text *t = &D->text[d];
+	doc_replace(d, 0, t->len, s, (u32)n, 0);
+	t->saved_upos = t->upos;
+	text_restat(t, D->path[d]);
+	free(s);
+}
+
+static void watch_tick(void)
+{
+	if (!app.fsw)
+		return;
+	u64 now = vx_now_ns();
+	if (now - app.watch_sync_ns > 500000000ull) {
+		app.watch_sync_ns = now;
+		watch_dirs_sync();
+		watch_docs_sync();
+	}
+	u32 tags[256];
+	u32 n = fsw_poll(app.fsw, tags, 256);
+	for (u32 i = 0; i < n; i++) {
+		u32 t = tags[i];
+		app.dirty = true;
+		if (t == TAG_GIT_DIR || t == TAG_GIT_REFS || t == TAG_GIT_HEADS) {
+			/* index, HEAD or refs moved: an outside git command ran */
+			git_request_refresh(300);
+		} else if ((t & 0xF0000000u) == TAG_DIR) {
+			u32 k = t & 0x0FFFFFFFu;
+			if (k < app.nwatch) {
+				u32 node = fs_find(&app.tree, app.watch_pool.b + app.watch_rel[k]);
+				if (node != FS_NONE)
+					fs_reload(&app.tree, node);
+			}
+			app.files_ok = false; /* Quick Open rescans lazily */
+			git_request_refresh(500);
+		} else if ((t & 0xF0000000u) == TAG_DOC) {
+			doc_external_change(t & 0x0FFFFFFFu);
+			git_request_refresh(500);
+		}
+	}
+}
+
 void ui_tick(void)
 {
 	app.now = vx_now_ns();
 	lsp_tick();
 	git_tick();
 	blame_tick();
-	if (app.now - app.tree_scan_ns > 5000000000ull) {
-		/* pick up files created outside the editor */
-		if (app.tree_scan_ns) {
-			fs_refresh(&app.tree);
-			app.files_ok = false;
+	watch_tick();
+	if (bg_files_poll()) {
+		app.dirty = true;
+		if (app.quick == QUICK_FILES && app.quick_in.n) {
+			quick_update();
+			if (app.quick_accept_pending) {
+				app.quick_accept_pending = false;
+				quick_accept();
+			}
 		}
-		app.tree_scan_ns = app.now;
+		if (app.search_pending) {
+			app.search_pending = false;
+			search_run();
+		}
 	}
+	if (bg_search_poll())
+		app.dirty = true;
+	if (bg_search_busy(NULL, NULL) || bg_files_busy())
+		app.dirty = true; /* progress */
 	search_tick();
 	{
 		extern void gitui_tick(void);
@@ -3143,10 +3416,22 @@ bool ui_init(const char *root, int w, int h, int scale, bool headless)
 	gpu_set_atlas(font_atlas);
 	fs_init(&app.tree, root);
 	app.tree_sel = FS_NONE;
-	app.git = git_open(root);
+	/* nothing waits on the disk at start-up: the first git status runs on
+	 * its worker thread and the views fill in when it lands */
+	app.git = git_open_ex(root, false);
+	app.fsw = fsw_open();
 	if (app.git) {
-		git_refresh(app.git);
-		app.git_ns = vx_now_ns();
+		git_refresh_async(app.git);
+		app.git_ns = app.git_req_ns = vx_now_ns();
+		{
+			char p[8192];
+			snprintf(p, sizeof p, "%s.git", git_workdir(app.git));
+			fsw_add(app.fsw, p, TAG_GIT_DIR); /* index, HEAD (lock + rename) */
+			snprintf(p, sizeof p, "%s.git/refs/heads", git_workdir(app.git));
+			fsw_add(app.fsw, p, TAG_GIT_HEADS);
+			snprintf(p, sizeof p, "%s.git/refs/remotes", git_workdir(app.git));
+			fsw_add(app.fsw, p, TAG_GIT_REFS);
+		}
 		app.blame_on = !getenv("VXIDE_NO_BLAME");
 		app.blame = blame_start(git_workdir(app.git));
 	}
@@ -3167,6 +3452,7 @@ void ui_shutdown(void)
 	if (app.lsp)
 		lsp_stop(app.lsp);
 	app.lsp = NULL;
+	bg_shutdown();
 	blame_stop(app.blame);
 	app.blame = NULL;
 	{
@@ -3176,6 +3462,8 @@ void ui_shutdown(void)
 	if (app.git)
 		git_close(app.git);
 	app.git = NULL;
+	fsw_close(app.fsw);
+	app.fsw = NULL;
 	fs_free(&app.tree);
 	files_free(&app.files);
 	search_free(&app.results);

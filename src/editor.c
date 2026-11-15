@@ -179,6 +179,49 @@ static void classify_line(u32 d, u32 l, const char *s, u32 n)
 	}
 }
 
+/* Draw one document line's text (syntax + semantic colours) with its
+ * origin at tx; glyphs left of clip_x0 or right of clip_x1 are skipped.
+ * Used by the diff editor's two panes. */
+void ed_draw_line_text(u32 d, u32 l, int tx, int ly, int clip_x0, int clip_x1)
+{
+	Text *t = &app.docs.text[d];
+	if (l >= text_lines(t))
+		return;
+	u32 n;
+	const char *s = text_line(t, l, &n);
+	u32 nn = VX_MIN(n, (u32)MAX_LINE_BYTES);
+	static char buf[MAX_LINE_BYTES];
+	memcpy(buf, s, nn);
+	classify_line(d, l, buf, nn);
+	int px = 0;
+	for (u32 i = 0; i < nn;) {
+		u8 c = (u8)buf[i];
+		if (c == '\t') {
+			px += TAB * app.char_w - px % (TAB * app.char_w);
+			i++;
+			continue;
+		}
+		u32 cp = c, k = 1;
+		if (c >= 0x80)
+			k = utf8_decode(buf + i, nn - i, &cp);
+		u8 st = tk_style[line_cls[i]];
+		int font = (st & TS_BOLD) ? FONT_MONO_BOLD : (st & TS_ITALIC) ? FONT_MONO_ITALIC : FONT_MONO;
+		u32 gid = font_glyph(font, cp);
+		int gx = tx + px;
+		if (gx > clip_x1)
+			break;
+		int adv = cp < 0x80 ? app.char_w : font_glyphs.adv[font_glyph(FONT_MONO, cp)];
+		if (c != ' ' && gx + adv > clip_x0)
+			draw_glyph(gid, gx, ly, TOK(line_cls[i]));
+		px += adv;
+		i += k;
+	}
+}
+
+/* x of a byte offset within line l, and the offset nearest to x. */
+int ed_x_of(Text *t, u32 l, u32 off);
+u32 ed_off_at_x(Text *t, u32 l, int px);
+
 /* ---- cursors ---------------------------------------------------------------- */
 
 static void sort_cursors(View *v)
@@ -238,6 +281,10 @@ static int g_view_h = 600; /* editor height of the last draw, for paging */
 
 void ed_reveal(View *v, u32 off, bool center)
 {
+	if (v->diff_left != UINT32_MAX) {
+		app.dirty = true; /* the diff view scrolls in rows when it draws */
+		return;
+	}
 	Text *t = T(v);
 	u32 l = text_line_of(t, VX_MIN(off, t->len));
 	i64 y = (i64)l * app.line_h;
@@ -460,6 +507,28 @@ void ed_text(View *v, const char *s, size_t n)
 	box.on = false;
 	if (readonly_doc(v))
 		return;
+	if (app.overtype && !memchr(s, '\n', n)) {
+		/* overtype: each typed character replaces the next one on the line */
+		u32 cps = 0;
+		for (size_t i = 0; i < n; i++)
+			cps += !utf8_cont((u8)s[i]);
+		u32 g = group_for(v, GK_TYPE);
+		for (u32 c = 0; c < v->nc; c++) {
+			u32 a = sel_lo(v, c), b = sel_hi(v, c);
+			if (a == b) {
+				u32 l = text_line_of(t, a);
+				u32 le = text_line_start(t, l) + text_line_len(t, l);
+				for (u32 k = 0; k < cps && b < le; k++)
+					b = next_char(t, b);
+			}
+			edit(v, a, b - a, s, (u32)n, g);
+			v->head[c] = v->anchor[c] = a + (u32)n;
+			v->want_x[c] = -1;
+		}
+		sort_cursors(v);
+		ed_reveal(v, v->head[0], false);
+		return;
+	}
 	app.hover_open = false;
 	if (n == 1) {
 		char c = s[0];
@@ -1057,8 +1126,19 @@ static void paste(View *v)
 		edit(v, ls, 0, s, (u32)n, g);
 		v->head[0] = v->anchor[0] = ls + (u32)n + col;
 	} else {
+		bool over = app.overtype && !memchr(s, '\n', n);
 		for (u32 c = 0; c < v->nc; c++) {
 			u32 a = sel_lo(v, c), b = sel_hi(v, c);
+			if (over && a == b) {
+				/* editor.overtypeOnPaste: the pasted text replaces as many characters */
+				u32 cps = 0;
+				for (size_t i = 0; i < n; i++)
+					cps += !utf8_cont((u8)s[i]);
+				u32 l = text_line_of(t, a);
+				u32 le = text_line_start(t, l) + text_line_len(t, l);
+				for (u32 k = 0; k < cps && b < le; k++)
+					b = next_char(t, b);
+			}
 			edit(v, a, b - a, s, (u32)n, g);
 			v->head[c] = v->anchor[c] = a + (u32)n;
 		}
@@ -1549,6 +1629,8 @@ bool ed_key(View *v, const Event *e)
 	u32 k = e->key;
 	if ((k == SDLK_BACKSPACE || k == SDLK_DELETE || k == SDLK_RETURN || k == SDLK_KP_ENTER || k == SDLK_TAB) &&
 	    readonly_doc(v))
+		return true;
+	if (v->diff_left != UINT32_MAX && diff_key(v, e))
 		return true;
 	if (app.compl_open) {
 		if (k == SDLK_DOWN || k == SDLK_UP || k == SDLK_PAGEDOWN || k == SDLK_PAGEUP) {
@@ -2080,6 +2162,10 @@ static int drag_grab;
 
 void ed_mouse(View *v, const Event *e, int x, int y, int w, int h)
 {
+	if (v->diff_left != UINT32_MAX) {
+		diff_mouse(v, e, x, y, w, h);
+		return;
+	}
 	Text *t = T(v);
 	int mm = minimap_w(w);
 	int sb_x = x + w - SCROLL_W;
@@ -2111,6 +2197,25 @@ void ed_mouse(View *v, const Event *e, int x, int y, int w, int h)
 		drag_mode = 6;
 		app.drag = 3; /* DRAG_EDITOR in ui.c */
 		return;
+	}
+	if (e->type == EV_MDOWN && e->button == 1 && app.git) {
+		/* a click on the git change bar in the gutter (VSCodium's quick diff peek) */
+		int nd = VX_MAX(digits(text_lines(t)), 5);
+		int gx = x + PX(18) + nd * app.char_w + PX(5);
+		i64 py = (i64)(e->y - y) + v->scroll_y;
+		u32 l = py < 0 ? 0 : (u32)(py / app.line_h);
+		Docs *D = &app.docs;
+		if (e->x >= gx - PX(3) && e->x < gx + PX(8) && l < D->gm_n[v->doc] && D->gm[v->doc][l] &&
+		    D->gm_for[v->doc] != UINT32_MAX) {
+			app.ctx = CTX_EDITOR;
+			app.ctx_off = l;
+			menu_open(e->x, e->y);
+			menu_item("Stage Change", CMD_GIT_STAGE_CHANGE, true);
+			menu_item("Revert Change", CMD_GIT_REVERT_CHANGE, true);
+			menu_sep();
+			menu_item("Open Changes", CMD_SCM_OPEN_CHANGES, true);
+			return;
+		}
 	}
 	if (e->type == EV_MDOWN && e->button == 1) {
 		app.compl_open = false;
@@ -2517,6 +2622,10 @@ static bool find_widget_click(View *v, const Event *e)
 
 void ed_draw(Group *g, View *v, int x, int y, int w, int h, bool focused)
 {
+	if (v->diff_left != UINT32_MAX) {
+		diff_draw(g, v, x, y, w, h, focused);
+		return;
+	}
 	if (v->doc == blame_rect_doc)
 		blame_rect_x1 = -1; /* re-recorded below if still shown */
 	(void)g;
@@ -2621,6 +2730,10 @@ void ed_draw(Group *g, View *v, int x, int y, int w, int h, bool focused)
 		draw_selection_line(t, v, l, tx, ly, text_x + text_w);
 		draw_clip(x, y, w - mm - SCROLL_W, h);
 	}
+
+	/* merge conflict regions: coloured, the markers stay editable text */
+	draw_clip(text_x, y, text_w, h);
+	conflict_draw(v, first, last, x, text_x, text_w, y0, lh, tx);
 
 	/* indent guides */
 	draw_clip(text_x, y, text_w, h);
@@ -2789,7 +2902,15 @@ void ed_draw(Group *g, View *v, int x, int y, int w, int h, bool focused)
 				continue;
 			int ly = y0 + (int)(l - first) * lh;
 			int cx = tx + x_of(t, l, v->head[c]);
-			draw_rect(cx, ly, PX(2), lh, COL(C_CURSOR));
+			if (app.overtype) {
+				/* block cursor over the character it will replace */
+				u32 h = v->head[c];
+				u32 le = text_line_start(t, l) + text_line_len(t, l);
+				int cw = h < le ? x_of(t, l, next_char(t, h)) - x_of(t, l, h) : app.char_w;
+				draw_rect(cx, ly, VX_MAX(cw, PX(2)), lh, (COL(C_CURSOR) & 0xFFFFFF00u) | 0x80u);
+			} else {
+				draw_rect(cx, ly, PX(2), lh, COL(C_CURSOR));
+			}
 		}
 	}
 	draw_noclip();
@@ -3198,3 +3319,6 @@ void ed_draw_popups(View *v)
 		draw_noclip();
 	}
 }
+
+int ed_x_of(Text *t, u32 l, u32 off) { return x_of(t, l, off); }
+u32 ed_off_at_x(Text *t, u32 l, int px) { return off_at_x(t, l, px); }

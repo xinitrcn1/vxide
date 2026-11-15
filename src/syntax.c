@@ -3935,7 +3935,19 @@ static u32 lex_diff(u32 state, const char *s, u32 n, SynSpans *o)
 		emit(o, a, b - a, TK_NUMBER);
 		return 0;
 	}
-	static const char *const keys[] = {"Author:", "AuthorDate:", "Commit:", "CommitDate:", "Date:", "Merge:"};
+	/* `git format-patch` mail: "From <sha> Mon Sep 17 ..." like "commit <sha>" */
+	if (n >= 46 && memcmp(s, "From ", 5) == 0) {
+		u32 b = 5;
+		while (b < n && is_xdigit((u8)s[b]))
+			b++;
+		if (b == 45) {
+			emit(o, 0, 4, TK_DIFFHDR);
+			emit(o, 5, 40, TK_NUMBER);
+			return 0;
+		}
+	}
+	static const char *const keys[] = {"Author:", "AuthorDate:", "Commit:", "CommitDate:", "Date:", "Merge:",
+	                                   "From:", "Subject:"};
 	for (size_t k = 0; k < VX_COUNT(keys); k++) {
 		u32 l = (u32)strlen(keys[k]);
 		if (n >= l && memcmp(s, keys[k], l) == 0) {
@@ -4114,6 +4126,815 @@ enum { MD_NORMAL, MD_FENCE, MD_HTMLCMT };
 
 static u32 lex_any(int lang, u32 state, const char *s, u32 n, SynSpans *o);
 
+/* ================================================================== */
+/* Python                                                              */
+/*
+ * Per VSCodium's MagicPython.tmLanguage under Dark+/Light+:
+ *   keyword.control.flow / .import       -> TK_CONTROL  (#C586C0)
+ *   storage.type.function/class, storage.modifier.declaration (def class
+ *   lambda async global nonlocal)        -> TK_STORAGE  (#569CD6)
+ *   keyword.operator.logical.python (and or not in is) -> TK_STORAGE
+ *   entity.name.function (def name), decorators, support.function.builtin
+ *   and .magic                           -> TK_FUNCTION (#DCDCAA)
+ *   entity.name.type.class, entity.other.inherited-class, support.type
+ *   (builtin types, exceptions)          -> TK_TYPE     (#4EC9B0)
+ *   variable.parameter (def params, call keywords), support.variable.magic
+ *                                        -> TK_VARIABLE (#9CDCFE)
+ *   variable.language.special.self (in bodies), constant.language
+ *                                        -> TK_LANGCONST (#569CD6)
+ *   storage.type.string (r b u f prefixes), the {} of f-strings and
+ *   format placeholders (constant.character.format.placeholder)
+ *                                        -> TK_STORAGE
+ *   raw strings with a lowercase r are regexps (string.regexp) -> TK_REGEX
+ * Generic calls (meta.function-call.generic) have no colour in Dark+.
+ *
+ * State: bits 0-2 string mode (0 none, 1 ''', 2 """, 3 ' continued,
+ * 4 " continued); bits 3-6 string flags (raw, f, bytes, regex);
+ * bit 7 inside a def parameter list, bit 8 inside class bases,
+ * bit 9 expecting a parameter name; bits 10-13 bracket depth there. */
+
+enum { PYS_NONE, PYS_TRI1, PYS_TRI2, PYS_CONT1, PYS_CONT2 };
+enum { PYF_RAW = 8, PYF_F = 16, PYF_BYTES = 32, PYF_REGEX = 64 };
+enum { PY_DEFP = 1u << 7, PY_CLASSB = 1u << 8, PY_EXPECT = 1u << 9 };
+enum { PYK_CTRL = 1, PYK_STORAGE, PYK_LOGIC, PYK_CONST, PYK_FUNC, PYK_TYPE, PYK_MAGICVAR, PYK_DEF, PYK_CLASS, PYK_ASYNC, PYK_SOFT };
+
+static KwSet kw_py;
+
+static const char py_ctrl[] =
+    "if elif else for while break continue return yield try except finally raise with as assert pass del "
+    "await import from";
+static const char py_storage[] = "lambda global nonlocal";
+static const char py_logic[] = "and or not in is";
+static const char py_const[] = "None True False Ellipsis NotImplemented __debug__";
+static const char py_func[] =
+    "abs aiter all anext any ascii bin breakpoint callable chr compile copyright credits delattr dir divmod "
+    "enumerate eval exec exit filter format getattr globals hasattr hash help hex id input isinstance "
+    "issubclass iter len license locals map max memoryview min next oct open ord pow print quit range repr "
+    "reversed round setattr sorted sum vars zip __import__";
+static const char py_type[] =
+    "bool bytearray bytes classmethod complex dict float frozenset int list object property set slice "
+    "staticmethod str super tuple type "
+    "BaseException BaseExceptionGroup Exception ExceptionGroup ArithmeticError AssertionError AttributeError "
+    "BlockingIOError BrokenPipeError BufferError ChildProcessError ConnectionAbortedError ConnectionError "
+    "ConnectionRefusedError ConnectionResetError EOFError EnvironmentError FileExistsError FileNotFoundError "
+    "FloatingPointError GeneratorExit IOError ImportError IndentationError IndexError InterruptedError "
+    "IsADirectoryError KeyError KeyboardInterrupt LookupError MemoryError ModuleNotFoundError NameError "
+    "NotADirectoryError NotImplementedError OSError OverflowError PermissionError ProcessLookupError "
+    "RecursionError ReferenceError RuntimeError StopAsyncIteration StopIteration SyntaxError SystemError "
+    "SystemExit TabError TimeoutError TypeError UnboundLocalError UnicodeDecodeError UnicodeEncodeError "
+    "UnicodeError UnicodeTranslateError ValueError ZeroDivisionError Warning BytesWarning DeprecationWarning "
+    "EncodingWarning FutureWarning ImportWarning PendingDeprecationWarning ResourceWarning RuntimeWarning "
+    "SyntaxWarning UnicodeWarning UserWarning";
+static const char py_magicvar[] =
+    "__all__ __annotations__ __builtins__ __class__ __closure__ __code__ __debug__ __defaults__ __dict__ "
+    "__doc__ __file__ __func__ __globals__ __kwdefaults__ __loader__ __module__ __mro__ __name__ "
+    "__package__ __path__ __qualname__ __self__ __slots__ __spec__ __version__ __weakref__ __match_args__";
+
+static void py_build(void)
+{
+	kw_list(&kw_py, py_ctrl, PYK_CTRL);
+	kw_list(&kw_py, py_storage, PYK_STORAGE);
+	kw_list(&kw_py, py_logic, PYK_LOGIC);
+	kw_list(&kw_py, py_const, PYK_CONST);
+	kw_list(&kw_py, py_func, PYK_FUNC);
+	kw_list(&kw_py, py_type, PYK_TYPE);
+	kw_list(&kw_py, py_magicvar, PYK_MAGICVAR);
+	kw_add(&kw_py, "def", 3, PYK_DEF);
+	kw_add(&kw_py, "class", 5, PYK_CLASS);
+	kw_add(&kw_py, "async", 5, PYK_ASYNC);
+	kw_list(&kw_py, "match case", PYK_SOFT);
+}
+
+static inline bool py_ident(u8 c) { return is_alpha(c) || is_digit(c) || c == '_' || c >= 0x80; }
+
+/* Python number at i (caller checked the first char); returns its end. */
+static u32 py_number(const char *s, u32 n, u32 i, SynSpans *o)
+{
+	u32 a = i;
+	if (s[i] == '0' && i + 1 < n && (lower((u8)s[i + 1]) == 'x' || lower((u8)s[i + 1]) == 'o' || lower((u8)s[i + 1]) == 'b')) {
+		i += 2;
+		while (i < n && (is_xdigit((u8)s[i]) || s[i] == '_'))
+			i++;
+	} else {
+		while (i < n && (is_digit((u8)s[i]) || s[i] == '_'))
+			i++;
+		if (i < n && s[i] == '.') {
+			i++;
+			while (i < n && (is_digit((u8)s[i]) || s[i] == '_'))
+				i++;
+		}
+		if (i < n && lower((u8)s[i]) == 'e') {
+			u32 k = i + 1;
+			if (k < n && (s[k] == '+' || s[k] == '-'))
+				k++;
+			if (k < n && is_digit((u8)s[k])) {
+				i = k;
+				while (i < n && (is_digit((u8)s[i]) || s[i] == '_'))
+					i++;
+			}
+		}
+	}
+	emit(o, a, i - a, TK_NUMBER);
+	if (i < n && lower((u8)s[i]) == 'j') {
+		emit(o, i, 1, TK_STORAGE); /* storage.type.imaginary.number */
+		i++;
+	}
+	return i;
+}
+
+static u32 py_code(const char *s, u32 n, u32 i, u32 end, u32 *st, SynSpans *o, bool in_fstring);
+
+/* Placeholders of str.format / %-format in a plain string piece. */
+static u32 py_placeholder(const char *s, u32 n, u32 i)
+{
+	if (s[i] == '%') {
+		u32 k = i + 1;
+		if (k < n && s[k] == '%')
+			return k + 1;
+		if (k < n && s[k] == '(') {
+			while (k < n && s[k] != ')')
+				k++;
+			if (k >= n)
+				return i;
+			k++;
+		}
+		while (k < n && strchr("#0- +", s[k]))
+			k++;
+		while (k < n && (is_digit((u8)s[k]) || s[k] == '.' || s[k] == '*'))
+			k++;
+		if (k < n && strchr("diouxXeEfFgGcrsab", s[k]))
+			return k + 1;
+		return i;
+	}
+	if (s[i] == '{') {
+		u32 k = i + 1;
+		while (k < n && s[k] != '}' && s[k] != '{' && s[k] != '\'' && s[k] != '"' && s[k] != ' ')
+			k++;
+		if (k < n && s[k] == '}')
+			return k + 1;
+	}
+	return i;
+}
+
+/* Body of a string from i until its closing quote; returns the end and
+ * sets *closed. quote: the quote byte; tri: triple quoted. */
+static u32 py_string_body(const char *s, u32 n, u32 i, u8 quote, bool tri, u32 flags, bool *closed, SynSpans *o)
+{
+	u32 base = (flags & PYF_REGEX) ? TK_REGEX : TK_STRING;
+	bool raw = flags & PYF_RAW;
+	bool fstr = flags & PYF_F;
+	*closed = false;
+	u32 seg = i;
+	while (i < n) {
+		u8 c = (u8)s[i];
+		if (c == quote && (!tri || (i + 2 < n && (u8)s[i + 1] == quote && (u8)s[i + 2] == quote))) {
+			u32 ql = tri ? 3 : 1;
+			emit(o, seg, i + ql - seg, base);
+			*closed = true;
+			return i + ql;
+		}
+		if (c == '\\' && i + 1 < n) {
+			emit(o, seg, i - seg, base);
+			if (raw) {
+				/* raw: \\ and \' are kept; in regexps \d etc are classes */
+				u8 d = (u8)s[i + 1];
+				bool cls = (flags & PYF_REGEX) && strchr("dDwWsSbBAZ", d);
+				emit(o, i, 2, cls ? TK_REGEX : (flags & PYF_REGEX) ? TK_ESCAPE : base);
+				i += 2;
+			} else {
+				u32 k = i + 2;
+				u8 d = (u8)s[i + 1];
+				if (d == 'x')
+					k = VX_MIN(n, i + 4);
+				else if (d == 'u' && !(flags & PYF_BYTES))
+					k = VX_MIN(n, i + 6);
+				else if (d == 'U' && !(flags & PYF_BYTES))
+					k = VX_MIN(n, i + 10);
+				else if (d == 'N' && i + 2 < n && s[i + 2] == '{') {
+					k = i + 3;
+					while (k < n && s[k] != '}')
+						k++;
+					k = VX_MIN(n, k + 1);
+				} else if (d >= '0' && d <= '7') {
+					k = i + 1;
+					while (k < n && k < i + 4 && s[k] >= '0' && s[k] <= '7')
+						k++;
+				}
+				emit(o, i, k - i, TK_ESCAPE);
+				i = k;
+			}
+			seg = i;
+			continue;
+		}
+		if (fstr && (c == '{' || c == '}')) {
+			emit(o, seg, i - seg, base);
+			if (i + 1 < n && s[i + 1] == (char)c) {
+				emit(o, i, 2, TK_ESCAPE); /* {{ and }} */
+				i += 2;
+				seg = i;
+				continue;
+			}
+			if (c == '}') {
+				emit(o, i, 1, TK_STORAGE);
+				seg = ++i;
+				continue;
+			}
+			/* replacement field: { expr [!conv] [:spec] } */
+			emit(o, i, 1, TK_STORAGE);
+			u32 k = i + 1, depth = 0;
+			u8 q = 0;
+			while (k < n) {
+				u8 e = (u8)s[k];
+				if (q) {
+					if (e == q)
+						q = 0;
+				} else if (e == '\'' || e == '"') {
+					if (e == quote)
+						break;
+					q = e;
+				} else if (e == '(' || e == '[' || e == '{') {
+					depth++;
+				} else if ((e == ')' || e == ']') && depth) {
+					depth--;
+				} else if (e == '}') {
+					if (!depth)
+						break;
+					depth--;
+				} else if (!depth && (e == '!' || e == ':') && !(e == '!' && k + 1 < n && s[k + 1] == '=')) {
+					break;
+				}
+				k++;
+			}
+			u32 dummy = 0;
+			py_code(s, n, i + 1, k, &dummy, o, true);
+			i = k;
+			if (i < n && (s[i] == '!' || s[i] == ':')) {
+				u32 spec = i;
+				while (i < n && s[i] != '}' && (u8)s[i] != quote)
+					i++;
+				emit(o, spec, i - spec, TK_STORAGE); /* storage.type.format */
+			}
+			if (i < n && s[i] == '}') {
+				emit(o, i, 1, TK_STORAGE);
+				i++;
+			}
+			seg = i;
+			continue;
+		}
+		if (!fstr && !raw && !(flags & PYF_BYTES) && (c == '%' || c == '{')) {
+			u32 k = py_placeholder(s, n, i);
+			if (k > i) {
+				emit(o, seg, i - seg, base);
+				emit(o, i, k - i, TK_STORAGE);
+				i = k;
+				seg = i;
+				continue;
+			}
+		}
+		i++;
+	}
+	emit(o, seg, n - seg, base);
+	return n;
+}
+
+/* Lex code in [i, end); returns end. *st carries the def/class context. */
+static u32 py_code(const char *s, u32 n, u32 i, u32 end, u32 *st, SynSpans *o, bool in_fstring)
+{
+	u32 ctx = *st & (PY_DEFP | PY_CLASSB | PY_EXPECT);
+	u32 depth = (*st >> 10) & 15u;
+	u32 next_name = 0; /* 1 def name, 2 class name */
+	bool line_start = true;
+	for (u32 k = 0; k < i; k++)
+		if (!is_space((u8)s[k]))
+			line_start = false;
+	while (i < end) {
+		u8 c = (u8)s[i];
+		if (is_space(c)) {
+			i++;
+			continue;
+		}
+		if (c == '#' && !in_fstring) {
+			emit(o, i, end - i, TK_COMMENT);
+			i = end;
+			break;
+		}
+		/* strings, with prefixes */
+		u32 p = i;
+		while (p < end && p - i < 3 && strchr("rRbBuUfF", s[p]))
+			p++;
+		if (p < end && (s[p] == '\'' || s[p] == '"') && (p == i || !py_ident((u8)(i ? s[i - 1] : ' ')))) {
+			u32 flags = 0;
+			bool lower_r = false;
+			for (u32 k = i; k < p; k++) {
+				u8 l = lower((u8)s[k]);
+				if (l == 'r') {
+					flags |= PYF_RAW;
+					lower_r |= s[k] == 'r';
+				} else if (l == 'f')
+					flags |= PYF_F;
+				else if (l == 'b')
+					flags |= PYF_BYTES;
+			}
+			/* MagicPython: r'', rb'', br'' and ur'' are regular expressions */
+			if (lower_r && !(flags & PYF_F))
+				flags |= PYF_REGEX;
+			emit(o, i, p - i, TK_STORAGE);
+			u8 q = (u8)s[p];
+			bool tri = p + 2 < end && (u8)s[p + 1] == q && (u8)s[p + 2] == q;
+			bool closed;
+			if (in_fstring)
+				tri = false;
+			u32 qs = p, body = p + (tri ? 3 : 1);
+			emit(o, qs, body - qs, (flags & PYF_REGEX) ? TK_REGEX : TK_STRING);
+			i = py_string_body(s, in_fstring ? end : n, body, q, tri, flags, &closed, o);
+			if (!closed && !in_fstring) {
+				u32 mode = tri ? (q == '\'' ? PYS_TRI1 : PYS_TRI2) : PYS_NONE;
+				if (!tri && n && s[n - 1] == '\\')
+					mode = q == '\'' ? PYS_CONT1 : PYS_CONT2;
+				*st = mode | flags | ctx | (depth << 10);
+				return n;
+			}
+			line_start = false;
+			continue;
+		}
+		if (is_digit(c) || (c == '.' && i + 1 < end && is_digit((u8)s[i + 1]))) {
+			i = py_number(s, end, i, o);
+			line_start = false;
+			continue;
+		}
+		if (c == '@' && line_start) {
+			/* decorator: @name.attr */
+			u32 k = i + 1;
+			while (k < end && (py_ident((u8)s[k]) || s[k] == '.'))
+				k++;
+			emit(o, i, k - i, TK_FUNCTION);
+			i = k;
+			line_start = false;
+			continue;
+		}
+		if (py_ident(c)) {
+			u32 a = i;
+			while (i < end && py_ident((u8)s[i]))
+				i++;
+			u32 len = i - a;
+			bool after_dot = a > 0 && s[a - 1] == '.';
+			u32 nx = skip_ws(s, end, i);
+			if (next_name) {
+				emit(o, a, len, next_name == 1 ? TK_FUNCTION : TK_TYPE);
+				if (next_name == 1 && nx < end && s[nx] == '(') {
+					ctx = PY_DEFP | PY_EXPECT;
+					depth = 0;
+				} else if (next_name == 2 && nx < end && s[nx] == '(') {
+					ctx = PY_CLASSB | PY_EXPECT;
+					depth = 0;
+				}
+				next_name = 0;
+				line_start = false;
+				continue;
+			}
+			int kc = after_dot ? -1 : kw_find(&kw_py, s + a, len);
+			bool is_self = !after_dot && (word_is(s + a, len, "self") || word_is(s + a, len, "cls"));
+			if ((ctx & PY_DEFP) && depth == 1 && (ctx & PY_EXPECT)) {
+				emit(o, a, len, TK_VARIABLE); /* variable.parameter.function */
+				ctx &= ~PY_EXPECT;
+			} else if ((ctx & PY_CLASSB) && depth == 1 && (ctx & PY_EXPECT) && !(nx < end && s[nx] == '=')) {
+				emit(o, a, len, TK_TYPE); /* entity.other.inherited-class */
+				ctx &= ~PY_EXPECT;
+			} else if (is_self) {
+				emit(o, a, len, TK_LANGCONST); /* variable.language.special.self */
+			} else if (kc == PYK_DEF) {
+				emit(o, a, len, TK_STORAGE);
+				next_name = 1;
+			} else if (kc == PYK_CLASS) {
+				emit(o, a, len, TK_STORAGE);
+				next_name = 2;
+			} else if (kc == PYK_ASYNC) {
+				bool before_def = nx + 3 <= end && !memcmp(s + nx, "def", 3);
+				emit(o, a, len, before_def ? TK_STORAGE : TK_CONTROL);
+			} else if (kc == PYK_SOFT) {
+				/* match/case are keywords only as statements ending in ':' */
+				u32 e = end;
+				while (e > i && is_space((u8)s[e - 1]))
+					e--;
+				bool stmt = line_start && e > i && s[e - 1] == ':' && nx < end && s[nx] != '=' && s[nx] != '.' && s[nx] != '(';
+				emit(o, a, len, stmt ? TK_CONTROL : TK_TEXT);
+			} else if (kc == PYK_CTRL) {
+				emit(o, a, len, TK_CONTROL);
+			} else if (kc == PYK_STORAGE || kc == PYK_LOGIC) {
+				emit(o, a, len, TK_STORAGE);
+			} else if (kc == PYK_CONST) {
+				emit(o, a, len, TK_LANGCONST);
+			} else if (kc == PYK_FUNC) {
+				emit(o, a, len, TK_FUNCTION);
+			} else if (kc == PYK_TYPE) {
+				emit(o, a, len, TK_TYPE);
+			} else if (kc == PYK_MAGICVAR) {
+				emit(o, a, len, TK_VARIABLE);
+			} else if (len > 4 && s[a] == '_' && s[a + 1] == '_' && s[i - 1] == '_' && s[i - 2] == '_') {
+				emit(o, a, len, TK_FUNCTION); /* support.function.magic */
+			} else if (depth && nx < end && s[nx] == '=' && !(nx + 1 < end && s[nx + 1] == '=') && !(ctx & (PY_DEFP | PY_CLASSB))) {
+				emit(o, a, len, TK_VARIABLE); /* variable.parameter.function-call (f(x=1)) */
+			}
+			line_start = false;
+			continue;
+		}
+		/* punctuation and operators */
+		if (c == '(' || c == '[' || c == '{') {
+			depth++;
+			if ((ctx & (PY_DEFP | PY_CLASSB)) && depth == 1 && c == '(')
+				ctx |= PY_EXPECT;
+		} else if (c == ')' || c == ']' || c == '}') {
+			if (depth)
+				depth--;
+			if ((ctx & (PY_DEFP | PY_CLASSB)) && depth == 0)
+				ctx = 0;
+		} else if (c == ',' && depth == 1 && (ctx & (PY_DEFP | PY_CLASSB))) {
+			ctx |= PY_EXPECT;
+		} else if (c == '*' && depth == 1 && (ctx & PY_DEFP)) {
+			/* *args, **kwargs keep expecting a name */
+		} else if ((c == ':' || c == '=') && depth == 1 && (ctx & PY_DEFP)) {
+			ctx &= ~PY_EXPECT; /* annotation or default value */
+		} else if (c == '/' && depth == 1 && (ctx & PY_DEFP)) {
+		} else if (strchr("+-*/%=<>!&|^~@", c)) {
+			u32 k = i + 1;
+			while (k < end && strchr("+-*/%=<>!&|^~@", s[k]) && k - i < 3)
+				k++;
+			if (!(c == '-' && k == i + 1 && i + 1 < end && s[i + 1] == '>'))
+				emit(o, i, k - i, TK_OPERATOR);
+			i = k;
+			line_start = false;
+			continue;
+		}
+		i++;
+		line_start = false;
+	}
+	if (ctx & (PY_DEFP | PY_CLASSB))
+		*st = ctx | (VX_MIN(depth, 15u) << 10);
+	else
+		*st = 0;
+	return end;
+}
+
+static u32 lex_python(u32 state, const char *s, u32 n, SynSpans *o)
+{
+	u32 mode = state & 7u;
+	u32 flags = state & (PYF_RAW | PYF_F | PYF_BYTES | PYF_REGEX);
+	u32 ctx = state & (PY_DEFP | PY_CLASSB | PY_EXPECT | (15u << 10));
+	u32 i = 0;
+	if (mode != PYS_NONE) {
+		u8 q = (mode == PYS_TRI1 || mode == PYS_CONT1) ? '\'' : '"';
+		bool tri = mode == PYS_TRI1 || mode == PYS_TRI2;
+		bool closed;
+		i = py_string_body(s, n, 0, q, tri, flags, &closed, o);
+		if (!closed) {
+			if (!tri && !(n && s[n - 1] == '\\'))
+				return ctx; /* an unterminated single-quoted string ends at the line */
+			return state;
+		}
+	}
+	u32 st = ctx;
+	py_code(s, n, i, n, &st, o, false);
+	return st;
+}
+
+/* ================================================================== */
+/* YAML                                                                */
+/*
+ * Per VSCodium's yaml-1.2 grammar under Dark+/Light+: mapping keys are
+ * entity.name.tag (TK_TAG: #569CD6 / #800000); plain and block scalars
+ * and single-quoted strings are string.unquoted / string.quoted.single,
+ * which Light+ shows #0000FF (TK_UNQUOTED); double-quoted strings
+ * TK_STRING with escapes; true/false/null constant.language; numbers;
+ * anchors and aliases: & and * keyword.control.flow (TK_CONTROL), their
+ * names variable.other (TK_VARIABLE); tags storage.type (TK_STORAGE);
+ * block scalar headers | > keyword.control.flow, chomping storage.modifier;
+ * %directives keyword.other (TK_STORAGE); document markers and
+ * punctuation have no colour.
+ *
+ * State: bits 0-1 mode (0 normal, 1 block scalar, 2 "..." continued,
+ * 3 '...' continued), bits 2-9 the indentation the block scalar must
+ * exceed, bits 10-13 flow-collection depth. */
+
+enum { YM_NORMAL, YM_BLOCK, YM_DQ, YM_SQ };
+
+static u32 yaml_quoted(const char *s, u32 n, u32 i, u8 q, bool *closed, SynSpans *o)
+{
+	u32 cls = q == '"' ? TK_STRING : TK_UNQUOTED;
+	u32 seg = i;
+	*closed = false;
+	while (i < n) {
+		if ((u8)s[i] == q) {
+			if (q == '\'' && i + 1 < n && s[i + 1] == '\'') {
+				emit(o, seg, i - seg, cls);
+				emit(o, i, 2, TK_ESCAPE);
+				i += 2;
+				seg = i;
+				continue;
+			}
+			emit(o, seg, i + 1 - seg, cls);
+			*closed = true;
+			return i + 1;
+		}
+		if (q == '"' && s[i] == '\\' && i + 1 < n) {
+			emit(o, seg, i - seg, cls);
+			u32 k = i + 2;
+			u8 d = (u8)s[i + 1];
+			if (d == 'x')
+				k = VX_MIN(n, i + 4);
+			else if (d == 'u')
+				k = VX_MIN(n, i + 6);
+			else if (d == 'U')
+				k = VX_MIN(n, i + 10);
+			emit(o, i, k - i, TK_ESCAPE);
+			i = k;
+			seg = i;
+			continue;
+		}
+		i++;
+	}
+	emit(o, seg, n - seg, cls);
+	return n;
+}
+
+/* Classify a plain scalar s[a, b): constant, number or string. */
+static u32 yaml_plain_cls(const char *s, u32 a, u32 b)
+{
+	u32 l = b - a;
+	const char *w = s + a;
+	static const char *const consts[] = {"true", "True", "TRUE", "false", "False", "FALSE", "null", "Null", "NULL", "~"};
+	for (size_t k = 0; k < VX_COUNT(consts); k++)
+		if (word_is(w, l, consts[k]))
+			return TK_LANGCONST;
+	static const char *const special[] = {".inf", ".Inf", ".INF", "-.inf", "+.inf", "-.Inf", "+.Inf", ".nan", ".NaN", ".NAN"};
+	for (size_t k = 0; k < VX_COUNT(special); k++)
+		if (word_is(w, l, special[k]))
+			return TK_NUMBER;
+	u32 i = 0;
+	if (i < l && (w[i] == '-' || w[i] == '+'))
+		i++;
+	if (i + 1 < l && w[i] == '0' && (w[i + 1] == 'x' || w[i + 1] == 'o')) {
+		u32 k = i + 2;
+		while (k < l && is_xdigit((u8)w[k]))
+			k++;
+		return k == l && k > i + 2 ? TK_NUMBER : TK_UNQUOTED;
+	}
+	bool digits = false, ok = true;
+	for (; i < l && ok; i++) {
+		u8 c = (u8)w[i];
+		if (is_digit(c))
+			digits = true;
+		else if (c == '.' || c == '_')
+			;
+		else if ((c == 'e' || c == 'E') && digits && i + 1 < l) {
+			if (w[i + 1] == '+' || w[i + 1] == '-')
+				i++;
+		} else
+			ok = false;
+	}
+	return ok && digits ? TK_NUMBER : TK_UNQUOTED;
+}
+
+static u32 lex_yaml(u32 state, const char *s, u32 n, SynSpans *o)
+{
+	u32 mode = state & 3u;
+	u32 bind = (state >> 2) & 0xFFu;
+	u32 flow = (state >> 10) & 15u;
+	u32 indent = 0;
+	while (indent < n && s[indent] == ' ')
+		indent++;
+	u32 i = 0;
+	if (mode == YM_BLOCK) {
+		/* block scalar: blank lines and lines indented past the parent */
+		if (indent >= n || indent > bind) {
+			emit(o, indent, n - indent, TK_UNQUOTED);
+			return state;
+		}
+		mode = YM_NORMAL;
+	} else if (mode == YM_DQ || mode == YM_SQ) {
+		bool closed;
+		i = yaml_quoted(s, n, 0, mode == YM_DQ ? '"' : '\'', &closed, o);
+		if (!closed)
+			return state;
+		mode = YM_NORMAL;
+	}
+	i = VX_MAX(i, indent);
+	if (i < n && s[i] == '#' && mode == YM_NORMAL) {
+		emit(o, i, n - i, TK_COMMENT);
+		return flow << 10;
+	}
+	if (i == 0 && n >= 1 && s[0] == '%') {
+		/* %YAML 1.2 / %TAG ! tag:... */
+		u32 k = 1;
+		while (k < n && !is_space((u8)s[k]))
+			k++;
+		emit(o, 0, k, TK_STORAGE);
+		emit(o, k, n - k, TK_UNQUOTED);
+		return 0;
+	}
+	if (i == 0 && n >= 3 && (!memcmp(s, "---", 3) || !memcmp(s, "...", 3)) && (n == 3 || is_space((u8)s[3]))) {
+		i = 3; /* document markers: no colour */
+		flow = 0;
+	}
+	bool value = false; /* after "key:" or at a node position */
+	while (i < n) {
+		u8 c = (u8)s[i];
+		if (is_space(c)) {
+			i++;
+			continue;
+		}
+		if (c == '#' && (i == 0 || is_space((u8)s[i - 1]))) {
+			emit(o, i, n - i, TK_COMMENT);
+			break;
+		}
+		if ((c == '-' || c == '?' || c == ':') && (i + 1 >= n || is_space((u8)s[i + 1])) && !flow) {
+			/* sequence item, explicit key, or value separator (no colour) */
+			value = c == ':';
+			i++;
+			continue;
+		}
+		if (c == '[' || c == '{') {
+			flow++;
+			i++;
+			continue;
+		}
+		if ((c == ']' || c == '}') && flow) {
+			flow--;
+			i++;
+			continue;
+		}
+		if (c == ',' && flow) {
+			i++;
+			continue;
+		}
+		if (c == '&' || c == '*') {
+			u32 k = i + 1;
+			while (k < n && !is_space((u8)s[k]) && !strchr(",[]{}", s[k]))
+				k++;
+			emit(o, i, 1, TK_CONTROL);
+			emit(o, i + 1, k - i - 1, TK_VARIABLE);
+			i = k;
+			continue;
+		}
+		if (c == '!') {
+			u32 k = i + 1;
+			while (k < n && !is_space((u8)s[k]) && !strchr(",[]{}", s[k]))
+				k++;
+			emit(o, i, k - i, TK_STORAGE);
+			i = k;
+			continue;
+		}
+		if ((c == '|' || c == '>') && !flow) {
+			/* block scalar header: indicator, chomping +/-, indentation digit */
+			u32 k = i + 1;
+			emit(o, i, 1, TK_CONTROL);
+			while (k < n && (s[k] == '+' || s[k] == '-' || is_digit((u8)s[k]))) {
+				emit(o, k, 1, is_digit((u8)s[k]) ? TK_NUMBER : TK_STORAGE);
+				k++;
+			}
+			k = skip_ws(s, n, k);
+			if (k < n && s[k] == '#')
+				emit(o, k, n - k, TK_COMMENT);
+			return YM_BLOCK | (VX_MIN(indent, 255u) << 2);
+		}
+		if (c == '"' || c == '\'') {
+			bool closed;
+			u32 a = i;
+			emit(o, i, 1, c == '"' ? TK_STRING : TK_UNQUOTED); /* the opening quote */
+			u32 k = yaml_quoted(s, n, i + 1, c, &closed, o);
+			if (!closed)
+				return (c == '"' ? YM_DQ : YM_SQ) | (flow << 10);
+			u32 nx = skip_ws(s, n, k);
+			if (nx < n && s[nx] == ':' && (nx + 1 >= n || is_space((u8)s[nx + 1]) || flow)) {
+				/* a quoted key: re-colour as entity.name.tag */
+				if (o) {
+					while (o->count && o->start[o->count - 1] >= a)
+						o->count--;
+					/* a span merged across the key's start is cut back */
+					if (o->count && o->start[o->count - 1] + o->len[o->count - 1] > a)
+						o->len[o->count - 1] = a - o->start[o->count - 1];
+				}
+				emit(o, a, k - a, TK_TAG);
+			}
+			i = k;
+			continue;
+		}
+		/* plain scalar: up to ": ", " #", or (in flow) , ] } */
+		u32 a = i, e = i, key_end = UINT32_MAX;
+		while (e < n) {
+			u8 d = (u8)s[e];
+			if (d == ':' && (e + 1 >= n || is_space((u8)s[e + 1]) || (flow && strchr(",[]{}", s[e + 1])))) {
+				key_end = e;
+				break;
+			}
+			if (d == '#' && e > a && is_space((u8)s[e - 1]))
+				break;
+			if (flow && strchr(",[]{}", d))
+				break;
+			e++;
+		}
+		u32 te = key_end != UINT32_MAX ? key_end : e;
+		while (te > a && is_space((u8)s[te - 1]))
+			te--;
+		if (key_end != UINT32_MAX) {
+			emit(o, a, te - a, TK_TAG);
+			i = key_end + 1;
+			value = true;
+			continue;
+		}
+		emit(o, a, te - a, yaml_plain_cls(s, a, te));
+		i = e;
+		(void)value;
+	}
+	return VX_MIN(flow, 15u) << 10;
+}
+
+/* ================================================================== */
+/* CODEOWNERS                                                          */
+/*
+ * No VSCodium grammar: patterns are coloured like ignore files (globs
+ * TK_REGEX, anchoring / TK_OPERATOR, escapes), owners (@user,
+ * @org/team) TK_VARIABLE, e-mail owners TK_STRING, GitLab sections
+ * ([Section], ^[Optional][2]) TK_HEADING, comments TK_COMMENT. */
+static u32 lex_codeowners(u32 state, const char *s, u32 n, SynSpans *o)
+{
+	(void)state;
+	u32 i = skip_ws(s, n, 0);
+	if (i >= n)
+		return 0;
+	if (s[i] == '#') {
+		emit(o, i, n - i, TK_COMMENT);
+		return 0;
+	}
+	if (s[i] == '[' || (s[i] == '^' && i + 1 < n && s[i + 1] == '[')) {
+		u32 k = i;
+		if (s[k] == '^') {
+			emit(o, k, 1, TK_OPERATOR);
+			k++;
+		}
+		u32 a = k;
+		while (k < n && s[k] != ']')
+			k++;
+		if (k < n)
+			k++;
+		emit(o, a, k - a, TK_HEADING);
+		if (k < n && s[k] == '[') {
+			u32 b = k;
+			while (k < n && s[k] != ']')
+				k++;
+			if (k < n)
+				k++;
+			emit(o, b, k - b, TK_NUMBER); /* required approvals */
+		}
+		i = k;
+	} else {
+		/* the path pattern */
+		u32 e = i;
+		while (e < n && !is_space((u8)s[e])) {
+			if (s[e] == '\\' && e + 1 < n)
+				e++;
+			e++;
+		}
+		for (u32 k = i; k < e; k++) {
+			u8 c = (u8)s[k];
+			if (c == '\\' && k + 1 < e) {
+				emit(o, k, 2, TK_ESCAPE);
+				k++;
+			} else if (c == '*' || c == '?') {
+				emit(o, k, 1, TK_REGEX);
+			} else if (c == '[') {
+				u32 j = k + 1;
+				while (j < e && s[j] != ']')
+					j++;
+				if (j < e) {
+					emit(o, k, j - k + 1, TK_REGEX);
+					k = j;
+				}
+			} else if (c == '/' && (k == i || k + 1 == e)) {
+				emit(o, k, 1, TK_OPERATOR);
+			}
+		}
+		i = e;
+	}
+	/* owners */
+	while (i < n) {
+		i = skip_ws(s, n, i);
+		if (i >= n)
+			break;
+		if (s[i] == '#') {
+			emit(o, i, n - i, TK_COMMENT);
+			break;
+		}
+		u32 a = i;
+		while (i < n && !is_space((u8)s[i]))
+			i++;
+		if (s[a] == '@')
+			emit(o, a, i - a, TK_VARIABLE);
+		else if (memchr(s + a, '@', i - a))
+			emit(o, a, i - a, TK_STRING);
+	}
+	return 0;
+}
+
 static int md_fence_lang(const char *w, u32 n)
 {
 	char b[16];
@@ -4140,6 +4961,8 @@ static int md_fence_lang(const char *w, u32 n)
 	    {"gitignore", LANG_IGNORE}, {"ignore", LANG_IGNORE}, {"diff", LANG_DIFF},  {"patch", LANG_DIFF},
 	    {"gitcommit", LANG_GIT_COMMIT}, {"git-commit", LANG_GIT_COMMIT},
 	    {"gitrebase", LANG_GIT_REBASE}, {"git-rebase", LANG_GIT_REBASE},
+	    {"python", LANG_PYTHON}, {"py", LANG_PYTHON}, {"python3", LANG_PYTHON}, {"py3", LANG_PYTHON},
+	    {"yaml", LANG_YAML},    {"yml", LANG_YAML},      {"codeowners", LANG_CODEOWNERS},
 	};
 	for (size_t i = 0; i < VX_COUNT(map); i++)
 		if (!strcmp(b, map[i].name))
@@ -4530,6 +5353,9 @@ static u32 lex_any(int lang, u32 state, const char *s, u32 n, SynSpans *o)
 	case LANG_DIFF: return lex_diff(state, s, n, o);
 	case LANG_GIT_COMMIT: return lex_git_commit(state, s, n, o);
 	case LANG_GIT_REBASE: return lex_git_rebase(state, s, n, o);
+	case LANG_PYTHON: return lex_python(state, s, n, o);
+	case LANG_YAML: return lex_yaml(state, s, n, o);
+	case LANG_CODEOWNERS: return lex_codeowners(state, s, n, o);
 	default: return 0;
 	}
 }
@@ -4561,6 +5387,7 @@ static void syn_build2(void)
 	kw_list(&kw_mkfn, mk_builtins, MKF_BUILTIN);
 	kw_list(&kw_mkdir, mk_gnu_dirs, 1);
 	kw_list(&kw_bsddir, mk_bsd_dirs, 1);
+	py_build();
 }
 
 /* ================================================================== */
@@ -4593,6 +5420,9 @@ const char *syn_lang_name(int lang)
 	case LANG_DIFF: return "Diff";
 	case LANG_GIT_COMMIT: return "Git Commit Message";
 	case LANG_GIT_REBASE: return "Git Rebase Message";
+	case LANG_PYTHON: return "Python";
+	case LANG_YAML: return "YAML";
+	case LANG_CODEOWNERS: return "CODEOWNERS";
 	default: return "Plain Text";
 	}
 }
@@ -4615,6 +5445,9 @@ const char *syn_lang_lsp_id(int lang)
 	case LANG_DIFF: return "diff";
 	case LANG_GIT_COMMIT: return "git-commit";
 	case LANG_GIT_REBASE: return "git-rebase";
+	case LANG_PYTHON: return "python";
+	case LANG_YAML: return "yaml";
+	case LANG_CODEOWNERS: return "codeowners";
 	default: return NULL;
 	}
 }
@@ -4630,7 +5463,10 @@ const char *syn_line_comment(int lang)
 	case LANG_MAKE:
 	case LANG_IGNORE:
 	case LANG_GIT_COMMIT:
-	case LANG_GIT_REBASE: return "#";
+	case LANG_GIT_REBASE:
+	case LANG_PYTHON:
+	case LANG_YAML:
+	case LANG_CODEOWNERS: return "#";
 	case LANG_JSONC: return "//";
 	case LANG_ASM_INTEL:
 	case LANG_LISP: return ";";
@@ -4740,6 +5576,16 @@ static int shebang_lang(const char *h, size_t n)
 				return LANG_SH;
 		if (wl >= 4 && memcmp(w, "perl", 4) == 0 && (wl == 4 || is_digit((u8)w[4])))
 			return LANG_PERL;
+		if (wl >= 6 && memcmp(w, "python", 6) == 0) {
+			bool ok = true; /* python, python3, python3.12 */
+			for (size_t k = 6; k < wl; k++)
+				if (!is_digit((u8)w[k]) && w[k] != '.')
+					ok = false;
+			if (ok)
+				return LANG_PYTHON;
+		}
+		if (wl >= 4 && (memcmp(w, "pypy", 4) == 0))
+			return LANG_PYTHON;
 		return LANG_NONE;
 	}
 	return LANG_NONE;
@@ -4818,6 +5664,9 @@ int syn_lang_for_path(const char *path, const char *head, size_t headlen)
 	    {"tasks.json", LANG_JSONC},       {"extensions.json", LANG_JSONC},  {"devcontainer.json", LANG_JSONC},
 	    {".devcontainer.json", LANG_JSONC}, {".babelrc", LANG_JSONC},       {".eslintrc", LANG_JSONC},
 	    {".jshintrc", LANG_JSONC},        {".swcrc", LANG_JSONC},           {".jscsrc", LANG_JSONC},
+	    {"SConstruct", LANG_PYTHON},      {"SConscript", LANG_PYTHON},      {"CODEOWNERS", LANG_CODEOWNERS},
+	    {".clang-format", LANG_YAML},     {"_clang-format", LANG_YAML},     {".clang-tidy", LANG_YAML},
+	    {".clangd", LANG_YAML},
 	};
 	for (size_t i = 0; i < VX_COUNT(names); i++)
 		if (!strcmp(base, names[i].name))
@@ -4856,6 +5705,10 @@ int syn_lang_for_path(const char *path, const char *head, size_t headlen)
 		e[i] = (char)lower((u8)dot[1 + i]);
 	if (!strcmp(e, "c") || !strcmp(e, "h"))
 		return LANG_C;
+	if (!strcmp(e, "py") || !strcmp(e, "pyi") || !strcmp(e, "pyw") || !strcmp(e, "gyp") || !strcmp(e, "gypi"))
+		return LANG_PYTHON;
+	if (!strcmp(e, "yml") || !strcmp(e, "yaml"))
+		return LANG_YAML;
 	if (!strcmp(e, "cmake"))
 		return LANG_CMAKE;
 	if (!strcmp(e, "mk") || !strcmp(e, "mak") || !strcmp(e, "make"))

@@ -153,6 +153,7 @@ const Theme themes[THEME_COUNT] = {
                 [TK_DELETED] = 0xCE9178FF,
                 [TK_CHANGED] = 0x569CD6FF,
                 [TK_DIFFHDR] = 0x569CD6FF,
+                [TK_UNQUOTED] = 0xCE9178FF,
             },
         },
     [THEME_LIGHT] =
@@ -305,6 +306,7 @@ const Theme themes[THEME_COUNT] = {
                 [TK_DELETED] = 0xA31515FF,
                 [TK_CHANGED] = 0x0451A5FF,
                 [TK_DIFFHDR] = 0x000080FF,
+                [TK_UNQUOTED] = 0x0000FFFF,
             },
         },
 };

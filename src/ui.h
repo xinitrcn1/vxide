@@ -13,6 +13,7 @@
 #include "draw.h"
 #include "font.h"
 #include "menu.h"
+#include "fswatch.h"
 
 /* ---- input ------------------------------------------------------------ */
 
@@ -87,6 +88,11 @@ typedef struct {
 	i64 scroll_y;            /* pixels */
 	i32 scroll_x;
 	bool preview; /* italic tab, replaced by the next preview open */
+	/* diff editor: this view shows `doc` on the right and diff_left (a
+	 * read-only original) on the left; UINT32_MAX when not a diff */
+	u32 diff_left;
+	u8 diff_kind; /* DIFF_WORKTREE, DIFF_STAGED, DIFF_COMMIT */
+	char diff_rel[512];
 	u32 group;    /* undo group currently being extended */
 	u8 group_kind;
 	u64 group_ns;
@@ -104,6 +110,7 @@ typedef struct {
 
 /* ---- workbench ---------------------------------------------------------- */
 
+enum { DIFF_WORKTREE = 1, DIFF_STAGED, DIFF_COMMIT };
 enum { SIDE_EXPLORER, SIDE_SEARCH, SIDE_SCM, SIDE_COUNT };
 enum { PANEL_PROBLEMS, PANEL_OUTPUT, PANEL_COUNT };
 enum {
@@ -182,6 +189,17 @@ typedef struct {
 	i32 search_scroll;
 	u32 search_sel;
 	u8 *search_collapsed; /* per file in files list */
+
+	/* file-system watches (explorer folders, .git, open documents) */
+	FsWatch *fsw;
+	Pool watch_pool;
+	u32 watch_rel[1024]; /* pool offsets of watched explorer folders */
+	u32 nwatch;
+	u64 watch_sync_ns;
+	u64 git_due_ns; /* debounced status refresh request */
+	u64 git_req_ns;
+	bool search_pending; /* waiting for the file list */
+	bool quick_accept_pending; /* Enter pressed in Quick Open while scanning */
 
 	/* source control */
 	Git *git;
@@ -278,6 +296,9 @@ typedef struct {
 	u32 pick_n, pick_cap;
 	i32 refs_req, decl_req;
 
+	/* overtype (insert key) mode, VSCodium's editor.action.toggleOvertypeInsertMode */
+	bool overtype;
+
 	/* mouse cursor shape wanted by the UI */
 	int cursor;
 
@@ -315,6 +336,7 @@ u32 doc_open(const char *abs_path); /* returns doc index or UINT32_MAX */
 u32 doc_find(const char *abs_path);  /* open document for a path, or UINT32_MAX */
 u32 doc_new_untitled(void);
 void doc_release(u32 d);
+void doc_release_unref(u32 d);
 bool doc_save(u32 d);
 void doc_replace(u32 d, u32 pos, u32 del, const char *ins, u32 nins, u32 group);
 u32 doc_git_color(u32 d, char *letter, bool *has);
@@ -348,6 +370,9 @@ void ed_lex_until(u32 d, u32 line);
 int ed_gutter_w(View *v);
 void ed_insert_text(View *v, const char *s, size_t n, u8 kind);
 u32 ed_offset_at(View *v, int mx, int my, int x, int y);
+void ed_draw_line_text(u32 d, u32 l, int tx, int ly, int clip_x0, int clip_x1);
+int ed_x_of(Text *t, u32 l, u32 off);
+u32 ed_off_at_x(Text *t, u32 l, int px);
 int ed_cursor_shape(View *v, int mx, int my, int x, int y, int w, int h, int mods);
 u32 blame_key_of(u32 d);
 const char *doc_repo_rel(u32 d);
@@ -361,6 +386,15 @@ void search_draw(int x, int y, int w, int h);
 bool search_event(const Event *e, int x, int y, int w, int h);
 void search_run(void);
 void search_tick(void);
+/* bgwork.c */
+void bg_files_request(void);
+bool bg_files_poll(void);
+bool bg_files_busy(void);
+void bg_search_start(const char *query, int flags, const char *inc, const char *exc);
+bool bg_search_busy(u32 *done, u32 *total);
+bool bg_search_poll(void);
+void bg_shutdown(void);
+void git_request_refresh(u64 delay_ms);
 void search_replace(u32 file, u32 result); /* UINT32_MAX = all */
 void search_step_result(int dir);
 void ui_ensure_files(void);
@@ -394,6 +428,19 @@ void pick_accept(int kind, u32 item);
 void actions_take_locations(const LspEvent *ev);
 void cursor_history_push(View *v);
 u32 doc_new_virtual(const char *name, const char *text, size_t n, int lang);
+
+/* diffview.c */
+void diff_open_worktree(const char *repo_rel); /* index (left) vs working file (right, editable) */
+void diff_open_staged(const char *repo_rel);   /* HEAD vs index */
+void diff_open_commit(const char *hash, const char *repo_rel);
+void diff_draw(Group *g, View *v, int x, int y, int w, int h, bool focused);
+void diff_mouse(View *v, const Event *e, int x, int y, int w, int h);
+bool diff_key(View *v, const Event *e);
+bool diff_command(View *v, int cmd);
+void diff_view_closed(View *v);
+/* conflicts in normal editors */
+void conflict_draw(View *v, u32 first, u32 last, int x, int text_x, int text_w, int y0, int lh, int tx);
+u32 conflict_regions(u32 d, u32 **start, u32 **sep, u32 **end, u32 **base);
 
 /* commands */
 enum {
@@ -541,6 +588,17 @@ enum {
 	CMD_TRANSFORM_TITLE,
 	CMD_TRANSFORM_SNAKE,
 	CMD_TRANSFORM_KEBAB,
+	CMD_TOGGLE_OVERTYPE,
+	CMD_GIT_STAGE_RANGES,
+	CMD_GIT_UNSTAGE_RANGES,
+	CMD_GIT_REVERT_RANGES,
+	CMD_GIT_STAGE_CHANGE,   /* gutter: the change under ctx_off line */
+	CMD_GIT_REVERT_CHANGE,
+	CMD_GIT_MARK_RESOLVED,
+	CMD_CONFLICT_NEXT,
+	CMD_CONFLICT_PREV,
+	CMD_DIFF_NEXT_CHANGE,
+	CMD_DIFF_PREV_CHANGE,
 	CMD_COUNT
 };
 

@@ -42,7 +42,8 @@ DejaVu Sans Mono for code, with DejaVu Sans as the fallback.
   highlighted in its own language), troff/man/mdoc and Perl (POD, `s{}{}`,
   regexes, heredocs), CMake, Make (BSD and GNU; recipe lines highlighted as
   shell), JSON / JSON with Comments, ignore files (.gitignore and friends),
-  diff/patch, git commit messages and git-rebase-todo. Languages are also
+  diff/patch, git commit messages, git-rebase-todo, Python, YAML and
+  CODEOWNERS. Languages are also
   detected from shebangs and file heads. They were checked against VSCodium's own `c.tmLanguage.json`
   scopes and the Dark+/Light+ rules. When clangd is running, its semantic
   tokens are overlaid the way the clangd extension does it (readonly
@@ -74,27 +75,62 @@ DejaVu Sans Mono for code, with DejaVu Sans as the fallback.
   the project is a subfolder of the repository; files in results, Quick
   Open, tabs and the explorer carry their git colour (yellow modified,
   green untracked/added, red deleted, grey ignored).
+- **Slow disks** (written for a 5400 RPM drive): nothing on the UI thread
+  waits on the disk. Git status runs on a worker thread (with stat data
+  written back to the index, like `git status`) when something happens -
+  a save, a git operation, a change under .git, window focus - plus a 60 s
+  fallback, instead of every 3 s. The explorer reacts to kqueue / inotify
+  events on its open folders instead of rescanning every 5 s, and reads
+  entry types from readdir (no stat per file). Quick Open's file list and
+  Search run on background threads; Search reads files in inode order with
+  sequential read-ahead and reports progress. Opened files get read-ahead
+  (posix_madvise WILLNEED); clangd's background index runs at low priority.
+  Idle file-system lookups on a 3800-file repository went from about 36,400
+  to 7,900 per 12 s (the one initial status), and none after that.
 - **Git blame** on the cursor line, on by default (VSCodium's
   `git.blame.editorDecoration`): `summary, author (3 days ago)`, or
-  "Not Committed Yet" for edited lines. A worker thread runs
-  `git blame --incremental --contents <buffer snapshot>`; libgit2 is the
-  fallback without a git binary (much slower on long histories). Toggle it
+  "Not Committed Yet" for edited lines. It runs on libgit2 with its own
+  engine (`src/lgblame.c`): libgit2's git_blame_file diffs whole trees at
+  every step (12 s on a 22k-line file with 1915 commits); this one looks
+  up only the tree entries along the file's path (memoised by tree id),
+  diffs blobs on a thread pool, and stops once every line has an owner -
+  0.28 s for that file (git: 0.25 s), matching `git blame` on 64,945 lines
+  but two ambiguous diff placements. The live buffer is mapped onto the
+  HEAD blob with one diff per edit. Toggle it
   with "Git: Toggle Git Blame Editor Decoration". Hovering the blame text
   shows the commit: author, relative and absolute date, the full message,
   hash and change stats.
-- **Source Control graph** (VSCodium's scm.graph): a GRAPH section with
+- **Source Control graph** (VSCodium's scm.graph, "auto": the current
+  branch, its upstream and its base): a GRAPH section with
   square lanes and commit markers (hollow for HEAD, ringed for merges),
   branch/tag badges, a hover card per commit, click to list a commit's
   files, click a file to open its diff, double click to open the whole
   commit. Right click: checkout (detached), create branch/tag, cherry pick,
   copy id/message.
 - **Git actions** from the view's "..." menu and the palette, run
-  asynchronously with output in Output > Git: pull/push/fetch/sync
+  asynchronously on libgit2 (the git CLI only as a fallback when an https
+  remote needs a credential helper), with output in Output > Git: pull/push/fetch/sync
   (prune, rebase, force with lease), publish, checkout, create/rename/delete
   branch, merge, rebase (continue/abort), abort merge, stash (include
   untracked, apply/pop/drop latest or picked), tags, commit all/amend, undo
   last commit, unstage/discard all. Rebase/merge in progress shows in the
   view. "Git: Open Changes" shows a file's diff read-only.
+- **Diff editor** (VSCodium style, side by side): unchanged lines face each
+  other, changed lines are paired with word-level highlights, filler rows
+  pad the shorter side. Working-tree diffs keep the real file editable on
+  the right. Each change has Stage and Revert buttons (Unstage in staged
+  diffs); Git: Stage / Unstage / Revert Selected Ranges (Ctrl+K Ctrl+Alt+S,
+  Ctrl+K Ctrl+N, Ctrl+K Ctrl+R) apply every change touching the selection,
+  in normal editors as well. Clicking a quick-diff mark in the gutter offers
+  Stage Change / Revert Change / Open Changes; Alt+F5 / Shift+Alt+F5 go to
+  the next / previous difference. Source Control opens diffs on click.
+- **Merge conflicts**: the markers stay as plain, editable text (no Accept
+  buttons); current / base / incoming regions are shaded with VSCodium's
+  merge colours and labelled. Conflicted files are listed under "Merge
+  Changes"; "+" or Git: Mark as Resolved stages the file, and refuses while
+  markers remain. Merge Conflict: Next / Previous Conflict navigate.
+- **Overtype**: Insert toggles insert/overtype (block cursor, OVR in the
+  status bar); pasting overtypes too.
 - **Context menus** (right click): editor (go to definition, declaration,
   type definition, references, find all references, change all occurrences,
   cut/copy/paste, toggle comment, command palette), explorer, tabs, Source
@@ -144,6 +180,10 @@ DejaVu Sans Mono for code, with DejaVu Sans as the fallback.
 | F12, Ctrl+click, Ctrl+Alt+-, Ctrl+Shift+- | Definition, back, forward |
 | F8, Shift+F8 | Next/previous problem |
 | Ctrl+K Ctrl+T | Toggle dark/light theme (also the gear in the activity bar) |
+| Ctrl+Shift+P | Command palette (delete the `>` to search files); includes Transform to Upper/Lower/Title/Snake/Kebab Case |
+| Insert | Toggle overtype |
+| Ctrl+K Ctrl+Alt+S, Ctrl+K Ctrl+N, Ctrl+K Ctrl+R | Stage / unstage / revert selected ranges |
+| Alt+F5, Shift+Alt+F5 | Next / previous difference in a diff |
 | Explorer: arrows, Enter, Space, F2, Delete | Navigate, open, preview, rename, delete |
 
 ## Layout of the code
@@ -163,7 +203,10 @@ one quad buffer.
 | `src/regex.c` | RE2-style regex: byte program, lazy DFA, Pike VM, replacement expansion |
 | `src/blame.c` | Inline blame worker thread (git CLI, libgit2 fallback) |
 | `src/gitgraph.c`, `src/gitops.c` | Commit graph lanes, commit details; async git runner and queries |
-| `src/gitui.c` | Graph section, git actions, hover cards, diff documents |
+| `src/gitui.c` | Graph section, git actions, hover cards |
+| `src/lgblame.c` | Blame on libgit2 primitives |
+| `src/githunk.c`, `src/diffview.c` | Hunks, word diffs, range staging, conflicts; the diff editor |
+| `src/fswatch.c`, `src/bgwork.c` | kqueue/inotify watches; background file scan and search |
 | `src/menu.c`, `src/actions.c` | Context menus, picker, references, multi-cursor and path actions |
 | `src/lsp.c`, `src/json.c` | LSP client over pipes (non-blocking), jsmn-style token table |
 | `src/git.c` | libgit2: status table, index ops, commit, quick diff |

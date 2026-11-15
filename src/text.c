@@ -135,6 +135,10 @@ static int load(Text *t, const char *path)
 		nf = m;
 		nlen = (size_t)st.st_size;
 		nmapped = true;
+		/* start reading the whole file now, asynchronously: on a slow disk
+		 * one sequential read beats a page fault per 4 KiB while scrolling */
+		if (nlen <= (256u << 20))
+			posix_madvise(m, nlen, POSIX_MADV_WILLNEED);
 	} else if (!S_ISREG(st.st_mode)) {
 		close(fd);
 		fd = -1;

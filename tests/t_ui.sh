@@ -22,6 +22,9 @@ VXIDE_NO_LSP=1 ./build/vxide --headless 1000x700 --script tests/multicursor.vx "
 # command palette case transforms
 printf 'hello w\303\266rld\nfooBar parseHTTPResponse\n' > "$tmp/src/t.c"
 VXIDE_NO_LSP=1 ./build/vxide --headless 1000x700 --script tests/transform.vx "$tmp"
+# overtype mode
+printf 'abcdef\nxy\n' > "$tmp/src/o.c"
+VXIDE_NO_LSP=1 ./build/vxide --headless 1000x700 --script tests/overtype.vx "$tmp"
 # git actions in a scratch repository
 repo="$tmp/repo"
 mkdir -p "$repo"
@@ -30,4 +33,23 @@ mkdir -p "$repo"
 VXIDE_NO_LSP=1 ./build/vxide --headless 1000x700 --script tests/gitactions.vx "$repo"
 (cd "$repo" && git branch | grep -q topic && git tag | grep -q '^v1$' && test -z "$(git stash list)" &&
 	git status --short | grep -q '^ M f.txt' && git status --short | grep -q '^?? u.txt')
+# diff editor + range staging
+d="$tmp/diffrepo"
+mkdir -p "$d"
+(cd "$d" && git init -q -b main && git config user.name T && git config user.email t@t &&
+	printf 'int a = 1;\nint b = 2;\nint c = 3;\nint d = 4;\nint e = 5;\nint f = 6;\nint g = 7;\n' > m.c &&
+	git add m.c && git commit -qm base &&
+	printf 'int a = 10;\nint b = 2;\nint c = 3;\nint d = 4;\nint new_line;\nint e = 5;\nint f = 6;\nint g = 70;\n' > m.c)
+VXIDE_NO_LSP=1 ./build/vxide --headless 1000x700 --script tests/diffstage.vx "$d"
+(cd "$d" && test "$(git diff --cached | grep -c '^[-+]int')" = 2 && git diff --cached | grep -q '^+int g = 70;' &&
+	git diff | grep -q '^+int a = 10;')
+# merge conflict: markers edited by hand, then marked resolved
+c="$tmp/conflictrepo"
+mkdir -p "$c"
+(cd "$c" && git init -q -b main && git config user.name T && git config user.email t@t &&
+	printf 'one\ntwo\nthree\n' > f.c && git add f.c && git commit -qm base && git checkout -qb topic &&
+	printf 'one\nTOPIC\nthree\n' > f.c && git commit -qam topic && git checkout -q main &&
+	printf 'one\nMAIN\nthree\n' > f.c && git commit -qam main && ! git merge topic >/dev/null 2>&1)
+VXIDE_NO_LSP=1 ./build/vxide --headless 1000x700 --script tests/conflict.vx "$c"
+(cd "$c" && test -z "$(git diff --name-only --diff-filter=U)" && ! grep -q '<<<<<<<' f.c)
 echo "ui test ok"

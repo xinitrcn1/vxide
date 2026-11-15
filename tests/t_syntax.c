@@ -53,7 +53,7 @@ static const char *const names[] = {
 	"TEXT", "COMMENT", "STRING", "ESCAPE", "NUMBER", "STORAGE", "CONTROL", "TYPE",
 	"FUNCTION", "VARIABLE", "CONSTANT", "LANGCONST", "PREPROC", "OPERATOR", "LABEL", "INVALID",
 	"HEADING", "BOLD", "ITALIC", "STRIKE", "RAW", "LINK", "LIST", "QUOTE", "TAG", "TAGPUNCT", "ATTR", "REGEX",
-	"PROPERTY", "INSERTED", "DELETED", "CHANGED", "DIFFHDR",
+	"PROPERTY", "INSERTED", "DELETED", "CHANGED", "DIFFHDR", "UNQUOTED",
 };
 _Static_assert(sizeof names / sizeof names[0] == TK_COUNT, "names[] matches TK_*");
 
@@ -756,7 +756,7 @@ static void test_detect2(void)
 	CHECK(syn_lang_for_path("tools/run", bang_bash, strlen(bang_bash)) == LANG_SH);
 	CHECK(syn_lang_for_path("x", bang_env, strlen(bang_env)) == LANG_PERL);
 	CHECK(syn_lang_for_path("script", bang_perl, strlen(bang_perl)) == LANG_PERL);
-	CHECK(syn_lang_for_path("script", bang_py, strlen(bang_py)) == LANG_NONE);
+	CHECK(syn_lang_for_path("script", bang_py, strlen(bang_py)) == LANG_PYTHON);
 	CHECK(syn_lang_for_path("configure", NULL, 0) == LANG_NONE);
 	CHECK(syn_lang_for_path("a.sh", NULL, 0) == LANG_SH);
 	CHECK(syn_lang_for_path("a.bash", NULL, 0) == LANG_SH);
@@ -1027,6 +1027,14 @@ static void test_ignore(void)
 
 static void test_diff(void)
 {
+	/* git format-patch mail headers */
+	lex(LANG_DIFF, 0, "From 5368c1466f621135a67f99055b5861a54b4e02a3 Mon Sep 17 00:00:00 2001");
+	T("From", TK_DIFFHDR);
+	T("5368c1466f621135a67f99055b5861a54b4e02a3", TK_NUMBER);
+	lex(LANG_DIFF, 0, "Subject: [PATCH] fix");
+	T("Subject:", TK_DIFFHDR);
+	lex(LANG_DIFF, 0, "From: Bob <b@x>");
+	T("From:", TK_DIFFHDR);
 	lex(LANG_DIFF, 0, "diff --git a/x.c b/x.c");
 	T("diff --git a/x.c b/x.c", TK_DIFFHDR);
 	lex(LANG_DIFF, 0, "--- a/x.c");
@@ -1202,6 +1210,201 @@ static void bench(void)
 	fprintf(stderr, "bench: C lexer %.1f MB/s (%zu bytes, %.3f s)\n", (double)bytes / sec / 1e6, bytes, sec);
 }
 
+static void test_python(void)
+{
+	u32 s;
+	lex(LANG_PYTHON, 0, "def area(self, w: int, h=2, *args, **kw) -> float:");
+	T("def", TK_STORAGE);
+	T("area", TK_FUNCTION);
+	T("self", TK_VARIABLE);
+	T("w", TK_VARIABLE);
+	T("int", TK_TYPE);
+	T("h", TK_VARIABLE);
+	T("2", TK_NUMBER);
+	T("args", TK_VARIABLE);
+	T("kw", TK_VARIABLE);
+	T("float", TK_TYPE);
+	lex(LANG_PYTHON, 0, "    return self.w * len(xs) if x is not None else 0x1F");
+	T("return", TK_CONTROL);
+	T("self", TK_LANGCONST);
+	T("len", TK_FUNCTION);
+	T("if", TK_CONTROL);
+	T("is", TK_STORAGE);
+	T("not", TK_STORAGE);
+	T("None", TK_LANGCONST);
+	T("0x1F", TK_NUMBER);
+	lex(LANG_PYTHON, 0, "class Shape(Base, metaclass=Meta):  # base");
+	T("class", TK_STORAGE);
+	T("Shape", TK_TYPE);
+	T("Base", TK_TYPE);
+	T("# base", TK_COMMENT);
+	lex(LANG_PYTHON, 0, "@functools.lru_cache(maxsize=None)");
+	T("@functools.lru_cache", TK_FUNCTION);
+	T("maxsize", TK_VARIABLE);
+	lex(LANG_PYTHON, 0, "from os import path as p");
+	T("from", TK_CONTROL);
+	T("import", TK_CONTROL);
+	T("as", TK_CONTROL);
+	lex(LANG_PYTHON, 0, "x = f\"v={x!r:>{w}} {{lit}}\" + 'a\\n' + rb'\\d+' + R'\\d' + 1_000.5e3j");
+	T("f", TK_STORAGE);
+	T("v=", TK_STRING);
+	TN("{", 0, TK_STORAGE);
+	TN("x", 1, TK_TEXT);
+	T("!r:>", TK_STORAGE);
+	T("{{", TK_ESCAPE);
+	T("\\n", TK_ESCAPE);
+	T("rb", TK_STORAGE);
+	T("+'", TK_REGEX);
+	T("R", TK_STORAGE);
+	T("1_000.5e3", TK_NUMBER);
+	T("j", TK_STORAGE);
+	lex(LANG_PYTHON, 0, "print(\"%s: {0}\" % name, end='')");
+	T("print", TK_FUNCTION);
+	T("%s", TK_STORAGE);
+	T("{0}", TK_STORAGE);
+	T("end", TK_VARIABLE);
+	/* triple-quoted docstring across lines */
+	s = lex(LANG_PYTHON, 0, "    \"\"\"Docstring");
+	T("Docstring", TK_STRING);
+	CHECK(s != 0);
+	s = lex(LANG_PYTHON, s, "still \\t inside");
+	T("still", TK_STRING);
+	T("\\t", TK_ESCAPE);
+	s = lex(LANG_PYTHON, s, "end\"\"\" + raise_it");
+	T("end\"\"\"", TK_STRING);
+	T("raise_it", TK_TEXT);
+	CHECK(s == 0);
+	/* def parameters across lines */
+	s = lex(LANG_PYTHON, 0, "def g(a,");
+	s = lex(LANG_PYTHON, s, "      b=1):");
+	T("b", TK_VARIABLE);
+	s = lex(LANG_PYTHON, s, "    pass");
+	T("pass", TK_CONTROL);
+	CHECK(s == 0);
+	lex(LANG_PYTHON, 0, "async def run(): await x; raise ValueError(__name__) from __init__");
+	TN("async", 0, TK_STORAGE);
+	T("await", TK_CONTROL);
+	T("ValueError", TK_TYPE);
+	T("__name__", TK_VARIABLE);
+	T("__init__", TK_FUNCTION);
+	lex(LANG_PYTHON, 0, "match cmd:");
+	T("match", TK_CONTROL);
+	lex(LANG_PYTHON, 0, "match = re.match(p, s)");
+	TN("match", 0, TK_TEXT);
+	lex(LANG_PYTHON, 0, "lambda: True and False or ...");
+	T("lambda", TK_STORAGE);
+	T("True", TK_LANGCONST);
+	T("and", TK_STORAGE);
+}
+
+static void test_yaml(void)
+{
+	u32 s;
+	lex(LANG_YAML, 0, "name: build # ci");
+	T("name", TK_TAG);
+	T("build", TK_UNQUOTED);
+	T("# ci", TK_COMMENT);
+	lex(LANG_YAML, 0, "  - key: \"a\\tb\"");
+	T("key", TK_TAG);
+	T("\\t", TK_ESCAPE);
+	T("\"a", TK_STRING);
+	lex(LANG_YAML, 0, "on: [push, 'pull request']");
+	T("on", TK_TAG);
+	T("push", TK_UNQUOTED);
+	T("'pull request'", TK_UNQUOTED);
+	lex(LANG_YAML, 0, "base: &defaults {retries: 3, ok: true, none: ~, v: 1.5e3}");
+	T("&", TK_CONTROL);
+	T("defaults", TK_VARIABLE);
+	T("retries", TK_TAG);
+	T("3", TK_NUMBER);
+	T("true", TK_LANGCONST);
+	T("~", TK_LANGCONST);
+	T("1.5e3", TK_NUMBER);
+	lex(LANG_YAML, 0, "job: *defaults");
+	T("*", TK_CONTROL);
+	T("defaults", TK_VARIABLE);
+	lex(LANG_YAML, 0, "when: !!str 2024-01-01");
+	T("!!str", TK_STORAGE);
+	T("2024-01-01", TK_UNQUOTED);
+	lex(LANG_YAML, 0, "\"quoted key\": x");
+	T("\"quoted key\"", TK_TAG);
+	lex(LANG_YAML, 0, "%YAML 1.2");
+	T("%YAML", TK_STORAGE);
+	lex(LANG_YAML, 0, "--- # doc");
+	T("# doc", TK_COMMENT);
+	T("---", TK_TEXT);
+	/* block scalar continues while indented, ends on dedent */
+	s = lex(LANG_YAML, 0, "  run: |-");
+	T("|", TK_CONTROL);
+	T("-", TK_STORAGE);
+	CHECK((s & 3) == 1);
+	s = lex(LANG_YAML, s, "    make: all # not a key");
+	T("make: all # not a key", TK_UNQUOTED);
+	s = lex(LANG_YAML, s, "");
+	s = lex(LANG_YAML, s, "      deeper");
+	T("deeper", TK_UNQUOTED);
+	s = lex(LANG_YAML, s, "  next: 1");
+	T("next", TK_TAG);
+	CHECK((s & 3) == 0);
+	/* multi-line quoted string */
+	s = lex(LANG_YAML, 0, "msg: \"two");
+	s = lex(LANG_YAML, s, "  lines\" # c");
+	T("lines\"", TK_STRING);
+	T("# c", TK_COMMENT);
+	CHECK(s == 0);
+}
+
+static void test_codeowners(void)
+{
+	lex(LANG_CODEOWNERS, 0, "# owners");
+	T("# owners", TK_COMMENT);
+	lex(LANG_CODEOWNERS, 0, "/src/**/*.c  @alice @org/core-team dev@example.com # c");
+	TN("/", 0, TK_OPERATOR);
+	TN("*", 0, TK_REGEX);
+	T("@alice", TK_VARIABLE);
+	T("@org/core-team", TK_VARIABLE);
+	T("dev@example.com", TK_STRING);
+	T("# c", TK_COMMENT);
+	lex(LANG_CODEOWNERS, 0, "^[Docs][2] @writers");
+	T("^", TK_OPERATOR);
+	T("[Docs]", TK_HEADING);
+	T("[2]", TK_NUMBER);
+	T("@writers", TK_VARIABLE);
+	lex(LANG_CODEOWNERS, 0, "docs/ @a");
+	TN("/", 0, TK_OPERATOR);
+}
+
+static void test_detect4(void)
+{
+	CHECK(syn_lang_for_path("a/b.py", NULL, 0) == LANG_PYTHON);
+	CHECK(syn_lang_for_path("stubs.pyi", NULL, 0) == LANG_PYTHON);
+	CHECK(syn_lang_for_path("/x/SConstruct", NULL, 0) == LANG_PYTHON);
+	const char *py = "#!/usr/bin/env python3\nprint(1)\n";
+	CHECK(syn_lang_for_path("tool", py, strlen(py)) == LANG_PYTHON);
+	const char *py2 = "#!/usr/local/bin/python3.12 -u\n";
+	CHECK(syn_lang_for_path("bin/run", py2, strlen(py2)) == LANG_PYTHON);
+	CHECK(syn_lang_for_path("ci.yml", NULL, 0) == LANG_YAML);
+	CHECK(syn_lang_for_path("/r/.github/workflows/build.yaml", NULL, 0) == LANG_YAML);
+	CHECK(syn_lang_for_path("/r/.clang-format", NULL, 0) == LANG_YAML);
+	CHECK(syn_lang_for_path("/r/.clangd", NULL, 0) == LANG_YAML);
+	CHECK(syn_lang_for_path("/r/.github/CODEOWNERS", NULL, 0) == LANG_CODEOWNERS);
+	CHECK(syn_lang_for_path("CODEOWNERS", NULL, 0) == LANG_CODEOWNERS);
+	CHECK(!strcmp(syn_lang_name(LANG_PYTHON), "Python"));
+	CHECK(!strcmp(syn_line_comment(LANG_YAML), "#"));
+	CHECK(!strcmp(syn_lang_lsp_id(LANG_PYTHON), "python"));
+	/* fenced code in Markdown */
+	u32 s = lex(LANG_MARKDOWN, 0, "```python");
+	s = lex(LANG_MARKDOWN, s, "def f(): pass");
+	T("def", TK_STORAGE);
+	TN("f", 1, TK_FUNCTION);
+	s = lex(LANG_MARKDOWN, s, "```");
+	s = lex(LANG_MARKDOWN, s, "```yaml");
+	s = lex(LANG_MARKDOWN, s, "k: v");
+	T("k", TK_TAG);
+	(void)s;
+	CHECK(LANG_COUNT <= 32);
+}
+
 int main(void)
 {
 	test_c();
@@ -1220,6 +1423,10 @@ int main(void)
 	test_diff();
 	test_git_msgs();
 	test_detect3();
+	test_python();
+	test_yaml();
+	test_codeowners();
+	test_detect4();
 	bench();
 	bench_more();
 	bench3();

@@ -41,6 +41,8 @@ enum {
 	TK_DELETED,   /* markup.deleted                        #CE9178 / #A31515     */
 	TK_CHANGED,   /* markup.changed                        #569CD6 / #0451A5     */
 	TK_DIFFHDR,   /* meta.diff.header                      #569CD6 / #000080     */
+	TK_UNQUOTED,  /* string.unquoted.plain/block, string.quoted.single (YAML)
+	                                                       #CE9178 / #0000FF     */
 	TK_COUNT
 };
 
@@ -62,6 +64,9 @@ enum {
 	LANG_GIT_COMMIT, /* COMMIT_EDITMSG, MERGE_MSG, TAG_EDITMSG       */
 	LANG_GIT_REBASE, /* git-rebase-todo                              */
 	LANG_JSONC,     /* JSON with Comments (.jsonc, settings.json)    */
+	LANG_PYTHON,    /* Python 3 (.py .pyi, shebangs)                 */
+	LANG_YAML,      /* YAML 1.2 (.yml .yaml, .clang-format)          */
+	LANG_CODEOWNERS, /* CODEOWNERS (GitHub / GitLab)                 */
 	LANG_COUNT /* Markdown keeps a fence language in 5 bits: <= 32  */
 };
 

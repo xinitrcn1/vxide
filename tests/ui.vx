@@ -38,6 +38,8 @@ key Escape
 expect line 6
 key ctrl+p
 type b.c
+# the file list is scanned on a background thread
+wait 300
 key Return
 expect file b.c
 key ctrl+Tab

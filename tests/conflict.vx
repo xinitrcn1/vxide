@@ -1,0 +1,14 @@
+# Conflict markers stay editable; mark as resolved refuses until they are gone
+open f.c
+key ctrl+shift+p
+type git: mark as resolved
+key Return
+wait 100
+expect text <<<<<<< HEAD
+key ctrl+Home Down ctrl+shift+k Down ctrl+shift+k Down ctrl+shift+k ctrl+Home Down Down ctrl+shift+k
+expect text one\nMAIN\nthree
+key ctrl+s
+key ctrl+shift+p
+type git: mark as resolved
+key Return
+wait 300

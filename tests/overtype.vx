@@ -1,0 +1,12 @@
+# Insert key toggles overtype (VSCodium editor.action.toggleOvertypeInsertMode)
+open src/o.c
+key Insert
+type ZZ
+expect text ZZcdef\nxy\n
+key Home
+key Down
+type 1234
+expect text ZZcdef\n1234\n
+key Insert
+type q
+expect text 1234q

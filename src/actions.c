@@ -206,7 +206,10 @@ void ctx_menu_scm_file(int x, int y, const char *repo_rel, bool staged)
 	menu_item("Open Changes", CMD_SCM_OPEN_CHANGES, true);
 	menu_item("Open File", CMD_SCM_OPEN_FILE, true);
 	menu_sep();
-	if (staged) {
+	bool conflict = app.git && (git_path_flags(app.git, repo_rel) & GS_CONFLICT);
+	if (conflict) {
+		menu_item("Mark as Resolved", CMD_GIT_MARK_RESOLVED, true);
+	} else if (staged) {
 		menu_item("Unstage Changes", CMD_SCM_UNSTAGE, true);
 	} else {
 		menu_item("Stage Changes", CMD_SCM_STAGE, true);

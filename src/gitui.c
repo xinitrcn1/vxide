@@ -266,19 +266,6 @@ static void show_text_doc(const char *name, char *text)
 	show_doc_public(d);
 }
 
-static void open_changes(const char *rel, bool staged)
-{
-	char *t = git_diff_text(app.git, rel, staged);
-	char name[600];
-	const char *base = strrchr(rel, '/');
-	snprintf(name, sizeof name, "%s (%s)", base ? base + 1 : rel, staged ? "Index" : "Working Tree");
-	if (!t || !*t) {
-		free(t);
-		ui_status("No changes in %s", rel);
-		return;
-	}
-	show_text_doc(name, t);
-}
 
 static void open_commit(const char *hash)
 {
@@ -306,13 +293,19 @@ bool gitui_command(int cmd)
 	switch (cmd) {
 	case CMD_SCM_OPEN_CHANGES:
 		if (app.git && app.ctx == CTX_SCM_FILE) {
-			open_changes(app.ctx_path, app.ctx_a);
+			if (app.ctx_a)
+				diff_open_staged(app.ctx_path);
+			else
+				diff_open_worktree(app.ctx_path);
 		} else if (app.git) {
-			/* palette: changes of the active file */
+			/* palette / gutter: changes of the active file */
 			View *v = active_view();
-			const char *rel = v ? doc_repo_rel(v->doc) : NULL;
-			if (rel)
-				open_changes(rel, false);
+			const char *rel = v ? (v->diff_left != UINT32_MAX ? v->diff_rel : doc_repo_rel(v->doc)) : NULL;
+			if (rel) {
+				char r2[1024];
+				snprintf(r2, sizeof r2, "%s", rel);
+				diff_open_worktree(r2);
+			}
 		}
 		app.ctx = CTX_NONE;
 		return true;
@@ -954,11 +947,7 @@ bool gitui_graph_event(const Event *e, int x, int y, int w, int h)
 	if (it & 0x80000000u) {
 		u32 f = it & 0x7FFFFFFFu;
 		const char *p = exp_ci.pool.b + exp_ci.path[f];
-		char *d = git_show_file_diff(git_workdir(app.git), graph.hash[expanded], p);
-		char name[600];
-		const char *sl = strrchr(p, '/');
-		snprintf(name, sizeof name, "%s (%.8s)", sl ? sl + 1 : p, graph.hash[expanded]);
-		show_text_doc(name, d);
+		diff_open_commit(graph.hash[expanded], p); /* side by side, like VSCodium */
 		return true;
 	}
 	if (e->clicks >= 2) {
