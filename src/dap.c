@@ -73,6 +73,8 @@ struct Dap {
 	int exit_code;
 	u32 stops;
 	u32 stops_at_run; /* stops seen when we last resumed */
+	bool main_once;   /* a breakpoint on main until the first stop */
+	u32 main_stop;    /* the stop it caused */
 	bool changed;
 	Pool pp; /* persistent strings */
 	Pool sp; /* this stop's strings */
@@ -345,8 +347,11 @@ Dap *dap_start(const DapLaunch *l, char *err, size_t errcap)
 	}
 	jb_raw(&a, "],\"cwd\":");
 	jb_str(&a, l->cwd ? l->cwd : ".");
+	/* "stop at main": gdb has a launch option; lldb's stopOnEntry stops in
+	 * the dynamic loader instead, so it gets a one-shot breakpoint on main */
 	jb_raw(&a, d->gdb ? ",\"stopAtBeginningOfMainSubprogram\":" : ",\"stopOnEntry\":");
-	jb_raw(&a, l->stop_on_entry ? "true" : "false");
+	jb_raw(&a, l->stop_on_entry && d->gdb ? "true" : "false");
+	d->main_once = l->stop_on_entry && !d->gdb;
 	jb_raw(&a, "}");
 	snprintf(d->launch_json, sizeof d->launch_json, "%.*s", (int)a.n, a.b);
 	jb_free(&a);
@@ -547,6 +552,11 @@ static void on_stopped(Dap *d, u32 body)
 	clear_stop(d, true);
 	d->state = DS_STOPPED;
 	d->stops++;
+	if (d->main_once) { /* one-shot: main is reached (or something stopped first) */
+		d->main_once = false;
+		d->main_stop = d->stops;
+		simple(d, "setFunctionBreakpoints", "{\"breakpoints\":[]}", RQ_QUIET, 0);
+	}
 	char b[512];
 	u32 r = json_get(j, body, "reason"), t = json_get(j, body, "description");
 	if (t == JSON_NIL)
@@ -578,6 +588,8 @@ static void on_event(Dap *d, u32 root)
 	u32 ev = json_get(j, root, "event"), body = json_get(j, root, "body");
 	if (json_eq(j, ev, "initialized")) {
 		send_bps(d);
+		if (d->main_once)
+			simple(d, "setFunctionBreakpoints", "{\"breakpoints\":[{\"name\":\"main\"}]}", RQ_QUIET, 0);
 		simple(d, "setExceptionBreakpoints", "{\"filters\":[]}", RQ_EXC, 0);
 		simple(d, "configurationDone", "{}", RQ_CONFDONE, 0);
 		d->configured = true;
@@ -854,6 +866,8 @@ static void on_response(Dap *d, u32 root)
 				ip[json_unescape(j->src + j->start[it], j->end[it] - j->start[it], ip)] = 0;
 			d->fr_ip[k] = strtoull(ip, NULL, 16);
 		}
+		if (d->main_stop && d->main_stop == d->stops && d->nfr && !strcmp(sstr(d, d->fr_name[0]), "main"))
+			snprintf(d->stoptext, sizeof d->stoptext, "the start of main");
 		/* the first frame with real source is the interesting one (lldb names
 		 * disassembly "libsys.so.7`_umtx_op_err": not a file) */
 		d->cur_frame = 0;
