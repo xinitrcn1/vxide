@@ -537,6 +537,10 @@ bool ed_command(View *v, int cmd);
  * has the focus, and the query's matches in v->doc (sorted offsets). */
 void ed_find_widget(View *v, int x, int y, int w);
 u32 ed_find_matches(View *v, const u32 **a, const u32 **b);
+/* binview.c: find in hex (bytes or text) and disassembly (row text);
+ * dir 0 = the query changed, 1 / -1 = next / previous */
+void binview_find(View *v, int dir);
+void binview_tick(void);
 
 
 /* panes.c */

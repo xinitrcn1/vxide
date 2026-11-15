@@ -330,7 +330,7 @@ static u32 group_for(View *v, u8 kind)
 
 static bool readonly_doc(View *v)
 {
-	if (!app.docs.readonly[v->doc])
+	if (!app.docs.readonly[v->doc] && !app.docs.bin[v->doc])
 		return false;
 	ui_status("Cannot edit in read-only editor");
 	return true;
@@ -1599,7 +1599,7 @@ bool ed_command(View *v, int cmd)
 	case CMD_REPLACE: {
 		app.find_open = true;
 		/* read-only tabs (manual pages, diffs' originals, reports) only find */
-		app.find_replace = cmd == CMD_REPLACE && !app.docs.readonly[v->doc];
+		app.find_replace = cmd == CMD_REPLACE && !app.docs.readonly[v->doc] && !app.docs.bin[v->doc];
 		app.find_flags &= ~0x100;
 		app.focus = FOCUS_FIND;
 		/* seed from the selection or the word at the cursor */
@@ -1838,6 +1838,10 @@ static void select_match(View *v, u32 k)
 
 void ed_find_update(View *v)
 {
+	if (app.docs.bin[v->doc] && v->diff_left == UINT32_MAX) {
+		binview_find(v, 0); /* hex bytes / disassembly text */
+		return;
+	}
 	app.find_index = 0;
 	find_matches(v);
 	if (!app.fm_n)
@@ -1850,6 +1854,10 @@ void ed_find_update(View *v)
 
 void ed_find_next(View *v, bool back)
 {
+	if (app.docs.bin[v->doc] && v->diff_left == UINT32_MAX) {
+		binview_find(v, back ? -1 : 1);
+		return;
+	}
 	find_matches(v);
 	if (!app.fm_n) {
 		app.find_index = 0;
@@ -2188,8 +2196,8 @@ static int drag_grab;
 
 void ed_mouse(View *v, const Event *e, int x, int y, int w, int h)
 {
-	/* the find widget sits over diffs too */
-	if (v->diff_left != UINT32_MAX && e->type == EV_MDOWN && e->button == 1 &&
+	/* the find widget sits over diffs and binary views too */
+	if ((v->diff_left != UINT32_MAX || app.docs.bin[v->doc]) && e->type == EV_MDOWN && e->button == 1 &&
 	    find_widget_click(v, e))
 		return;
 	if (v->diff_left != UINT32_MAX) {
@@ -2631,7 +2639,7 @@ static bool find_widget_click(View *v, const Event *e)
 	int mx = e->x, my = e->y - fw_y;
 	bool row2 = my >= fw_row1;
 	if (mx < ix) {
-		app.find_replace = !app.find_replace && !app.docs.readonly[v->doc];
+		app.find_replace = !app.find_replace && !app.docs.readonly[v->doc] && !app.docs.bin[v->doc];
 		return true;
 	}
 	if (!row2) {

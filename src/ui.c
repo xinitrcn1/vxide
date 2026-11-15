@@ -4287,6 +4287,7 @@ void ui_tick(void)
 		/* a background disassembly finished: show it */
 		static bool bin_was_busy;
 		profview_tick();
+		binview_tick(); /* a disassembly search in progress */
 		bool busy = binview_busy();
 		if (bin_was_busy && !busy)
 			app.dirty = true;

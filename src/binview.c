@@ -8,6 +8,7 @@
 #include "ui.h"
 #include "binfile.h"
 #include "syntax.h"
+#include "search.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -48,6 +49,14 @@ struct BinDoc {
 };
 
 static BinDoc bdoc[MAX_DOCS];
+static u32 bdoc_index(const BinDoc *b) { return (u32)(b - bdoc); }
+
+/* find (below) */
+static bool hex_found(u32 doc, u32 part, u64 o);
+static bool row_found(u32 doc, u32 part, u32 r);
+static void bf_forget_view(View *v);
+static void bf_forget_doc(u32 d);
+static bool find_busy(void);
 
 static const u8 *doc_bytes(u32 d, size_t *n)
 {
@@ -157,6 +166,7 @@ static BinView *bv_get(View *v, BinDoc *b)
 
 void binview_closed(View *v)
 {
+	bf_forget_view(v);
 	for (int i = 0; i < 32; i++)
 		if (bview[i].v == v) {
 			free(bview[i].cur);
@@ -170,6 +180,7 @@ void binview_doc_released(u32 d)
 {
 	if (app.docs.prof[d])
 		profview_doc_released(d);
+	bf_forget_doc(d);
 	bd_free(&bdoc[d]);
 }
 
@@ -330,7 +341,7 @@ static DisJob *dis_for(BinDoc *b, u32 part)
 
 bool binview_busy(void)
 {
-	if (profview_busy())
+	if (profview_busy() || find_busy())
 		return true;
 	for (u32 d = 0; d < MAX_DOCS; d++)
 		if (bdoc[d].used)
@@ -431,6 +442,8 @@ static void draw_inspector(BinDoc *b, BinView *s, u32 part, int x, int y, int w,
 	}
 }
 
+static int last_vis = 20; /* rows the last binary view showed (find centres its result) */
+
 static void draw_hex(BinDoc *b, BinView *s, u32 part, int x, int y, int w, int h, bool focused)
 {
 	HexGeo g = hex_geo(b, x, w);
@@ -439,6 +452,7 @@ static void draw_hex(BinDoc *b, BinView *s, u32 part, int x, int y, int w, int h
 	u64 base = lo & ~(u64)(BYTES_PER_ROW - 1);
 	u64 nrows = (hi - base + BYTES_PER_ROW - 1) / BYTES_PER_ROW;
 	int vis = (h - g.head_h) / g.row_h;
+	last_vis = vis;
 	/* keep the cursor visible */
 	i64 crow = (i64)((s->cur[part] - base) / BYTES_PER_ROW);
 	if (crow < s->scroll[part])
@@ -476,6 +490,10 @@ static void draw_hex(BinDoc *b, BinView *s, u32 part, int x, int y, int w, int h
 			if (t >= 0) {
 				draw_rect(hx - g.cw / 2, ry, 3 * g.cw, g.row_h, tag_cols[b->t_col[t] % 5]);
 				draw_rect(ax, ry, g.cw, g.row_h, tag_cols[b->t_col[t] % 5]);
+			}
+			if (!in_sel && hex_found(bdoc_index(b), part, o)) {
+				draw_rect(hx - g.cw / 2, ry, 3 * g.cw, g.row_h, COL(C_FIND_MATCH_OTHER));
+				draw_rect(ax, ry, g.cw, g.row_h, COL(C_FIND_MATCH_OTHER));
 			}
 			if (in_sel) {
 				draw_rect(hx - g.cw / 2, ry, 3 * g.cw, g.row_h, COL(C_SELECTION));
@@ -536,6 +554,7 @@ static void draw_disasm(BinDoc *b, BinView *s, u32 part, int x, int y, int w, in
 	}
 	int lh = app.line_h, cw = app.char_w;
 	int vis = h / lh;
+	last_vis = vis;
 	i64 cur = (i64)VX_MIN(s->cur[part], (u64)d->n - 1);
 	s->cur[part] = (u64)cur;
 	if (cur < s->scroll[part])
@@ -556,6 +575,8 @@ static void draw_disasm(BinDoc *b, BinView *s, u32 part, int x, int y, int w, in
 		int ry = y + r * lh;
 		if (row >= sa && row <= se)
 			draw_rect(x, ry, w, lh, row == (u64)cur ? COL(C_LIST_ACTIVE_BG) : COL(C_SELECTION));
+		else if (row_found(bdoc_index(b), part, (u32)row))
+			draw_rect(x, ry, w, lh, COL(C_FIND_MATCH_OTHER));
 		/* decoded for the rows on screen only (the table keeps 5 bytes a row) */
 		char tbuf[256];
 		u64 target;
@@ -631,6 +652,8 @@ void binview_draw(View *v, int x, int y, int w, int h, bool focused)
 		draw_disasm(b, s, v->part, x, y, w, h);
 	else
 		draw_hex(b, s, v->part, x, y, w, h, focused);
+	/* the find widget over the main column (left of the inspector) */
+	ed_find_widget(v, x, y, part_is_code(b, v->part) ? w : hex_geo(b, x, w).main_w);
 }
 
 /* ---- input --------------------------------------------------------------------------- */
@@ -836,6 +859,381 @@ void binview_mouse(View *v, const Event *e, int x, int y, int w, int h)
 	}
 }
 
+/* ---- find: hex bytes or text in hex parts, row text in disassembly ------------------- */
+
+/* One search at a time (the find widget is global). Hex parts are scanned
+ * at once (memchr fast); disassembly rows are decoded on demand, so they
+ * are scanned in time-boxed steps from binview_tick and the count grows. */
+static struct {
+	bool used;
+	u32 doc, part, key;
+	bool text;  /* hex parts: the query as text; else as bytes */
+	bool disasm;
+	u8 pat[256];
+	u32 plen;
+	u64 *off; /* hex matches, sorted (each plen bytes) */
+	u32 n, cap;
+	Matcher m; /* text: regex / literal for disassembly rows and regex in hex */
+	bool m_ok;
+	u32 *rows, nrows, rcap; /* disassembly matches */
+	u32 scan;
+	bool done;
+	int want;  /* pending move: 1 first at/after `from`, 2 next after, -2 previous before */
+	u64 from;
+	View *v;
+	bool said_text;
+} bf;
+
+static void bf_reset(void)
+{
+	free(bf.off);
+	free(bf.rows);
+	if (bf.m_ok)
+		matcher_free(&bf.m);
+	memset(&bf, 0, sizeof bf);
+}
+
+/* "7f 45 4c 46", "7F454C46", "0x7f 0x45": hex bytes; false for anything else */
+static bool parse_hex(const char *q, u32 n, u8 *out, u32 *len)
+{
+	u32 k = 0, digits = 0;
+	int hi = -1;
+	for (u32 i = 0; i < n; i++) {
+		char c = q[i];
+		if (c == ' ' || c == ',' || c == '\t') {
+			if (hi >= 0)
+				return false; /* an odd digit inside a token */
+			continue;
+		}
+		if (c == '0' && i + 1 < n && (q[i + 1] == 'x' || q[i + 1] == 'X') && hi < 0) {
+			i++;
+			continue;
+		}
+		int v = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+		if (v < 0)
+			return false;
+		digits++;
+		if (hi < 0)
+			hi = v;
+		else {
+			if (k == 256)
+				return false;
+			out[k++] = (u8)(hi << 4 | v);
+			hi = -1;
+		}
+	}
+	*len = k;
+	return hi < 0 && digits > 0;
+}
+
+static u8 lower(u8 c) { return c >= 'A' && c <= 'Z' ? (u8)(c + 32) : c; }
+static bool wordb(u8 c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; }
+
+static void hex_scan(BinDoc *b, u32 part, int flags)
+{
+	u64 lo, hi;
+	part_range(b, part, &lo, &hi);
+	bf.n = 0;
+	const u8 *d = b->data;
+	if (bf.text && (flags & SEARCH_REGEX)) {
+		if (!bf.m_ok || hi - lo > 0xFFFFFFFFull)
+			return;
+		u32 pos = 0, a, e;
+		u32 n = (u32)(hi - lo);
+		while (bf.n < 100000 && pos < n && matcher_next(&bf.m, (const char *)d + lo, n, pos, &a, &e)) {
+			VX_GROW(bf.off, bf.cap, bf.n + 1);
+			bf.off[bf.n++] = lo + a;
+			pos = e > a ? e : a + 1;
+		}
+		bf.plen = 1; /* regex matches vary; the selection shows each one's start */
+		return;
+	}
+	u32 m = bf.plen;
+	if (!m || hi - lo < m)
+		return;
+	bool icase = bf.text && !(flags & SEARCH_CASE);
+	bool word = bf.text && (flags & SEARCH_WORD);
+	u8 f0 = bf.pat[0], f1 = icase ? (u8)(f0 >= 'a' && f0 <= 'z' ? f0 - 32 : f0) : f0;
+	for (u64 o = lo; o + m <= hi && bf.n < 100000;) {
+		/* jump to the next possible first byte */
+		const u8 *p = memchr(d + o, f0, (size_t)(hi - m + 1 - o));
+		if (icase && f1 != f0) {
+			const u8 *q = memchr(d + o, f1, (size_t)(hi - m + 1 - o));
+			if (!p || (q && q < p))
+				p = q;
+		}
+		if (!p)
+			break;
+		o = (u64)(p - d);
+		bool eq = true;
+		for (u32 i = 1; i < m && eq; i++)
+			eq = icase ? lower(d[o + i]) == bf.pat[i] : d[o + i] == bf.pat[i];
+		if (eq && word && ((o > lo && wordb(d[o - 1])) || (o + m < hi && wordb(d[o + m]))))
+			eq = false;
+		if (eq) {
+			VX_GROW(bf.off, bf.cap, bf.n + 1);
+			bf.off[bf.n++] = o;
+			o += m;
+		} else
+			o++;
+	}
+}
+
+/* first index with off >= x */
+static u32 off_lb(u64 x)
+{
+	u32 lo = 0, hi = bf.n;
+	while (lo < hi) {
+		u32 mid = (lo + hi) / 2;
+		if (bf.off[mid] < x)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
+static u32 row_lb(u32 x)
+{
+	u32 lo = 0, hi = bf.nrows;
+	while (lo < hi) {
+		u32 mid = (lo + hi) / 2;
+		if (bf.rows[mid] < x)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
+/* is byte o inside a match (hex highlight) */
+static bool hex_found(u32 doc, u32 part, u64 o)
+{
+	if (!app.find_open || !bf.used || bf.disasm || bf.doc != doc || bf.part != part || !bf.n)
+		return false;
+	u32 k = off_lb(o + 1);
+	return k > 0 && o < bf.off[k - 1] + bf.plen;
+}
+
+static bool row_found(u32 doc, u32 part, u32 r)
+{
+	if (!app.find_open || !bf.used || !bf.disasm || bf.doc != doc || bf.part != part || !bf.nrows)
+		return false;
+	u32 k = row_lb(r);
+	return k < bf.nrows && bf.rows[k] == r;
+}
+
+static void dis_step(BinDoc *b, u64 budget_ns)
+{
+	DisJob *j = dis_for(b, bf.part);
+	if (atomic_load(&j->state) != 2 || bf.done)
+		return;
+	BinDisasm *d = &j->dis;
+	u64 t0 = vx_now_ns();
+	char buf[256];
+	while (bf.scan < d->n) {
+		u32 r = bf.scan++;
+		bin_row_text(&b->img, d, b->data, b->n, r, buf, sizeof buf, NULL);
+		u32 a, e;
+		if (bf.m_ok && matcher_next(&bf.m, buf, (u32)strlen(buf), 0, &a, &e)) {
+			VX_GROW(bf.rows, bf.rcap, bf.nrows + 1);
+			bf.rows[bf.nrows++] = r;
+		}
+		if ((bf.scan & 255) == 0 && vx_now_ns() - t0 > budget_ns)
+			break;
+	}
+	if (bf.scan >= d->n)
+		bf.done = true;
+}
+
+/* Move to the pending target when it is known. */
+static void dis_resolve(BinView *s)
+{
+	if (!bf.want)
+		return;
+	u32 p = bf.part;
+	i64 pick = -1;
+	if (bf.want == 1 || bf.want == 2) {
+		u32 from = (u32)bf.from + (bf.want == 2 ? 1 : 0);
+		u32 k = row_lb(from);
+		if (k < bf.nrows)
+			pick = k;
+		else if (bf.done)
+			pick = bf.nrows ? 0 : -1; /* wrap */
+		else
+			return;
+	} else {
+		u32 k = row_lb((u32)bf.from);
+		if (k > 0 && (bf.scan > bf.from || bf.done))
+			pick = k - 1;
+		else if (bf.done)
+			pick = bf.nrows ? (i64)bf.nrows - 1 : -1;
+		else
+			return;
+	}
+	bf.want = 0;
+	if (pick >= 0) {
+		s->cur[p] = s->anchor[p] = bf.rows[pick];
+		if ((i64)s->cur[p] < s->scroll[p] + 2 || (i64)s->cur[p] >= s->scroll[p] + last_vis - 1)
+			s->scroll[p] = (i64)s->cur[p] - last_vis / 3; /* with context, below the widget */
+		app.find_index = (u32)pick + 1;
+	} else
+		app.find_index = 0;
+	app.dirty = true;
+}
+
+void binview_find(View *v, int dir)
+{
+	if (PROF_VIEW(v))
+		return;
+	BinDoc *b = bd_get(v->doc);
+	BinView *s = bv_get(v, b);
+	u32 p = v->part;
+	bool dis = part_is_code(b, p);
+	int flags = app.find_flags & (SEARCH_CASE | SEARCH_WORD | SEARCH_REGEX);
+	const char *q = app.find_in.b ? app.find_in.b : "";
+	u32 qn = app.find_in.n;
+	/* the key: query, flags, view, part, and for hex which column has the focus */
+	u32 key = 2166136261u ^ (u32)flags ^ (s->ascii ? 0x9E3779B9u : 0) ^ (u32)dis << 30;
+	for (u32 i = 0; i < qn; i++)
+		key = (key ^ (u8)q[i]) * 16777619u;
+	if (!bf.used || bf.doc != v->doc || bf.part != p || bf.key != key || bf.v != v) {
+		bf_reset();
+		bf.used = true;
+		bf.doc = v->doc;
+		bf.part = p;
+		bf.key = key;
+		bf.v = v;
+		bf.disasm = dis;
+		if (!qn) {
+			bf.done = true; /* nothing to look for */
+			app.find_count = app.find_index = 0;
+			return;
+		}
+		if (dis) {
+			bf.m_ok = matcher_init(&bf.m, q, qn, flags);
+		} else {
+			bool hexq = !s->ascii && !(flags & SEARCH_REGEX) && parse_hex(q, qn, bf.pat, &bf.plen);
+			bf.text = !hexq;
+			if (bf.text) {
+				bf.plen = VX_MIN(qn, 256u);
+				for (u32 i = 0; i < bf.plen; i++)
+					bf.pat[i] = (flags & SEARCH_CASE) ? (u8)q[i] : lower((u8)q[i]);
+				if (flags & SEARCH_REGEX)
+					bf.m_ok = matcher_init(&bf.m, q, qn, flags);
+			}
+			hex_scan(b, p, flags);
+			ui_status(bf.text ? "Find: text%s" : "Find: bytes%s",
+			          bf.text && !s->ascii ? " (not hex digits; click the text column to always search text)" : "");
+		}
+	}
+	if (!qn)
+		return;
+	if (dis) {
+		u64 cur = VX_MIN(s->cur[p], s->anchor[p]);
+		bf.want = dir == 0 ? 1 : dir > 0 ? 2 : -2;
+		bf.from = cur;
+		dis_step(b, 20000000ull);
+		app.find_count = bf.nrows;
+		dis_resolve(s);
+		app.dirty = true;
+		return;
+	}
+	app.find_count = bf.n;
+	if (!bf.n) {
+		app.find_index = 0;
+		return;
+	}
+	u64 at = VX_MIN(s->cur[p], s->anchor[p]);
+	u32 k;
+	if (dir == 0)
+		k = off_lb(at);
+	else if (dir > 0)
+		k = off_lb(at + 1);
+	else {
+		k = off_lb(at);
+		k = k == 0 ? bf.n - 1 : k - 1;
+	}
+	if (k >= bf.n)
+		k = 0; /* wrap */
+	s->anchor[p] = bf.off[k];
+	s->cur[p] = VX_MIN(bf.off[k] + bf.plen - 1, (u64)b->n - 1);
+	{
+		u64 lo, hi;
+		part_range(b, p, &lo, &hi);
+		i64 row = (i64)((bf.off[k] - (lo & ~(u64)(BYTES_PER_ROW - 1))) / BYTES_PER_ROW);
+		if (row < s->scroll[p] + 2 || row >= s->scroll[p] + last_vis - 1)
+			s->scroll[p] = row - last_vis / 3;
+	}
+	app.find_index = k + 1;
+	app.dirty = true;
+}
+
+void binview_tick(void)
+{
+	if (!bf.used || !bf.disasm || bf.done || !bf.m_ok || !app.find_open || !bf.v)
+		return;
+	if (bf.doc >= MAX_DOCS || !bdoc[bf.doc].used || !app.docs.bin[bf.doc]) {
+		bf_reset();
+		return;
+	}
+	BinDoc *b = &bdoc[bf.doc];
+	dis_step(b, 25000000ull);
+	app.find_count = bf.nrows;
+	dis_resolve(bv_get(bf.v, b));
+	DisJob *j = dis_for(b, bf.part);
+	if (!bf.done && atomic_load(&j->state) == 2 && j->dis.n)
+		ui_status("Searching the disassembly... %u%%", (unsigned)((u64)bf.scan * 100 / j->dis.n));
+	else if (bf.done)
+		ui_status("%u matching rows", bf.nrows);
+	app.dirty = true;
+}
+
+static void bf_forget_doc(u32 d)
+{
+	if (bf.used && bf.doc == d)
+		bf_reset();
+}
+
+static void bf_forget_view(View *v)
+{
+	if (bf.used && bf.v == v)
+		bf_reset();
+}
+
+static bool find_busy(void) { return bf.used && bf.disasm && !bf.done && bf.m_ok && app.find_open && bf.v; }
+
+/* Ctrl+F: the find widget, seeded from the selected bytes */
+static void find_open(View *v, BinDoc *b, BinView *s)
+{
+	u32 p = v->part;
+	app.find_open = true;
+	app.find_replace = false;
+	app.find_flags &= ~0x100;
+	app.focus = FOCUS_FIND;
+	if (!part_is_code(b, p) && s->cur[p] != s->anchor[p]) {
+		u64 a = VX_MIN(s->cur[p], s->anchor[p]), e = VX_MAX(s->cur[p], s->anchor[p]);
+		if (e - a < 64) {
+			char q[256];
+			u32 k = 0;
+			bool printable = true;
+			for (u64 o = a; o <= e; o++)
+				printable &= b->data[o] >= 0x20 && b->data[o] < 0x7F;
+			if (s->ascii && printable)
+				for (u64 o = a; o <= e; o++)
+					q[k++] = (char)b->data[o];
+			else
+				for (u64 o = a; o <= e; o++)
+					k += (u32)snprintf(q + k, sizeof q - k, o < e ? "%02X " : "%02X", b->data[o]);
+			input_set(&app.find_in, q, k);
+		}
+	}
+	app.find_in.anchor = 0;
+	app.find_in.cur = app.find_in.n;
+	bf.used = false; /* search again from here */
+	binview_find(v, 0);
+}
+
 /* ---- commands: tags, go to offset, copy ------------------------------------------------ */
 
 enum { PR_HEX_TAG = 200, PR_HEX_GOTO };
@@ -911,6 +1309,15 @@ bool binview_command(int cmd)
 		return false;
 	u32 p = v->part;
 	switch (cmd) {
+	case CMD_FIND:
+	case CMD_REPLACE:
+		find_open(v, b, s);
+		return true;
+	case CMD_FIND_NEXT:
+	case CMD_FIND_PREV:
+		if (app.find_in.n)
+			binview_find(v, cmd == CMD_FIND_NEXT ? 1 : -1);
+		return true;
 	case CMD_HEX_ADD_TAG:
 		if (part_is_code(b, p)) {
 			ui_status("Tags are for the hex view");
