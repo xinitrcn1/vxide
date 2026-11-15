@@ -363,7 +363,7 @@ static int run_script(const char *path)
 		} else if (!strcmp(s, "theme")) {
 			app.theme = !strcmp(arg, "light") ? THEME_LIGHT : THEME_DARK;
 		} else if (!strcmp(s, "expect")) {
-			/* expect text|line|file|find|problems for scripted checks */
+			/* expect text|line|file|find|part|problems for scripted checks */
 			View *v = active_view();
 			if (!strncmp(arg, "text ", 5) && v) {
 				const char *want = arg + 5;
@@ -379,6 +379,13 @@ static int run_script(const char *path)
 				u32 got = text_line_of(&app.docs.text[v->doc], v->head[0]) + 1;
 				if (got != want) {
 					fprintf(stderr, "vxide: expect line %u, got %u\n", want, got);
+					rc = 1;
+				}
+			} else if (!strncmp(arg, "part ", 5) && v) {
+				/* the subtab shown: Markdown 0 Edit / 1 Preview, profile and binary parts */
+				u32 want = (u32)atoi(arg + 5);
+				if (v->part != want) {
+					fprintf(stderr, "vxide: expect part %u, got %u\n", want, v->part);
 					rc = 1;
 				}
 			} else if (!strncmp(arg, "find ", 5)) {

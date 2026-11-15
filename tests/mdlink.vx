@@ -1,0 +1,13 @@
+# Markdown links from the preview (run by tests/t_ui.sh): Markdown opens
+# in its preview, other files in their usual view.
+open README.md
+key ctrl+shift+v
+wait 50
+click 246 210
+expect file other.md
+expect part 1
+key ctrl+Tab
+expect file README.md
+click 330 210
+expect file a.c
+expect part 0

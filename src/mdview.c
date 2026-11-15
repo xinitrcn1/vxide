@@ -1361,10 +1361,25 @@ static void open_link(View *v, const char *url)
 	} else
 		snprintf(path, sizeof path, "%s/%s", app.root ? app.root : ".", rel);
 	struct stat st;
-	if (stat(path, &st) == 0 && S_ISREG(st.st_mode))
-		open_file(path, false, UINT32_MAX, 0);
-	else
+	if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
 		ui_status("Not found: %s", rel);
+		return;
+	}
+	open_file(path, false, UINT32_MAX, 0);
+	/* a Markdown file opened from the preview shows its preview too (at the
+	 * #fragment's heading); other files open as they always do */
+	View *nv = active_view();
+	mdview_sync(nv);
+	if (!nv || !md_doc(nv) || nv == v)
+		return;
+	nv->part = 1;
+	*scroll_of(nv) = 0;
+	if (hash && hash[1]) {
+		Layout *L = layout_for(nv->doc, last_w);
+		for (u32 i = 0; i < L->nh; i++)
+			if (!strcmp(L->pool.b + L->h_slug[i], hash + 1))
+				*scroll_of(nv) = L->h_y[i] - PX(8);
+	}
 }
 
 bool mdview_key(View *v, const Event *e)

@@ -87,4 +87,11 @@ printf '%s\n' '- [ ]' '[a](' '![b](' '**x' '`y' '~~z' '<a' '&' '|a|' '|-|' '    
 printf '```\nunclosed fence\n' >> "$m/odd.md"
 VXIDE_NO_LSP=1 "$vx" --headless 1000x700 --script tests/md.vx "$m"
 grep -q '^- new item$' "$m/README.md" && ! grep -q ignored "$m/README.md"
+# links in the preview: Markdown opens previewed, other files as usual
+l="$tmp/mdlink"
+mkdir -p "$l"
+printf '# Main\n\nSee [the other doc](other.md#second) and [code](a.c).\n' > "$l/README.md"
+printf '# Other\n\ntext\n\n## Second\n\nbody\n' > "$l/other.md"
+printf 'int x;\n' > "$l/a.c"
+VXIDE_NO_LSP=1 "$vx" --headless 1000x600 --script tests/mdlink.vx "$l"
 echo "ui test ok"
