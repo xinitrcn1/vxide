@@ -93,17 +93,20 @@ static u32 line_starts(const char *s, size_t n, u32 **out)
 
 /* ---- diff --------------------------------------------------------------------------- */
 
+#define HUNK_COLS(h)                                                                                     \
+	SOA((h)->old_start), SOA((h)->old_lines), SOA((h)->new_start), SOA((h)->new_lines), SOA((h)->chg_first), \
+	    SOA((h)->chg_count)
+#define CHG_COLS(h) SOA((h)->c_old_off), SOA((h)->c_old_len), SOA((h)->c_new_off), SOA((h)->c_new_len)
+#define CONFLICT_COLS(c) SOA((c)->path), SOA((c)->sides)
+#define MARKER_COLS(m)                                                                                        \
+	SOA((m)->start), SOA((m)->base), SOA((m)->sep), SOA((m)->end), SOA((m)->ours_label), SOA((m)->base_label), \
+	    SOA((m)->theirs_label)
+
 static void hunk_add(GitHunks *h, u32 os, u32 ol, u32 ns, u32 nl)
 {
 	if (h->n == h->cap) {
-		u32 c = h->cap ? h->cap * 2 : 16;
-		h->old_start = vx_realloc(h->old_start, c * sizeof(u32));
-		h->old_lines = vx_realloc(h->old_lines, c * sizeof(u32));
-		h->new_start = vx_realloc(h->new_start, c * sizeof(u32));
-		h->new_lines = vx_realloc(h->new_lines, c * sizeof(u32));
-		h->chg_first = vx_realloc(h->chg_first, c * sizeof(u32));
-		h->chg_count = vx_realloc(h->chg_count, c * sizeof(u32));
-		h->cap = c;
+		SoaCol c[] = {HUNK_COLS(h)};
+		soa_grow(c, 6, &h->cap, h->n + 1, h->n);
 	}
 	u32 i = h->n++;
 	h->old_start[i] = os;
@@ -117,12 +120,8 @@ static void hunk_add(GitHunks *h, u32 os, u32 ol, u32 ns, u32 nl)
 static void chg_add(GitHunks *h, u32 oo, u32 ol, u32 no, u32 nl)
 {
 	if (h->nc == h->ccap) {
-		u32 c = h->ccap ? h->ccap * 2 : 32;
-		h->c_old_off = vx_realloc(h->c_old_off, c * sizeof(u32));
-		h->c_old_len = vx_realloc(h->c_old_len, c * sizeof(u32));
-		h->c_new_off = vx_realloc(h->c_new_off, c * sizeof(u32));
-		h->c_new_len = vx_realloc(h->c_new_len, c * sizeof(u32));
-		h->ccap = c;
+		SoaCol c[] = {CHG_COLS(h)};
+		soa_grow(c, 4, &h->ccap, VX_MAX(h->nc + 1, 32u), h->nc);
 	}
 	u32 i = h->nc++;
 	h->c_old_off[i] = oo;
@@ -283,16 +282,9 @@ int githunk_diff(const char *old, size_t no, const char *new_, size_t nn, GitHun
 
 void githunk_free(GitHunks *h)
 {
-	free(h->old_start);
-	free(h->old_lines);
-	free(h->new_start);
-	free(h->new_lines);
-	free(h->chg_first);
-	free(h->chg_count);
-	free(h->c_old_off);
-	free(h->c_old_len);
-	free(h->c_new_off);
-	free(h->c_new_len);
+	SoaCol hc[] = {HUNK_COLS(h)}, cc[] = {CHG_COLS(h)};
+	soa_free(hc, 6);
+	soa_free(cc, 4);
 	memset(h, 0, sizeof *h);
 }
 
@@ -614,10 +606,8 @@ int githunk_conflicts(const char *workdir, GitConflicts *c)
 		while (git_index_conflict_next(&a, &o, &t, it) == 0) {
 			const char *p = o ? o->path : t ? t->path : a->path;
 			if (c->n == c->cap) {
-				u32 cp = c->cap ? c->cap * 2 : 16;
-				c->path = vx_realloc(c->path, cp * sizeof(u32));
-				c->sides = vx_realloc(c->sides, cp);
-				c->cap = cp;
+				SoaCol cc[] = {CONFLICT_COLS(c)};
+				soa_grow(cc, 2, &c->cap, c->n + 1, c->n);
 			}
 			u32 i = c->n++;
 			c->path[i] = pool_add(&c->pool, p, (u32)strlen(p));
@@ -632,8 +622,8 @@ int githunk_conflicts(const char *workdir, GitConflicts *c)
 
 void githunk_conflicts_free(GitConflicts *c)
 {
-	free(c->path);
-	free(c->sides);
+	SoaCol cc[] = {CONFLICT_COLS(c)};
+	soa_free(cc, 2);
 	pool_free(&c->pool);
 	memset(c, 0, sizeof *c);
 }
@@ -735,15 +725,8 @@ static void mk_add(GitMarkers *m, u32 st, u32 base, u32 sep, u32 end, const char
                    size_t bln, const char *tl, size_t tln)
 {
 	if (m->n == m->cap) {
-		u32 c = m->cap ? m->cap * 2 : 8;
-		m->start = vx_realloc(m->start, c * sizeof(u32));
-		m->base = vx_realloc(m->base, c * sizeof(u32));
-		m->sep = vx_realloc(m->sep, c * sizeof(u32));
-		m->end = vx_realloc(m->end, c * sizeof(u32));
-		m->ours_label = vx_realloc(m->ours_label, c * sizeof(u32));
-		m->base_label = vx_realloc(m->base_label, c * sizeof(u32));
-		m->theirs_label = vx_realloc(m->theirs_label, c * sizeof(u32));
-		m->cap = c;
+		SoaCol c[] = {MARKER_COLS(m)};
+		soa_grow(c, 7, &m->cap, m->n + 1, m->n);
 	}
 	u32 i = m->n++;
 	m->start[i] = st;
@@ -802,13 +785,8 @@ u32 githunk_find_markers(const char *text, size_t n, GitMarkers *m)
 
 void githunk_markers_free(GitMarkers *m)
 {
-	free(m->start);
-	free(m->base);
-	free(m->sep);
-	free(m->end);
-	free(m->ours_label);
-	free(m->base_label);
-	free(m->theirs_label);
+	SoaCol c[] = {MARKER_COLS(m)};
+	soa_free(c, 7);
 	pool_free(&m->pool);
 	memset(m, 0, sizeof *m);
 }

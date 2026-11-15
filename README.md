@@ -241,9 +241,14 @@ DejaVu Sans Mono for code, with DejaVu Sans as the fallback.
 
 ## Layout of the code
 
-Data-oriented: state lives in flat arrays (struct-of-arrays tables indexed
-by ids) with string pools, and per-frame work is a linear pass that fills
-one quad buffer.
+Data-oriented: state lives in tables named by `u32` indices, each table
+one coalesced struct-of-arrays block (`soa_grow`), strings in pools, and
+nothing kept that already exists (unmodified files are their mapping, the
+glyph atlas and the quads live in GPU-mapped memory). Per-frame work is a
+linear pass that writes quads straight into the frame's GPU buffer. The
+rules and measurements (a typical session holds ~1.7 MB of vxide's own
+heap) are in [docs/memory.md](docs/memory.md); `-DVXIDE_HEAPTRACE=ON` and
+the script command `heap` measure it.
 
 | File | Role |
 |---|---|

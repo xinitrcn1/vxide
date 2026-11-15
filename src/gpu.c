@@ -334,7 +334,7 @@ static void make_pipeline(void)
 	vi.vertexAttributeDescriptionCount = 3;
 	vi.pVertexAttributeDescriptions = va;
 	VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-	ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+	ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; /* 4 vertices a quad (each instance its own strip) */
 	VkPipelineViewportStateCreateInfo vps = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
 	vps.viewportCount = 1;
 	vps.scissorCount = 1;
@@ -817,7 +817,7 @@ bool gpu_frame(const Quad *q, u32 n, u32 clear)
 		vkCmdPushConstants(c, G.pl, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
 		VkDeviceSize off = 0;
 		vkCmdBindVertexBuffers(c, 0, 1, &f->inst, &off);
-		vkCmdDraw(c, 6, n, 0, 0);
+		vkCmdDraw(c, 4, n, 0, 0); /* corners from gl_VertexIndex, quads from the instance buffer */
 	}
 	vkCmdEndRenderPass(c);
 	if (G.headless) {

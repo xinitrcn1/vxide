@@ -23,11 +23,8 @@ static bool search_excluded(const char *name)
 static void fl_add(FileList *fl, const char *rel, u32 n, u64 ino)
 {
 	if (fl->n == fl->cap) {
-		u32 c = fl->cap ? fl->cap * 2 : 1024;
-		fl->path = vx_realloc(fl->path, c * sizeof(u32));
-		fl->base = vx_realloc(fl->base, c * sizeof(u32));
-		fl->ino = vx_realloc(fl->ino, c * sizeof(u64));
-		fl->cap = c;
+		SoaCol c[] = {FL_COLS(fl)};
+		soa_grow(c, 3, &fl->cap, VX_MAX(fl->n + 1, 1024u), fl->n);
 	}
 	fl->ino[fl->n] = ino;
 	const char *slash = strrchr(rel, '/');
@@ -91,13 +88,14 @@ void files_scan(FileList *fl, const char *root, SkipFn skip, void *ctx, u32 limi
 	pool_clear(&fl->pool);
 	char rel[4096] = "";
 	walk(fl, root, rel, 0, skip, ctx, limit, 0);
+	SoaCol c[] = {FL_COLS(fl)};
+	soa_fit(c, 3, &fl->cap, fl->n); /* read-only until the next scan */
 }
 
 void files_free(FileList *fl)
 {
-	free(fl->path);
-	free(fl->base);
-	free(fl->ino);
+	SoaCol c[] = {FL_COLS(fl)};
+	soa_free(c, 3);
 	pool_free(&fl->pool);
 	memset(fl, 0, sizeof *fl);
 }

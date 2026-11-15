@@ -564,6 +564,8 @@ void pick_accept(int kind, u32 item);
 void actions_take_locations(const LspEvent *ev);
 void cursor_history_push(View *v);
 u32 doc_new_virtual(const char *name, const char *text, size_t n, int lang);
+/* Same, taking buf (malloc'd, NUL after n bytes) as the text: no copy. */
+u32 doc_new_virtual_owned(const char *name, char *buf, u32 n, int lang);
 
 /* diffview.c */
 void diff_open_worktree(const char *repo_rel); /* index (left) vs working file (right, editable) */

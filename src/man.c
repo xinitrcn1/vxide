@@ -141,6 +141,7 @@ typedef struct {
 	u32 *line, *col, *len;
 	u8 *cls;
 } Page;
+#define SPAN_COLS(p) SOA((p)->line), SOA((p)->col), SOA((p)->len), SOA((p)->cls)
 
 static void put(Page *p, const char *s, u32 n)
 {
@@ -159,11 +160,8 @@ static void span(Page *p, u32 line, u32 col, u32 len, u8 cls)
 		return;
 	}
 	if (p->sn == p->scap) {
-		p->scap = p->scap ? p->scap * 2 : 1024;
-		p->line = vx_realloc(p->line, p->scap * sizeof(u32));
-		p->col = vx_realloc(p->col, p->scap * sizeof(u32));
-		p->len = vx_realloc(p->len, p->scap * sizeof(u32));
-		p->cls = vx_realloc(p->cls, p->scap);
+		SoaCol c[] = {SPAN_COLS(p)};
+		soa_grow(c, 4, &p->scap, VX_MAX(p->sn + 1, 1024u), p->sn);
 	}
 	p->line[p->sn] = line;
 	p->col[p->sn] = col;
@@ -336,30 +334,45 @@ static bool render_page(const char *name, const char *sec, bool prefer_c, int wi
 static void page_free(Page *p)
 {
 	free(p->t);
-	free(p->line);
-	free(p->col);
-	free(p->len);
-	free(p->cls);
+	SoaCol c[] = {SPAN_COLS(p)};
+	soa_free(c, 4);
 	memset(p, 0, sizeof *p);
 }
 
 /* A read-only document holding the page text with its style spans. */
+/* The page's text and spans become the document's: both blocks change
+ * owner (trimmed to size first), nothing is copied. A 2.7 MB Index used to
+ * be held three times (page buffer, insert buffer, flat copy). */
 static u32 page_to_doc(Page *p, const char *title)
 {
-	u32 d = doc_new_virtual(title, p->t ? p->t : "", p->n, LANG_NONE);
+	char *buf = vx_realloc(p->t, (size_t)p->n + 1);
+	buf[p->n] = 0;
+	u32 d = doc_new_virtual_owned(title, buf, p->n, LANG_NONE);
+	p->t = NULL;
+	p->n = p->cap = 0;
 	if (d == UINT32_MAX)
 		return d;
 	Docs *D = &app.docs;
 	D->man[d] = 1;
-	SoaCol sc[] = {SEM_COLS(D, d)};
-	soa_grow(sc, 4, &D->scap[d], p->sn + 1, 0);
+	/* SPAN_COLS and SEM_COLS have the same columns in the same order, so
+	 * the block can be handed over as it is */
+	SoaCol pc[] = {SPAN_COLS(p)}, dc[] = {SEM_COLS(D, d)};
+	soa_free(dc, 4);
 	if (p->sn) {
-		memcpy(D->s_line[d], p->line, p->sn * sizeof(u32));
-		memcpy(D->s_col[d], p->col, p->sn * sizeof(u32));
-		memcpy(D->s_len[d], p->len, p->sn * sizeof(u32));
-		memcpy(D->s_cls[d], p->cls, p->sn);
+		soa_fit(pc, 4, &p->scap, p->sn);
+		D->s_line[d] = p->line;
+		D->s_col[d] = p->col;
+		D->s_len[d] = p->len;
+		D->s_cls[d] = p->cls;
+		D->scap[d] = p->scap;
+		p->line = p->col = p->len = NULL;
+		p->cls = NULL;
+		p->scap = 0;
+	} else {
+		D->scap[d] = 0;
 	}
 	D->sn[d] = p->sn;
+	p->sn = 0;
 	return d;
 }
 

@@ -1143,6 +1143,8 @@ static u32 replace_in_file(u32 f, u32 only_line, u32 only_col)
 	u32 cnt = 0, line = 0, ls = 0, scanned = 0;
 	/* collect edits */
 	u32 *ea = NULL, *eb = NULL, *eo = NULL, *el = NULL, ecap = 0;
+#define REPL_COLS SOA(ea), SOA(eb), SOA(eo), SOA(el)
+	SoaCol ec[] = {REPL_COLS};
 	Pool reps = {0};
 	u32 pos = 0, a, b;
 	while (pos <= n && matcher_next(m, hay, (u32)n, pos, &a, &b)) {
@@ -1162,10 +1164,7 @@ static u32 replace_in_file(u32 f, u32 only_line, u32 only_col)
 		char *out = NULL;
 		u32 len = 0, cap = 0;
 		matcher_expand(m, repl, app.search_repl_in.n, hay, &out, &len, &cap);
-		VX_GROW(ea, ecap, cnt + 1);
-		eb = vx_realloc(eb, ecap * sizeof(u32));
-		eo = vx_realloc(eo, ecap * sizeof(u32));
-		el = vx_realloc(el, ecap * sizeof(u32));
+		soa_grow(ec, 4, &ecap, cnt + 1, cnt);
 		ea[cnt] = a;
 		eb[cnt] = b;
 		eo[cnt] = pool_add(&reps, out ? out : "", len);
@@ -1201,10 +1200,8 @@ static u32 replace_in_file(u32 f, u32 only_line, u32 only_col)
 		}
 		free(buf);
 	}
-	free(ea);
-	free(eb);
-	free(eo);
-	free(el);
+	soa_free(ec, 4);
+#undef REPL_COLS
 	pool_free(&reps);
 	free(own);
 	return cnt;
@@ -1881,6 +1878,7 @@ bool scm_event(const Event *e, int x, int y, int w, int h)
 
 static u32 prow_n, prow_cap;
 static u32 *prow_doc, *prow_diag; /* diag UINT32_MAX = file header */
+#define PROW_COLS SOA(prow_doc), SOA(prow_diag)
 
 static void problem_rows(void)
 {
@@ -1889,8 +1887,8 @@ static void problem_rows(void)
 	for (u32 d = 0; d < D->n; d++) {
 		if (!D->dn[d] || !D->path[d])
 			continue;
-		VX_GROW(prow_doc, prow_cap, prow_n + 1 + D->dn[d]);
-		prow_diag = vx_realloc(prow_diag, prow_cap * sizeof(u32));
+		SoaCol pc[] = {PROW_COLS};
+		soa_grow(pc, 2, &prow_cap, prow_n + 1 + D->dn[d], prow_n);
 		prow_doc[prow_n] = d;
 		prow_diag[prow_n++] = UINT32_MAX;
 		/* errors first, then by line */

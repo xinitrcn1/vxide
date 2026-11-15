@@ -124,7 +124,7 @@ static void send(const Event *e) { ui_event(e); }
 #include <malloc_np.h>
 #endif
 
-void heap_report(const char *label)
+static void heap_report(const char *label)
 {
 #if defined(__FreeBSD__)
 	u64 epoch = 1;
@@ -474,12 +474,10 @@ int main(int argc, char **argv)
 	}
 	if (!scale)
 		scale = 1;
-	if (getenv("VXIDE_HEAPPROBE")) heap_report("before-gpu");
 	if (!gpu_init(win, w, h)) {
 		fprintf(stderr, "vxide: Vulkan initialisation failed\n");
 		return 1;
 	}
-	if (getenv("VXIDE_HEAPPROBE")) heap_report("after-gpu");
 	if (!ui_init(root, w, h, scale, headless)) {
 		fprintf(stderr, "vxide: UI initialisation failed (fonts?)\n");
 		return 1;

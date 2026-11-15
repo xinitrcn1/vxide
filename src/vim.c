@@ -2027,6 +2027,8 @@ static void ex_substitute(View *v, u32 l0, u32 l1, char *s)
 	const char *F = text_flat(t);
 	u32 caps[2 * RE_MAX_CAPS], nm = 0, cap = 0, nlines = 0, last_l = NONE;
 	u32 *ma = NULL, *mb = NULL, *ro = NULL, *rl = NULL;
+#define SUBST_COLS SOA(ma), SOA(mb), SOA(ro), SOA(rl) /* one block: matches + replacements */
+	SoaCol mc[] = {SUBST_COLS};
 	Pool reps = {0};
 	for (u32 l = l0; l <= l1; l++) {
 		u32 s0 = lst(t, l), e = lend(t, l), pos = s0;
@@ -2035,13 +2037,7 @@ static void ex_substitute(View *v, u32 l0, u32 l1, char *s)
 			char *o = NULL;
 			u32 on = 0, oc = 0;
 			re_expand(re, erep, strlen(erep), F, caps, &o, &on, &oc);
-			if (nm + 1 > cap) {
-				cap = cap ? cap * 2 : 64;
-				ma = vx_realloc(ma, cap * sizeof(u32));
-				mb = vx_realloc(mb, cap * sizeof(u32));
-				ro = vx_realloc(ro, cap * sizeof(u32));
-				rl = vx_realloc(rl, cap * sizeof(u32));
-			}
+			soa_grow(mc, 4, &cap, VX_MAX(nm + 1, 64u), nm);
 			ma[nm] = caps[0];
 			mb[nm] = caps[1];
 			ro[nm] = pool_add(&reps, o ? o : "", on);
@@ -2073,10 +2069,8 @@ static void ex_substitute(View *v, u32 l0, u32 l1, char *s)
 		set_cur(v, first_nb(t, lnof(t, last_s)));
 		ui_status("%u substitution%s on %u line%s", nm, nm == 1 ? "" : "s", nlines, nlines == 1 ? "" : "s");
 	}
-	free(ma);
-	free(mb);
-	free(ro);
-	free(rl);
+	soa_free(mc, 4);
+#undef SUBST_COLS
 	pool_free(&reps);
 }
 

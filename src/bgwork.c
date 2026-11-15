@@ -101,10 +101,10 @@ static SearchJob *job;
 static FileList fl_copy(const FileList *s)
 {
 	FileList d = {0};
-	d.n = d.cap = s->n;
-	d.path = vx_alloc((s->n + 1) * sizeof(u32));
-	d.base = vx_alloc((s->n + 1) * sizeof(u32));
-	d.ino = vx_alloc((s->n + 1) * sizeof(u64));
+	d.n = s->n;
+	d.cap = VX_MAX(s->n, 1u); /* no block yet: soa_grow allocates exactly cap rows */
+	SoaCol c[] = {FL_COLS(&d)};
+	soa_grow(c, 3, &d.cap, d.cap, 0);
 	if (s->n) {
 		memcpy(d.path, s->path, s->n * sizeof(u32));
 		memcpy(d.base, s->base, s->n * sizeof(u32));

@@ -50,6 +50,9 @@ typedef struct {
 
 void text_init(Text *t);
 int text_open(Text *t, const char *path); /* 0 ok; missing file = empty, -1 on error */
+/* Take buf (malloc'd, n bytes followed by a NUL) as the text's original:
+ * no copy; the text frees it. For generated documents (man pages, Index). */
+void text_adopt(Text *t, char *buf, u32 n);
 void text_free(Text *t);
 int text_save(Text *t, const char *path); /* atomic replace + remap */
 /* Did the file on disk change since load/save? */

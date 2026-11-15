@@ -34,6 +34,7 @@ typedef struct {
 } Rows;
 
 static Rows cache[16];
+#define ROW_COLS(r) SOA((r)->rl), SOA((r)->rr), SOA((r)->hunk), SOA((r)->kind)
 
 static Rows *rows_for(View *v)
 {
@@ -50,10 +51,10 @@ static Rows *rows_for(View *v)
 		}
 	/* evict the first */
 	githunk_free(&cache[0].h);
-	free(cache[0].rl);
-	free(cache[0].rr);
-	free(cache[0].kind);
-	free(cache[0].hunk);
+	{
+		SoaCol c[] = {ROW_COLS(&cache[0])};
+		soa_free(c, 4);
+	}
 	memset(&cache[0], 0, sizeof cache[0]);
 	cache[0].v = v;
 	cache[0].lver = cache[0].rver = NONE;
@@ -66,10 +67,10 @@ void diff_view_closed(View *v)
 	for (int i = 0; i < 16; i++)
 		if (cache[i].v == v) {
 			githunk_free(&cache[i].h);
-			free(cache[i].rl);
-			free(cache[i].rr);
-			free(cache[i].kind);
-			free(cache[i].hunk);
+			{
+				SoaCol c[] = {ROW_COLS(&cache[i])};
+				soa_free(c, 4);
+			}
 			memset(&cache[i], 0, sizeof cache[i]);
 		}
 	if (v->diff_left != NONE)
@@ -80,11 +81,8 @@ void diff_view_closed(View *v)
 static void row_add(Rows *r, u32 l, u32 rr, u8 kind, u32 hunk)
 {
 	if (r->n == r->cap) {
-		r->cap = r->cap ? r->cap * 2 : 1024;
-		r->rl = vx_realloc(r->rl, r->cap * sizeof(u32));
-		r->rr = vx_realloc(r->rr, r->cap * sizeof(u32));
-		r->kind = vx_realloc(r->kind, r->cap);
-		r->hunk = vx_realloc(r->hunk, r->cap * sizeof(u32));
+		SoaCol c[] = {ROW_COLS(r)};
+		soa_grow(c, 4, &r->cap, VX_MAX(r->n + 1, 1024u), r->n);
 	}
 	r->rl[r->n] = l;
 	r->rr[r->n] = rr;

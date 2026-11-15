@@ -159,6 +159,28 @@ static int load(Text *t, const char *path)
 	return 0;
 }
 
+void text_adopt(Text *t, char *buf, u32 n)
+{
+	text_init(t);
+	t->file = buf; /* not mapped: unmap() frees it */
+	t->file_len = n;
+	t->mapped = false;
+	t->np = 0;
+	if (n) {
+		pieces_reserve(t, 1);
+		t->psrc[0] = SRC_FILE;
+		t->poff[0] = 0;
+		t->plen[0] = n;
+		t->pstart[0] = 0;
+		t->np = 1;
+	}
+	t->len = n;
+	index_lines(t);
+	t->ls = vx_realloc(t->ls, ((size_t)t->nl + 1) * sizeof(u32));
+	t->lcap = t->nl + 1;
+	t->version++;
+}
+
 int text_open(Text *t, const char *path)
 {
 	text_init(t);

@@ -211,6 +211,9 @@ static bool rbuf_fill(RBuf *r, int fd)
 
 /* ---------- documents ---------- */
 
+#define LDOC_COLS(l) SOA((l)->doc_path), SOA((l)->doc_text), SOA((l)->doc_len)
+#define RQ_COLS(l) SOA((l)->rq_path), SOA((l)->rq_id), SOA((l)->rq_kind)
+
 static i32 doc_find(Lsp *l, const char *path)
 {
 	for (u32 i = 0; i < l->doc_n; i++)
@@ -224,11 +227,8 @@ static void doc_set(Lsp *l, const char *path, const char *text, size_t n)
 	i32 d = doc_find(l, path);
 	if (d < 0) {
 		if (l->doc_n == l->doc_cap) {
-			u32 c = l->doc_cap ? l->doc_cap * 2 : 16;
-			l->doc_path = vx_realloc(l->doc_path, c * sizeof(char *));
-			l->doc_text = vx_realloc(l->doc_text, c * sizeof(char *));
-			l->doc_len = vx_realloc(l->doc_len, c * sizeof(u32));
-			l->doc_cap = c;
+			SoaCol c[] = {LDOC_COLS(l)};
+			soa_grow(c, 3, &l->doc_cap, l->doc_n + 1, l->doc_n);
 		}
 		d = (i32)l->doc_n++;
 		l->doc_path[d] = vx_strdup(path);
@@ -380,11 +380,8 @@ static i32 msg_begin_request(Lsp *l, const char *method, u8 kind, const char *pa
 	i32 id = g_next_id++;
 	l->next_id = g_next_id;
 	if (l->rq_n == l->rq_cap) {
-		u32 c = l->rq_cap ? l->rq_cap * 2 : 16;
-		l->rq_id = vx_realloc(l->rq_id, c * sizeof(i32));
-		l->rq_kind = vx_realloc(l->rq_kind, c);
-		l->rq_path = vx_realloc(l->rq_path, c * sizeof(char *));
-		l->rq_cap = c;
+		SoaCol c[] = {RQ_COLS(l)};
+		soa_grow(c, 3, &l->rq_cap, l->rq_n + 1, l->rq_n);
 	}
 	l->rq_id[l->rq_n] = id;
 	l->rq_kind[l->rq_n] = kind;
@@ -659,49 +656,38 @@ void lsp_pump(Lsp *l)
 
 /* ---------- event tables ---------- */
 
-#define RE(p, c) (p) = vx_realloc((p), (size_t)(c) * sizeof(*(p)))
+#define LDIAG_COLS(d)                                                                                    \
+	SOA((d)->line0), SOA((d)->col0), SOA((d)->line1), SOA((d)->col1), SOA((d)->message), SOA((d)->source), \
+	    SOA((d)->severity)
+#define COMP_COLS(d)                                                                                              \
+	SOA((d)->label), SOA((d)->detail), SOA((d)->insert), SOA((d)->line0), SOA((d)->col0), SOA((d)->line1),    \
+	    SOA((d)->col1), SOA((d)->kind), SOA((d)->has_range)
+#define LOC_COLS(d) SOA((d)->path), SOA((d)->line), SOA((d)->col)
+#define LSEM_COLS(d) SOA((d)->line), SOA((d)->col), SOA((d)->len), SOA((d)->mods), SOA((d)->cls)
 
+/* Every row is rewritten after a reserve, except locations (appended). */
 static void diags_reserve(Lsp *l, u32 n)
 {
-	if (n <= l->diags_cap)
-		return;
-	u32 c = n < 64 ? 64 : n;
-	LspDiags *d = &l->diags;
-	RE(d->line0, c); RE(d->col0, c); RE(d->line1, c); RE(d->col1, c);
-	RE(d->severity, c); RE(d->message, c); RE(d->source, c);
-	l->diags_cap = c;
+	SoaCol c[] = {LDIAG_COLS(&l->diags)};
+	soa_grow(c, 7, &l->diags_cap, VX_MAX(n, 64u), 0);
 }
 
 static void comp_reserve(Lsp *l, u32 n)
 {
-	if (n <= l->comp_cap)
-		return;
-	u32 c = n < 64 ? 64 : n;
-	LspCompletion *d = &l->comp;
-	RE(d->label, c); RE(d->detail, c); RE(d->insert, c); RE(d->kind, c);
-	RE(d->line0, c); RE(d->col0, c); RE(d->line1, c); RE(d->col1, c);
-	RE(d->has_range, c);
-	l->comp_cap = c;
+	SoaCol c[] = {COMP_COLS(&l->comp)};
+	soa_grow(c, 9, &l->comp_cap, VX_MAX(n, 64u), 0);
 }
 
 static void locs_reserve(Lsp *l, u32 n)
 {
-	if (n <= l->locs_cap)
-		return;
-	u32 c = n < 16 ? 16 : n;
-	LspLocations *d = &l->locs;
-	RE(d->path, c); RE(d->line, c); RE(d->col, c);
-	l->locs_cap = c;
+	SoaCol c[] = {LOC_COLS(&l->locs)};
+	soa_grow(c, 3, &l->locs_cap, VX_MAX(n, 16u), l->locs.count);
 }
 
 static void sem_reserve(Lsp *l, u32 n)
 {
-	if (n <= l->sem_cap)
-		return;
-	u32 c = n < 256 ? 256 : n;
-	LspSemantic *d = &l->sem;
-	RE(d->line, c); RE(d->col, c); RE(d->len, c); RE(d->cls, c); RE(d->mods, c);
-	l->sem_cap = c;
+	SoaCol c[] = {LSEM_COLS(&l->sem)};
+	soa_grow(c, 5, &l->sem_cap, VX_MAX(n, 256u), 0);
 }
 
 static void ev_init(Lsp *l, LspEvent *ev, int type, i32 req)
@@ -1470,16 +1456,14 @@ void lsp_stop(Lsp *l)
 		close(l->fd_err);
 	for (u32 i = 0; i < l->rq_n; i++)
 		free(l->rq_path[i]);
-	free(l->rq_id);
-	free(l->rq_kind);
-	free(l->rq_path);
+	SoaCol rc[] = {RQ_COLS(l)};
+	soa_free(rc, 3);
 	for (u32 i = 0; i < l->doc_n; i++) {
 		free(l->doc_path[i]);
 		free(l->doc_text[i]);
 	}
-	free(l->doc_path);
-	free(l->doc_text);
-	free(l->doc_len);
+	SoaCol dc[] = {LDOC_COLS(l)};
+	soa_free(dc, 3);
 	jb_free(&l->out);
 	jb_free(&l->pre);
 	jb_free(&l->msg);
@@ -1490,14 +1474,11 @@ void lsp_stop(Lsp *l)
 	free(l->scratch);
 	json_free(&l->js);
 	pool_free(&l->pool);
-	LspDiags *d = &l->diags;
-	free(d->line0); free(d->col0); free(d->line1); free(d->col1);
-	free(d->severity); free(d->message); free(d->source);
-	LspCompletion *c = &l->comp;
-	free(c->label); free(c->detail); free(c->insert); free(c->kind);
-	free(c->line0); free(c->col0); free(c->line1); free(c->col1); free(c->has_range);
-	free(l->locs.path); free(l->locs.line); free(l->locs.col);
-	LspSemantic *s = &l->sem;
-	free(s->line); free(s->col); free(s->len); free(s->cls); free(s->mods);
+	SoaCol ec[] = {LDIAG_COLS(&l->diags)}, cc[] = {COMP_COLS(&l->comp)}, lc[] = {LOC_COLS(&l->locs)},
+	       sc[] = {LSEM_COLS(&l->sem)};
+	soa_free(ec, 7);
+	soa_free(cc, 9);
+	soa_free(lc, 3);
+	soa_free(sc, 5);
 	free(l);
 }

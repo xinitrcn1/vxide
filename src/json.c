@@ -12,16 +12,13 @@ typedef struct {
 	u32 n, i;
 } JP;
 
+#define TOK_COLS(j) SOA((j)->start), SOA((j)->end), SOA((j)->size), SOA((j)->next), SOA((j)->type)
+
 static u32 tok_new(Json *j, u8 type, u32 start)
 {
 	if (j->n == j->cap) {
-		u32 c = j->cap ? j->cap * 2 : 256;
-		j->type = vx_realloc(j->type, c);
-		j->start = vx_realloc(j->start, c * sizeof(u32));
-		j->end = vx_realloc(j->end, c * sizeof(u32));
-		j->size = vx_realloc(j->size, c * sizeof(u32));
-		j->next = vx_realloc(j->next, c * sizeof(u32));
-		j->cap = c;
+		SoaCol c[] = {TOK_COLS(j)};
+		soa_grow(c, 5, &j->cap, VX_MAX(j->n + 1, 256u), j->n);
 	}
 	u32 t = j->n++;
 	j->type[t] = type;
@@ -220,11 +217,8 @@ int json_parse(Json *j, const char *src, u32 n)
 
 void json_free(Json *j)
 {
-	free(j->type);
-	free(j->start);
-	free(j->end);
-	free(j->size);
-	free(j->next);
+	SoaCol c[] = {TOK_COLS(j)};
+	soa_free(c, 5);
 	free(j->stack);
 	memset(j, 0, sizeof *j);
 }

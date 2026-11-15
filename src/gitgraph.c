@@ -12,29 +12,18 @@
 
 #define MAX_LANES 1024
 
-static void graph_reserve(GitGraph *g, u32 n)
-{
-	g->hash = vx_realloc(g->hash, (size_t)n * sizeof g->hash[0]);
-	g->subject = vx_realloc(g->subject, n * sizeof(u32));
-	g->author = vx_realloc(g->author, n * sizeof(u32));
-	g->email = vx_realloc(g->email, n * sizeof(u32));
-	g->refs = vx_realloc(g->refs, n * sizeof(u32));
-	g->time = vx_realloc(g->time, n * sizeof(i64));
-	g->lane = vx_realloc(g->lane, n * sizeof(u16));
-	g->color = vx_realloc(g->color, n);
-	g->flags = vx_realloc(g->flags, n);
-	g->edge_first = vx_realloc(g->edge_first, n * sizeof(u32));
-	g->edge_count = vx_realloc(g->edge_count, n * sizeof(u32));
-}
+#define GRAPH_COLS(g)                                                                                      \
+	SOA((g)->time), SOA((g)->subject), SOA((g)->author), SOA((g)->email), SOA((g)->refs), SOA((g)->edge_first), \
+	    SOA((g)->edge_count), SOA((g)->lane), SOA((g)->hash), SOA((g)->color), SOA((g)->flags)
+#define EDGE_COLS(g) SOA((g)->e_x0), SOA((g)->e_x1), SOA((g)->e_color), SOA((g)->e_half)
+#define FILE_COLS(ci) SOA((ci)->path), SOA((ci)->old_path), SOA((ci)->ins), SOA((ci)->del), SOA((ci)->status)
+#define DECOR_COLS(d) SOA((d)->text), SOA((d)->oid), SOA((d)->rank)
 
 static void edge(GitGraph *g, u32 *cap, u8 half, u32 x0, u32 x1, u8 color)
 {
 	if (g->ne == *cap) {
-		*cap = *cap ? *cap * 2 : 256;
-		g->e_x0 = vx_realloc(g->e_x0, *cap * sizeof(u16));
-		g->e_x1 = vx_realloc(g->e_x1, *cap * sizeof(u16));
-		g->e_color = vx_realloc(g->e_color, *cap);
-		g->e_half = vx_realloc(g->e_half, *cap);
+		SoaCol c[] = {EDGE_COLS(g)};
+		soa_grow(c, 4, cap, VX_MAX(g->ne + 1, 256u), g->ne);
 	}
 	g->e_x0[g->ne] = (u16)x0;
 	g->e_x1[g->ne] = (u16)x1;
@@ -45,21 +34,9 @@ static void edge(GitGraph *g, u32 *cap, u8 half, u32 x0, u32 x1, u8 color)
 
 void git_graph_free(GitGraph *g)
 {
-	free(g->hash);
-	free(g->subject);
-	free(g->author);
-	free(g->email);
-	free(g->refs);
-	free(g->time);
-	free(g->lane);
-	free(g->color);
-	free(g->flags);
-	free(g->edge_first);
-	free(g->edge_count);
-	free(g->e_x0);
-	free(g->e_x1);
-	free(g->e_color);
-	free(g->e_half);
+	SoaCol rc[] = {GRAPH_COLS(g)}, ec[] = {EDGE_COLS(g)};
+	soa_free(rc, 11);
+	soa_free(ec, 4);
 	pool_free(&g->pool);
 	memset(g, 0, sizeof *g);
 }
@@ -67,11 +44,8 @@ void git_graph_free(GitGraph *g)
 void git_commit_info_free(GitCommitInfo *ci)
 {
 	free(ci->parents);
-	free(ci->path);
-	free(ci->old_path);
-	free(ci->status);
-	free(ci->ins);
-	free(ci->del);
+	SoaCol c[] = {FILE_COLS(ci)};
+	soa_free(c, 5);
 	pool_free(&ci->pool);
 	memset(ci, 0, sizeof *ci);
 }
@@ -79,12 +53,8 @@ void git_commit_info_free(GitCommitInfo *ci)
 static void file_add(GitCommitInfo *ci, u32 *cap, char status, const char *path, const char *old, i32 ins, i32 del)
 {
 	if (ci->nfiles == *cap) {
-		*cap = *cap ? *cap * 2 : 16;
-		ci->path = vx_realloc(ci->path, *cap * sizeof(u32));
-		ci->old_path = vx_realloc(ci->old_path, *cap * sizeof(u32));
-		ci->status = vx_realloc(ci->status, *cap);
-		ci->ins = vx_realloc(ci->ins, *cap * sizeof(i32));
-		ci->del = vx_realloc(ci->del, *cap * sizeof(i32));
+		SoaCol c[] = {FILE_COLS(ci)};
+		soa_grow(c, 5, cap, ci->nfiles + 1, ci->nfiles);
 	}
 	u32 i = ci->nfiles++;
 	ci->path[i] = pool_add(&ci->pool, path, (u32)strlen(path));
@@ -142,11 +112,8 @@ typedef struct {
 static void decor_add(Decor *d, const git_oid *oid, u8 rank, const char *text)
 {
 	if (d->n == d->cap) {
-		u32 c = d->cap ? d->cap * 2 : 64;
-		d->oid = vx_realloc(d->oid, c * sizeof(git_oid));
-		d->rank = vx_realloc(d->rank, c);
-		d->text = vx_realloc(d->text, c * sizeof(u32));
-		d->cap = c;
+		SoaCol c[] = {DECOR_COLS(d)};
+		soa_grow(c, 3, &d->cap, VX_MAX(d->n + 1, 64u), d->n);
 	}
 	u32 i = d->n++;
 	d->oid[i] = *oid;
@@ -156,9 +123,8 @@ static void decor_add(Decor *d, const git_oid *oid, u8 rank, const char *text)
 
 static void decor_free(Decor *d)
 {
-	free(d->oid);
-	free(d->rank);
-	free(d->text);
+	SoaCol c[] = {DECOR_COLS(d)};
+	soa_free(c, 3);
 	pool_free(&d->pool);
 }
 
@@ -370,8 +336,8 @@ int git_graph_load(GitGraph *g, const char *workdir, u32 limit)
 		if (git_commit_lookup(&cm, r, &id) != 0)
 			continue;
 		if (g->n == cap_rows) {
-			cap_rows = cap_rows ? cap_rows * 2 : 256;
-			graph_reserve(g, cap_rows);
+			SoaCol c[] = {GRAPH_COLS(g)};
+			soa_grow(c, 11, &cap_rows, VX_MAX(g->n + 1, 256u), g->n);
 		}
 		u32 i = g->n++;
 		git_oid_tostr(g->hash[i], 41, &id);
@@ -486,6 +452,10 @@ int git_graph_load(GitGraph *g, const char *workdir, u32 limit)
 	free(col);
 	decor_free(&dec);
 	git_revwalk_free(w);
+	/* built once, then only read: drop the doubling slack */
+	SoaCol rc[] = {GRAPH_COLS(g)}, ec[] = {EDGE_COLS(g)};
+	soa_fit(rc, 11, &cap_rows, g->n);
+	soa_fit(ec, 4, &ecap, g->ne);
 	repo_unlock();
 	return 0;
 }
@@ -589,6 +559,8 @@ int git_commit_details(const char *workdir, const char *hash, GitCommitInfo *ci)
 				file_add(ci, &cap, st, path, old, ins, del);
 				git_patch_free(pt);
 			}
+			SoaCol fc[] = {FILE_COLS(ci)};
+			soa_fit(fc, 5, &cap, ci->nfiles);
 		}
 	}
 	git_diff_free(diff);

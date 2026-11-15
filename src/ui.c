@@ -1302,17 +1302,13 @@ static void ensure_files(void)
 	(void)skip_ignored;
 }
 
+#define QUICK_COLS(a) SOA((a)->quick_mask), SOA((a)->quick_items), SOA((a)->quick_score)
+
+/* Every caller rewrites all rows (quick_n is reset first). */
 static void quick_reserve(u32 n)
 {
-	if (n <= app.quick_cap)
-		return;
-	u32 c = app.quick_cap ? app.quick_cap : 256;
-	while (c < n)
-		c *= 2;
-	app.quick_items = vx_realloc(app.quick_items, c * sizeof(u32));
-	app.quick_score = vx_realloc(app.quick_score, c * sizeof(int));
-	app.quick_mask = vx_realloc(app.quick_mask, c * sizeof(u64));
-	app.quick_cap = c;
+	SoaCol c[] = {QUICK_COLS(&app)};
+	soa_grow(c, 3, &app.quick_cap, VX_MAX(n, 256u), 0);
 }
 
 static int quick_cmp_idx(const void *a, const void *b)
@@ -4346,14 +4342,11 @@ bool ui_init(const char *root, int w, int h, int scale, bool headless)
 	app.ngroups = 1;
 	app.compl_req = app.hover_req = app.def_req = -1;
 	app.hover_pending_off = -1;
-	{ extern void heap_report(const char *); if (getenv("VXIDE_HEAPPROBE")) heap_report("before-font"); }
 	if (!font_init(PX(13), PX(14), PX(19), PX(11)))
 		return false;
 	app.line_h = font_m[FONT_MONO].line;
 	app.char_w = font_m[FONT_MONO].adv;
-	{ extern void heap_report(const char *); if (getenv("VXIDE_HEAPPROBE")) heap_report("after-font"); }
 	icons_init();
-	{ extern void heap_report(const char *); if (getenv("VXIDE_HEAPPROBE")) heap_report("after-icons"); }
 	font_atlas_was_reset(); /* pins the icon rows */
 	fs_init(&app.tree, root);
 	app.tree_sel = FS_NONE;

@@ -18,6 +18,8 @@ typedef struct {
 	u32 *o_path; /* pool offset */
 	u32 *o_head; /* first pending range */
 	u8 *o_queued;
+	u32 *o_efirst, *o_ecount; /* pass 1: edges of the origin */
+	u8 *o_visited;
 	Pool paths;
 	/* origin lookup: open addressing, key = commit oid + path */
 	u32 *ohash;
@@ -39,6 +41,12 @@ typedef struct {
 	u32 nhk, chk;
 	u32 *h_os, *h_ol, *h_ns, *h_nl;
 } Ctx;
+
+#define ORIGIN_COLS(c)                                                                                       \
+	SOA((c)->o_time), SOA((c)->o_path), SOA((c)->o_head), SOA((c)->o_efirst), SOA((c)->o_ecount), SOA((c)->o_commit), \
+	    SOA((c)->o_blob), SOA((c)->o_queued), SOA((c)->o_visited)
+#define RANGE_COLS(c) SOA((c)->r_final), SOA((c)->r_len), SOA((c)->r_src), SOA((c)->r_next)
+#define COMMIT_COLS(b) SOA((b)->time), SOA((b)->author), SOA((b)->summary), SOA((b)->oid)
 
 static u32 oid_hash(const git_oid *id, u32 salt)
 {
@@ -169,14 +177,8 @@ static u32 origin(Ctx *c, const git_commit *cm, u32 path_off, const git_oid *blo
 		h = (h + 1) & (c->ohash_cap - 1);
 	}
 	if (c->no == c->co) {
-		u32 n = c->co ? c->co * 2 : 256;
-		c->o_commit = vx_realloc(c->o_commit, n * sizeof(git_oid));
-		c->o_blob = vx_realloc(c->o_blob, n * sizeof(git_oid));
-		c->o_time = vx_realloc(c->o_time, n * sizeof(i64));
-		c->o_path = vx_realloc(c->o_path, n * sizeof(u32));
-		c->o_head = vx_realloc(c->o_head, n * sizeof(u32));
-		c->o_queued = vx_realloc(c->o_queued, n);
-		c->co = n;
+		SoaCol oc[] = {ORIGIN_COLS(c)};
+		soa_grow(oc, 9, &c->co, VX_MAX(c->no + 1, 256u), c->no);
 	}
 	u32 o = c->no++;
 	c->o_commit[o] = *id;
@@ -185,6 +187,8 @@ static u32 origin(Ctx *c, const git_commit *cm, u32 path_off, const git_oid *blo
 	c->o_path[o] = path_off;
 	c->o_head[o] = UINT32_MAX;
 	c->o_queued[o] = 0;
+	c->o_efirst[o] = c->o_ecount[o] = 0;
+	c->o_visited[o] = 0;
 	c->ohash[h] = o;
 	return o;
 }
@@ -235,12 +239,8 @@ static void add_range(Ctx *c, u32 o, u32 final, u32 len, u32 src)
 	if (!len)
 		return;
 	if (c->nr == c->cr) {
-		u32 n = c->cr ? c->cr * 2 : 1024;
-		c->r_final = vx_realloc(c->r_final, n * sizeof(u32));
-		c->r_len = vx_realloc(c->r_len, n * sizeof(u32));
-		c->r_src = vx_realloc(c->r_src, n * sizeof(u32));
-		c->r_next = vx_realloc(c->r_next, n * sizeof(u32));
-		c->cr = n;
+		SoaCol rc[] = {RANGE_COLS(c)};
+		soa_grow(rc, 4, &c->cr, VX_MAX(c->nr + 1, 1024u), c->nr);
 	}
 	u32 r = c->nr++;
 	c->r_final[r] = final;
@@ -257,11 +257,11 @@ static u32 commit_entry(Ctx *c, const git_oid *id)
 	for (u32 i = b->nc; i-- > 0;)
 		if (git_oid_equal(&b->oid[i], id))
 			return i;
+	if (b->nc == b->cc) {
+		SoaCol cc[] = {COMMIT_COLS(b)};
+		soa_grow(cc, 4, &b->cc, b->nc + 1, b->nc);
+	}
 	u32 i = b->nc++;
-	b->oid = vx_realloc(b->oid, b->nc * sizeof(git_oid));
-	b->author = vx_realloc(b->author, b->nc * sizeof(u32));
-	b->summary = vx_realloc(b->summary, b->nc * sizeof(u32));
-	b->time = vx_realloc(b->time, b->nc * sizeof(i64));
 	b->oid[i] = *id;
 	git_commit *cm = NULL;
 	const char *name = "", *sum = "";
@@ -299,12 +299,8 @@ static void blame_ranges_to(Ctx *c, u32 head, const git_oid *commit)
 static u32 keep_push(Ctx *c, u32 keep, u32 final, u32 len, u32 src)
 {
 	if (c->nr == c->cr) {
-		u32 n = c->cr ? c->cr * 2 : 1024;
-		c->r_final = vx_realloc(c->r_final, n * sizeof(u32));
-		c->r_len = vx_realloc(c->r_len, n * sizeof(u32));
-		c->r_src = vx_realloc(c->r_src, n * sizeof(u32));
-		c->r_next = vx_realloc(c->r_next, n * sizeof(u32));
-		c->cr = n;
+		SoaCol rc[] = {RANGE_COLS(c)};
+		soa_grow(rc, 4, &c->cr, VX_MAX(c->nr + 1, 1024u), c->nr);
 	}
 	u32 q = c->nr++;
 	c->r_final[q] = final;
@@ -405,24 +401,24 @@ typedef struct {
 	u32 n, cap;
 	u32 *from, *to, *job;
 } Edges;
+#define EDGE_COLS(e) SOA((e)->from), SOA((e)->to), SOA((e)->job)
 
 typedef struct {
 	u32 n, cap;
 	git_oid *old_blob, *new_blob;
-	/* results: hunks per job */
+	/* results: hunks per job; os[k] .. nl[k] are one HunkBuf block */
 	u32 *nh;
 	u32 **os, **ol, **ns, **nl;
 	_Atomic u32 next;
 	const char *repo_path;
 } Jobs;
+#define JOB_COLS(j) SOA((j)->os), SOA((j)->ol), SOA((j)->ns), SOA((j)->nl), SOA((j)->nh), SOA((j)->old_blob), SOA((j)->new_blob)
 
 static void edge_add(Edges *e, u32 from, u32 to, u32 job)
 {
 	if (e->n == e->cap) {
-		e->cap = e->cap ? e->cap * 2 : 1024;
-		e->from = vx_realloc(e->from, e->cap * sizeof(u32));
-		e->to = vx_realloc(e->to, e->cap * sizeof(u32));
-		e->job = vx_realloc(e->job, e->cap * sizeof(u32));
+		SoaCol c[] = {EDGE_COLS(e)};
+		soa_grow(c, 3, &e->cap, VX_MAX(e->n + 1, 1024u), e->n);
 	}
 	e->from[e->n] = from;
 	e->to[e->n] = to;
@@ -433,12 +429,13 @@ static void edge_add(Edges *e, u32 from, u32 to, u32 job)
 static u32 job_add(Jobs *j, const git_oid *old_b, const git_oid *new_b)
 {
 	if (j->n == j->cap) {
-		j->cap = j->cap ? j->cap * 2 : 256;
-		j->old_blob = vx_realloc(j->old_blob, j->cap * sizeof(git_oid));
-		j->new_blob = vx_realloc(j->new_blob, j->cap * sizeof(git_oid));
+		SoaCol c[] = {JOB_COLS(j)};
+		soa_grow(c, 7, &j->cap, VX_MAX(j->n + 1, 256u), j->n);
 	}
 	j->old_blob[j->n] = *old_b;
 	j->new_blob[j->n] = *new_b;
+	j->nh[j->n] = 0;
+	j->os[j->n] = j->ol[j->n] = j->ns[j->n] = j->nl[j->n] = NULL;
 	return j->n++;
 }
 
@@ -446,17 +443,17 @@ typedef struct {
 	u32 n, cap;
 	u32 *os, *ol, *ns, *nl;
 } HunkBuf;
+/* Same column order: a job's result slots hold one HunkBuf's block. */
+#define HUNKBUF_COLS(b) SOA((b)->os), SOA((b)->ol), SOA((b)->ns), SOA((b)->nl)
+#define JOB_HUNK_COLS(j, k) SOA((j)->os[k]), SOA((j)->ol[k]), SOA((j)->ns[k]), SOA((j)->nl[k])
 
 static int job_hunk(const git_diff_delta *d, const git_diff_hunk *h, void *p)
 {
 	(void)d;
 	HunkBuf *b = p;
 	if (b->n == b->cap) {
-		b->cap = b->cap ? b->cap * 2 : 32;
-		b->os = vx_realloc(b->os, b->cap * sizeof(u32));
-		b->ol = vx_realloc(b->ol, b->cap * sizeof(u32));
-		b->ns = vx_realloc(b->ns, b->cap * sizeof(u32));
-		b->nl = vx_realloc(b->nl, b->cap * sizeof(u32));
+		SoaCol c[] = {HUNKBUF_COLS(b)};
+		soa_grow(c, 4, &b->cap, VX_MAX(b->n + 1, 32u), b->n);
 	}
 	b->os[b->n] = (u32)h->old_start;
 	b->ol[b->n] = (u32)h->old_lines;
@@ -486,6 +483,7 @@ static void *job_worker(void *arg)
 			git_diff_blobs(ob, NULL, nb, NULL, &o, NULL, NULL, job_hunk, NULL, &hb);
 		git_blob_free(ob);
 		git_blob_free(nb);
+		/* the whole HunkBuf block moves to the job (os is the block) */
 		j->nh[k] = hb.n;
 		j->os[k] = hb.os;
 		j->ol[k] = hb.ol;
@@ -498,11 +496,6 @@ static void *job_worker(void *arg)
 
 static void run_jobs(Jobs *j)
 {
-	j->nh = vx_alloc((j->n + 1) * sizeof(u32));
-	j->os = vx_alloc((j->n + 1) * sizeof(u32 *));
-	j->ol = vx_alloc((j->n + 1) * sizeof(u32 *));
-	j->ns = vx_alloc((j->n + 1) * sizeof(u32 *));
-	j->nl = vx_alloc((j->n + 1) * sizeof(u32 *));
 	long cpus = sysconf(_SC_NPROCESSORS_ONLN);
 	u32 nt = (u32)VX_CLAMP(cpus, 1, 8);
 	if (nt > j->n)
@@ -520,34 +513,12 @@ static void run_jobs(Jobs *j)
 
 static void jobs_free(Jobs *j)
 {
-	for (u32 k = 0; k < j->n && j->os; k++) {
-		free(j->os[k]);
-		free(j->ol[k]);
-		free(j->ns[k]);
-		free(j->nl[k]);
+	for (u32 k = 0; k < j->n; k++) {
+		SoaCol hc[] = {JOB_HUNK_COLS(j, k)};
+		soa_free(hc, 4);
 	}
-	free(j->os);
-	free(j->ol);
-	free(j->ns);
-	free(j->nl);
-	free(j->nh);
-	free(j->old_blob);
-	free(j->new_blob);
-}
-
-/* Per-origin side tables, kept as long as the origin table (zero-filled). */
-static void sync_tabs(Ctx *c, u8 **visited, u32 **efirst, u32 **ecount, u32 *tcap)
-{
-	if (*tcap >= c->co)
-		return;
-	u32 n = c->co;
-	*visited = vx_realloc(*visited, n);
-	*efirst = vx_realloc(*efirst, n * sizeof(u32));
-	*ecount = vx_realloc(*ecount, n * sizeof(u32));
-	memset(*visited + *tcap, 0, n - *tcap);
-	memset(*efirst + *tcap, 0, (n - *tcap) * sizeof(u32));
-	memset(*ecount + *tcap, 0, (n - *tcap) * sizeof(u32));
-	*tcap = n;
+	SoaCol c[] = {JOB_COLS(j)};
+	soa_free(c, 7);
 }
 
 int lg_blame_head(git_repository *repo, const char *path, LgBlame *out)
@@ -582,18 +553,15 @@ int lg_blame_head(git_repository *repo, const char *path, LgBlame *out)
 	Edges E = {0};
 	Jobs J = {0};
 	J.repo_path = git_repository_path(repo);
-	u32 *efirst = NULL, *ecount = NULL, tcap = 0;
-	u8 *visited = NULL;
 	heap_push(&c, o0);
 	while (c.nh) {
 		u32 o = heap_pop(&c);
-		sync_tabs(&c, &visited, &efirst, &ecount, &tcap);
-		if (visited[o])
+		if (c.o_visited[o])
 			continue;
-		visited[o] = 1;
+		c.o_visited[o] = 1;
 		out->commits_visited++;
-		efirst[o] = E.n;
-		ecount[o] = 0;
+		c.o_efirst[o] = E.n;
+		c.o_ecount[o] = 0;
 		git_commit *cm = NULL;
 		if (git_commit_lookup(&cm, repo, &c.o_commit[o]) != 0)
 			continue;
@@ -637,9 +605,8 @@ int lg_blame_head(git_repository *repo, const char *path, LgBlame *out)
 				continue;
 			u32 po = origin(&c, par[k], ppath[k], &pblob[k]);
 			u32 job = same >= 0 ? UINT32_MAX : job_add(&J, &pblob[k], &c.o_blob[o]);
-			sync_tabs(&c, &visited, &efirst, &ecount, &tcap); /* origin() may have grown */
 			edge_add(&E, o, po, job);
-			ecount[o]++;
+			c.o_ecount[o]++;
 			heap_push(&c, po);
 		}
 		for (u32 k = 0; k < np; k++)
@@ -666,9 +633,9 @@ int lg_blame_head(git_repository *repo, const char *path, LgBlame *out)
 		c.o_head[o] = UINT32_MAX;
 		if (list == UINT32_MAX)
 			continue;
-		u32 n_e = o < tcap && visited[o] ? ecount[o] : 0;
+		u32 n_e = c.o_visited[o] ? c.o_ecount[o] : 0;
 		for (u32 e = 0; e < n_e && list != UINT32_MAX; e++) {
-			u32 k = efirst[o] + e;
+			u32 k = c.o_efirst[o] + e;
 			u32 po = E.to[k];
 			if (E.job[k] == UINT32_MAX) {
 				/* same blob: everything passes on */
@@ -704,23 +671,12 @@ int lg_blame_head(git_repository *repo, const char *path, LgBlame *out)
 		}
 
 	jobs_free(&J);
-	free(E.from);
-	free(E.to);
-	free(E.job);
-	free(efirst);
-	free(ecount);
-	free(visited);
-	free(c.o_commit);
-	free(c.o_blob);
-	free(c.o_time);
-	free(c.o_path);
-	free(c.o_head);
-	free(c.o_queued);
+	SoaCol ec[] = {EDGE_COLS(&E)}, oc[] = {ORIGIN_COLS(&c)}, rc[] = {RANGE_COLS(&c)}, bc[] = {COMMIT_COLS(out)};
+	soa_free(ec, 3);
+	soa_free(oc, 9);
+	soa_free(rc, 4);
+	soa_fit(bc, 4, &out->cc, out->nc); /* the result is only read from here on */
 	free(c.ohash);
-	free(c.r_final);
-	free(c.r_len);
-	free(c.r_src);
-	free(c.r_next);
 	free(c.heap);
 	free(c.m_tree);
 	free(c.m_blob);
@@ -733,10 +689,8 @@ int lg_blame_head(git_repository *repo, const char *path, LgBlame *out)
 void lg_blame_free(LgBlame *b)
 {
 	free(b->line_commit);
-	free(b->oid);
-	free(b->author);
-	free(b->summary);
-	free(b->time);
+	SoaCol c[] = {COMMIT_COLS(b)};
+	soa_free(c, 4);
 	pool_free(&b->pool);
 	memset(b, 0, sizeof *b);
 }
@@ -749,17 +703,15 @@ typedef struct {
 	u32 *h_os, *h_ol, *h_ns, *h_nl;
 	u32 n, cap;
 } BufCtx;
+#define BUFHUNK_COLS(b) SOA((b)->h_os), SOA((b)->h_ol), SOA((b)->h_ns), SOA((b)->h_nl)
 
 static int buf_hunk(const git_diff_delta *d, const git_diff_hunk *h, void *p)
 {
 	(void)d;
 	BufCtx *b = p;
 	if (b->n == b->cap) {
-		b->cap = b->cap ? b->cap * 2 : 64;
-		b->h_os = vx_realloc(b->h_os, b->cap * sizeof(u32));
-		b->h_ol = vx_realloc(b->h_ol, b->cap * sizeof(u32));
-		b->h_ns = vx_realloc(b->h_ns, b->cap * sizeof(u32));
-		b->h_nl = vx_realloc(b->h_nl, b->cap * sizeof(u32));
+		SoaCol c[] = {BUFHUNK_COLS(b)};
+		soa_grow(c, 4, &b->cap, VX_MAX(b->n + 1, 64u), b->n);
 	}
 	b->h_os[b->n] = (u32)h->old_start;
 	b->h_ol[b->n] = (u32)h->old_lines;
@@ -782,8 +734,11 @@ int lg_blame_buffer_map(git_repository *repo, const git_oid *head_blob, const ch
 	o.flags = GIT_DIFF_FORCE_TEXT;
 	int rc = git_diff_blob_to_buffer(ob, path, text, n, path, &o, NULL, NULL, buf_hunk, NULL, &b);
 	git_blob_free(ob);
-	if (rc != 0)
+	SoaCol bc[] = {BUFHUNK_COLS(&b)};
+	if (rc != 0) {
+		soa_free(bc, 4); /* hunks gathered before the failure */
 		return -1;
+	}
 	/* walk buffer lines: inside a hunk's new range -> uncommitted, else old line */
 	i64 delta = 0;
 	u32 h = 0;
@@ -805,9 +760,6 @@ int lg_blame_buffer_map(git_repository *repo, const git_oid *head_blob, const ch
 		out[l] = (u32)((i64)l + delta);
 	next:;
 	}
-	free(b.h_os);
-	free(b.h_ol);
-	free(b.h_ns);
-	free(b.h_nl);
+	soa_free(bc, 4);
 	return 0;
 }

@@ -11,6 +11,7 @@
 
 #define TAB 4
 #define MAX_LINE_BYTES 8192
+#define FM_COLS(a) SOA((a)->fm_a), SOA((a)->fm_b) /* find matches */
 
 static u32 next_group = 1;
 
@@ -1799,8 +1800,8 @@ static void find_matches(View *v)
 	const char *hay = text_flat(t);
 	u32 pos = 0, a, b;
 	while (app.fm_n < 19999 && pos <= t->len && matcher_next(&app.find_m, hay, t->len, pos, &a, &b)) {
-		VX_GROW(app.fm_a, app.fm_cap, app.fm_n + 1);
-		app.fm_b = vx_realloc(app.fm_b, app.fm_cap * sizeof(u32));
+		SoaCol fc[] = {FM_COLS(&app)};
+		soa_grow(fc, 2, &app.fm_cap, app.fm_n + 1, app.fm_n);
 		app.fm_a[app.fm_n] = a;
 		app.fm_b[app.fm_n] = b;
 		app.fm_n++;
@@ -1990,6 +1991,8 @@ void ed_completion_trigger(View *v, bool explicit_)
 	app.compl_req = lsp_completion(doc_lsp(v->doc), app.docs.path[v->doc], line, col);
 }
 
+#define COMPL_COLS(a) SOA((a)->compl_label), SOA((a)->compl_insert), SOA((a)->compl_detail), SOA((a)->compl_filtered), SOA((a)->compl_kind)
+
 void ed_take_completion(const LspEvent *ev)
 {
 	if (ev->req != app.compl_req)
@@ -2001,14 +2004,8 @@ void ed_take_completion(const LspEvent *ev)
 	const LspCompletion *c = ev->completion;
 	pool_clear(&app.compl_pool);
 	u32 n = c->count;
-	if (n > app.compl_cap) {
-		app.compl_label = vx_realloc(app.compl_label, n * sizeof(u32));
-		app.compl_insert = vx_realloc(app.compl_insert, n * sizeof(u32));
-		app.compl_detail = vx_realloc(app.compl_detail, n * sizeof(u32));
-		app.compl_kind = vx_realloc(app.compl_kind, n);
-		app.compl_filtered = vx_realloc(app.compl_filtered, n * sizeof(u32));
-		app.compl_cap = n;
-	}
+	SoaCol cc[] = {COMPL_COLS(&app)};
+	soa_grow(cc, 5, &app.compl_cap, n, 0); /* all rows are rewritten */
 	for (u32 i = 0; i < n; i++) {
 		const char *l = pool_str(ev->pool, c->label[i]);
 		const char *ins = pool_str(ev->pool, c->insert[i]);

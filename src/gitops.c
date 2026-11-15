@@ -350,6 +350,9 @@ typedef struct {
 	u64 *ns;
 } DoneQueue;
 
+#define OPQ_COLS(q) SOA((q)->label), SOA((q)->args), SOA((q)->in), SOA((q)->id), SOA((q)->flags), SOA((q)->index), SOA((q)->kind)
+#define DONEQ_COLS(d) SOA((d)->label), SOA((d)->out), SOA((d)->err), SOA((d)->ns), SOA((d)->id), SOA((d)->status)
+
 struct GitOps {
 	char *workdir;
 	git_repository *wrepo; /* worker thread only */
@@ -370,15 +373,8 @@ struct GitOps {
 static void q_push(OpQueue *q, u32 id, u8 kind, u32 flags, u32 index, char *label, char *args, char *in)
 {
 	if (q->n == q->cap) {
-		u32 c = q->cap ? q->cap * 2 : 8;
-		q->id = vx_realloc(q->id, c * sizeof(u32));
-		q->kind = vx_realloc(q->kind, c);
-		q->flags = vx_realloc(q->flags, c * sizeof(u32));
-		q->index = vx_realloc(q->index, c * sizeof(u32));
-		q->label = vx_realloc(q->label, c * sizeof(char *));
-		q->args = vx_realloc(q->args, c * sizeof(char *));
-		q->in = vx_realloc(q->in, c * sizeof(char *));
-		q->cap = c;
+		SoaCol c[] = {OPQ_COLS(q)};
+		soa_grow(c, 7, &q->cap, q->n + 1, q->n);
 	}
 	u32 i = q->n++;
 	q->id[i] = id;
@@ -405,14 +401,8 @@ static void q_pop_front(OpQueue *q)
 static void d_push(DoneQueue *d, u32 id, char *label, int status, char *out, char *err, u64 ns)
 {
 	if (d->n == d->cap) {
-		u32 c = d->cap ? d->cap * 2 : 8;
-		d->id = vx_realloc(d->id, c * sizeof(u32));
-		d->label = vx_realloc(d->label, c * sizeof(char *));
-		d->status = vx_realloc(d->status, c * sizeof(int));
-		d->out = vx_realloc(d->out, c * sizeof(char *));
-		d->err = vx_realloc(d->err, c * sizeof(char *));
-		d->ns = vx_realloc(d->ns, c * sizeof(u64));
-		d->cap = c;
+		SoaCol c[] = {DONEQ_COLS(d)};
+		soa_grow(c, 6, &d->cap, d->n + 1, d->n);
 	}
 	u32 i = d->n++;
 	d->id[i] = id;
@@ -1797,19 +1787,9 @@ void gitops_stop(GitOps *o)
 		free(o->d.out[i]);
 		free(o->d.err[i]);
 	}
-	free(o->q.id);
-	free(o->q.kind);
-	free(o->q.flags);
-	free(o->q.index);
-	free(o->q.label);
-	free(o->q.args);
-	free(o->q.in);
-	free(o->d.id);
-	free(o->d.label);
-	free(o->d.status);
-	free(o->d.out);
-	free(o->d.err);
-	free(o->d.ns);
+	SoaCol qc[] = {OPQ_COLS(&o->q)}, dc[] = {DONEQ_COLS(&o->d)};
+	soa_free(qc, 7);
+	soa_free(dc, 6);
 	pthread_mutex_destroy(&o->mu);
 	pthread_cond_destroy(&o->cv);
 	git_repository_free(o->wrepo);
@@ -1998,19 +1978,16 @@ u32 gitops_tag_delete(GitOps *o, const char *name) { return enqueue(o, "Deleting
 
 /* ---- synchronous queries (caller thread, its own repository handle) -------------------- */
 
+#define BRANCH_COLS(l)                                                                                       \
+	SOA((l)->time), SOA((l)->name), SOA((l)->upstream), SOA((l)->hash), SOA((l)->ahead), SOA((l)->behind), \
+	    SOA((l)->flags)
+#define STASH_COLS(l) SOA((l)->ref), SOA((l)->message)
+#define NAME_COLS(l) SOA((l)->name), SOA((l)->hash)
+
 static void branch_reserve(GitBranchList *l)
 {
-	if (l->n < l->cap)
-		return;
-	u32 c = l->cap ? l->cap * 2 : 32;
-	l->name = vx_realloc(l->name, c * sizeof(u32));
-	l->upstream = vx_realloc(l->upstream, c * sizeof(u32));
-	l->hash = vx_realloc(l->hash, c * sizeof(u32));
-	l->flags = vx_realloc(l->flags, c);
-	l->ahead = vx_realloc(l->ahead, c * sizeof(u32));
-	l->behind = vx_realloc(l->behind, c * sizeof(u32));
-	l->time = vx_realloc(l->time, c * sizeof(i64));
-	l->cap = c;
+	SoaCol c[] = {BRANCH_COLS(l)};
+	soa_grow(c, 7, &l->cap, VX_MAX(l->n + 1, 32u), l->n);
 }
 
 int gitops_branches(GitOps *o, GitBranchList *l)
@@ -2067,10 +2044,8 @@ static int stash_cb(size_t index, const char *message, const git_oid *id, void *
 	(void)id;
 	GitStashList *l = payload;
 	if (l->n == l->cap) {
-		u32 c = l->cap ? l->cap * 2 : 16;
-		l->ref = vx_realloc(l->ref, c * sizeof(u32));
-		l->message = vx_realloc(l->message, c * sizeof(u32));
-		l->cap = c;
+		SoaCol c[] = {STASH_COLS(l)};
+		soa_grow(c, 2, &l->cap, l->n + 1, l->n);
 	}
 	char r[32];
 	snprintf(r, sizeof r, "stash@{%zu}", index);
@@ -2090,10 +2065,8 @@ int gitops_stashes(GitOps *o, GitStashList *l)
 static void names_add(GitNameList *l, const char *a, size_t na, const char *b, size_t nb)
 {
 	if (l->n == l->cap) {
-		u32 c = l->cap ? l->cap * 2 : 16;
-		l->name = vx_realloc(l->name, c * sizeof(u32));
-		l->hash = vx_realloc(l->hash, c * sizeof(u32));
-		l->cap = c;
+		SoaCol c[] = {NAME_COLS(l)};
+		soa_grow(c, 2, &l->cap, l->n + 1, l->n);
 	}
 	u32 i = l->n++;
 	l->name[i] = pool_add(&l->pool, a, (u32)na);
@@ -2202,29 +2175,24 @@ u32 gitops_state(GitOps *o)
 
 void gitops_branches_free(GitBranchList *l)
 {
-	free(l->name);
-	free(l->upstream);
-	free(l->hash);
-	free(l->flags);
-	free(l->ahead);
-	free(l->behind);
-	free(l->time);
+	SoaCol c[] = {BRANCH_COLS(l)};
+	soa_free(c, 7);
 	pool_free(&l->pool);
 	memset(l, 0, sizeof *l);
 }
 
 void gitops_stashes_free(GitStashList *l)
 {
-	free(l->ref);
-	free(l->message);
+	SoaCol c[] = {STASH_COLS(l)};
+	soa_free(c, 2);
 	pool_free(&l->pool);
 	memset(l, 0, sizeof *l);
 }
 
 void gitops_names_free(GitNameList *l)
 {
-	free(l->name);
-	free(l->hash);
+	SoaCol c[] = {NAME_COLS(l)};
+	soa_free(c, 2);
 	pool_free(&l->pool);
 	memset(l, 0, sizeof *l);
 }

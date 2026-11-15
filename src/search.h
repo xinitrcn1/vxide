@@ -15,6 +15,7 @@ typedef struct {
 	u64 *ino;  /* inode from readdir (d_ino): disk-friendly read order */
 	Pool pool;
 } FileList;
+#define FL_COLS(f) SOA((f)->ino), SOA((f)->path), SOA((f)->base) /* one block (SoA) */
 
 /* Walk root (files.exclude + search.exclude defaults, plus skip()). */
 void files_scan(FileList *fl, const char *root, SkipFn skip, void *ctx, u32 limit);

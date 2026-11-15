@@ -1,5 +1,7 @@
 #version 450
-// One instance = one axis-aligned quad. Six vertices per instance.
+// One instance = one axis-aligned quad, drawn as a 4-vertex triangle strip.
+// The corners are not in any buffer: they come from gl_VertexIndex. The
+// only per-quad input is the 16-byte instance (rect, atlas origin, colour).
 layout(location = 0) in ivec4 in_rect; // x, y, w, h in pixels
 layout(location = 1) in uvec2 in_uv;   // atlas texel origin; u = 0xFFFF solid, 0xFFFE squiggle
 layout(location = 2) in vec4 in_color; // straight alpha
@@ -12,9 +14,8 @@ layout(location = 2) noperspective out vec2 v_local;
 
 void main()
 {
-	const vec2 corner[6] = vec2[6](vec2(0, 0), vec2(1, 0), vec2(0, 1),
-	                               vec2(1, 0), vec2(1, 1), vec2(0, 1));
-	vec2 c = corner[gl_VertexIndex];
+	// strip order 0,1,2,3 = (0,0) (1,0) (0,1) (1,1): bit 0 is x, bit 1 is y
+	vec2 c = vec2(gl_VertexIndex & 1, gl_VertexIndex >> 1);
 	vec2 size = vec2(in_rect.zw);
 	vec2 p = vec2(in_rect.xy) + c * size;
 	gl_Position = vec4(p * pc.inv_half_size - 1.0, 0.0, 1.0);

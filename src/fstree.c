@@ -16,17 +16,13 @@ bool fs_excluded(const char *name)
 	return false;
 }
 
+#define FS_COLS(t) SOA((t)->name), SOA((t)->parent), SOA((t)->first), SOA((t)->next), SOA((t)->depth), SOA((t)->flags)
+
 static u32 add_node(FsTree *t, const char *name, u32 parent, u8 flags)
 {
 	if (t->n == t->cap) {
-		u32 c = t->cap ? t->cap * 2 : 256;
-		t->name = vx_realloc(t->name, c * sizeof(u32));
-		t->parent = vx_realloc(t->parent, c * sizeof(u32));
-		t->first = vx_realloc(t->first, c * sizeof(u32));
-		t->next = vx_realloc(t->next, c * sizeof(u32));
-		t->depth = vx_realloc(t->depth, c * sizeof(u16));
-		t->flags = vx_realloc(t->flags, c);
-		t->cap = c;
+		SoaCol c[] = {FS_COLS(t)};
+		soa_grow(c, 6, &t->cap, VX_MAX(t->n + 1, 256u), t->n);
 	}
 	u32 i = t->n++;
 	t->name[i] = pool_add(&t->pool, name, (u32)strlen(name));
@@ -52,12 +48,8 @@ void fs_init(FsTree *t, const char *root)
 
 void fs_free(FsTree *t)
 {
-	free(t->name);
-	free(t->parent);
-	free(t->first);
-	free(t->next);
-	free(t->depth);
-	free(t->flags);
+	SoaCol c[] = {FS_COLS(t)};
+	soa_free(c, 6);
 	pool_free(&t->pool);
 	free(t->root);
 	memset(t, 0, sizeof *t);

@@ -58,6 +58,12 @@ struct Regex {
 	u32 stack_cap;
 };
 
+#define PROG_COLS(re) SOA((re)->a), SOA((re)->b), SOA((re)->op)
+/* trans holds 256 entries per state: one 1 KiB row element */
+#define STATE_COLS(re)                                                                                   \
+	SOA((re)->st_off), SOA((re)->st_len), ((SoaCol){(void **)&(re)->trans, 256 * (u32)sizeof(u32)}), \
+	    SOA((re)->st_flags), SOA((re)->st_eof)
+
 /* ---- parser / AST --------------------------------------------------------- */
 
 enum {
@@ -99,6 +105,9 @@ static void fail(Parser *P, const char *fmt, const char *arg, size_t argn)
 	P->failed = true;
 }
 
+#define RANGE_COLS(P) SOA((P)->rlo), SOA((P)->rhi)
+#define NODE_COLS(P) SOA((P)->a), SOA((P)->b), SOA((P)->first), SOA((P)->next), SOA((P)->kind), SOA((P)->flag)
+
 static u32 node(Parser *P, u8 kind, u32 a, u32 b)
 {
 	if (P->n >= MAX_NODES) {
@@ -106,14 +115,8 @@ static u32 node(Parser *P, u8 kind, u32 a, u32 b)
 		return 0;
 	}
 	if (P->n == P->cap) {
-		u32 c = P->cap ? P->cap * 2 : 64;
-		P->kind = vx_realloc(P->kind, c);
-		P->flag = vx_realloc(P->flag, c);
-		P->a = vx_realloc(P->a, c * sizeof(u32));
-		P->b = vx_realloc(P->b, c * sizeof(u32));
-		P->first = vx_realloc(P->first, c * sizeof(u32));
-		P->next = vx_realloc(P->next, c * sizeof(u32));
-		P->cap = c;
+		SoaCol c[] = {NODE_COLS(P)};
+		soa_grow(c, 6, &P->cap, VX_MAX(P->n + 1, 64u), P->n);
 	}
 	u32 i = P->n++;
 	P->kind[i] = kind;
@@ -127,10 +130,8 @@ static u32 node(Parser *P, u8 kind, u32 a, u32 b)
 static void range(Parser *P, u32 lo, u32 hi)
 {
 	if (P->nr == P->rcap) {
-		u32 c = P->rcap ? P->rcap * 2 : 64;
-		P->rlo = vx_realloc(P->rlo, c * sizeof(u32));
-		P->rhi = vx_realloc(P->rhi, c * sizeof(u32));
-		P->rcap = c;
+		SoaCol c[] = {RANGE_COLS(P)};
+		soa_grow(c, 2, &P->rcap, VX_MAX(P->nr + 1, 64u), P->nr);
 	}
 	P->rlo[P->nr] = lo;
 	P->rhi[P->nr] = hi;
@@ -694,11 +695,8 @@ static u32 emit(Parser *P, u8 op, u32 a, u32 b)
 		return 0;
 	}
 	if (re->n == re->cap) {
-		u32 c = re->cap ? re->cap * 2 : 64;
-		re->op = vx_realloc(re->op, c);
-		re->a = vx_realloc(re->a, c * sizeof(u32));
-		re->b = vx_realloc(re->b, c * sizeof(u32));
-		re->cap = c;
+		SoaCol c[] = {PROG_COLS(re)};
+		soa_grow(c, 3, &re->cap, VX_MAX(re->n + 1, 64u), re->n);
 	}
 	u32 i = re->n++;
 	re->op[i] = op;
@@ -1071,14 +1069,10 @@ static void gen(Parser *P, u32 n)
 
 static void free_parser(Parser *P)
 {
-	free(P->kind);
-	free(P->flag);
-	free(P->a);
-	free(P->b);
-	free(P->first);
-	free(P->next);
-	free(P->rlo);
-	free(P->rhi);
+	SoaCol c[] = {NODE_COLS(P)};
+	soa_free(c, 6);
+	SoaCol rc[] = {RANGE_COLS(P)};
+	soa_free(rc, 2);
 }
 
 Regex *re_compile(const char *pat, size_t len, int flags, char *err, size_t errcap)
@@ -1126,6 +1120,8 @@ Regex *re_compile(const char *pat, size_t len, int flags, char *err, size_t errc
 		re_free(re);
 		return NULL;
 	}
+	SoaCol pc[] = {PROG_COLS(re)};
+	soa_fit(pc, 3, &re->cap, re->n); /* the program is only read from here on */
 	re->sparse = vx_alloc(re->n * sizeof(u32));
 	re->dense = vx_alloc(re->n * sizeof(u32));
 	return re;
@@ -1143,15 +1139,10 @@ void re_free(Regex *re)
 {
 	if (!re)
 		return;
-	free(re->op);
-	free(re->a);
-	free(re->b);
+	SoaCol pc[] = {PROG_COLS(re)}, sc[] = {STATE_COLS(re)};
+	soa_free(pc, 3);
+	soa_free(sc, 5);
 	free(re->sets);
-	free(re->st_off);
-	free(re->st_len);
-	free(re->st_flags);
-	free(re->trans);
-	free(re->st_eof);
 	free(re->kpool);
 	free(re->hash);
 	free(re->sparse);
@@ -1222,13 +1213,8 @@ static u32 dfa_state(Regex *re, const u32 *k, u32 n, u8 f)
 	if (re->nst >= DFA_MAX_STATES)
 		return DFA_UNKNOWN; /* cache full: caller resets */
 	if (re->nst == re->st_cap) {
-		u32 c = re->st_cap ? re->st_cap * 2 : 64;
-		re->st_off = vx_realloc(re->st_off, c * sizeof(u32));
-		re->st_len = vx_realloc(re->st_len, c * sizeof(u32));
-		re->st_flags = vx_realloc(re->st_flags, c);
-		re->st_eof = vx_realloc(re->st_eof, c);
-		re->trans = vx_realloc(re->trans, (size_t)c * 256 * sizeof(u32));
-		re->st_cap = c;
+		SoaCol c[] = {STATE_COLS(re)};
+		soa_grow(c, 5, &re->st_cap, VX_MAX(re->nst + 1, 64u), re->nst);
 	}
 	u32 s = re->nst++;
 	VX_GROW(re->kpool, re->kcap, re->kn + n + 1);

@@ -53,15 +53,12 @@ void pick_begin(int kind, const char *title, const char *placeholder)
 	snprintf(app.quick_title, sizeof app.quick_title, "%s", title ? title : "");
 }
 
+#define PICK_COLS(a) SOA((a)->pick_label), SOA((a)->pick_desc), SOA((a)->pick_val)
+
 void pick_add(const char *label, const char *desc, u32 val)
 {
-	if (app.pick_n == app.pick_cap) {
-		u32 c = app.pick_cap ? app.pick_cap * 2 : 64;
-		app.pick_label = vx_realloc(app.pick_label, c * sizeof(u32));
-		app.pick_desc = vx_realloc(app.pick_desc, c * sizeof(u32));
-		app.pick_val = vx_realloc(app.pick_val, c * sizeof(u32));
-		app.pick_cap = c;
-	}
+	SoaCol c[] = {PICK_COLS(&app)};
+	soa_grow(c, 3, &app.pick_cap, VX_MAX(app.pick_n + 1, 64u), app.pick_n);
 	u32 i = app.pick_n++;
 	app.pick_label[i] = pool_add(&app.pick_pool, label, (u32)strlen(label));
 	app.pick_desc[i] = pool_add(&app.pick_pool, desc ? desc : "", desc ? (u32)strlen(desc) : 0);
@@ -74,6 +71,7 @@ void pick_show(void) { quick_show_pick(); }
 /* References are kept here until a pick (paths + positions). */
 static Pool loc_pool;
 static u32 *loc_path, *loc_line, *loc_col, loc_n, loc_cap;
+#define LOC_COLS SOA(loc_path), SOA(loc_line), SOA(loc_col)
 
 void pick_accept(int kind, u32 item)
 {
@@ -152,9 +150,8 @@ void actions_take_locations(const LspEvent *ev)
 	snprintf(app.quick_title, sizeof app.quick_title, "%u reference%s", L->count, L->count == 1 ? "" : "s");
 	for (u32 i = 0; i < L->count; i++) {
 		const char *p = pool_str(ev->pool, L->path[i]);
-		VX_GROW(loc_path, loc_cap, loc_n + 1);
-		loc_line = vx_realloc(loc_line, loc_cap * sizeof(u32));
-		loc_col = vx_realloc(loc_col, loc_cap * sizeof(u32));
+		SoaCol lc[] = {LOC_COLS};
+		soa_grow(lc, 3, &loc_cap, loc_n + 1, loc_n);
 		loc_path[loc_n] = pool_add(&loc_pool, p, (u32)strlen(p));
 		loc_line[loc_n] = L->line[i];
 		loc_col[loc_n] = L->col[i];
@@ -492,6 +489,26 @@ bool actions_command(int cmd)
 }
 
 /* Virtual read-only documents (diffs, commit views). */
+u32 doc_new_virtual_owned(const char *name, char *buf, u32 n, int lang)
+{
+	u32 d = doc_new_untitled();
+	if (d == UINT32_MAX) {
+		free(buf);
+		return d;
+	}
+	Docs *D = &app.docs;
+	free(D->rel[d]);
+	D->rel[d] = vx_strdup(name);
+	D->untitled[d] = 0;
+	D->readonly[d] = 1;
+	D->lang[d] = (u8)lang;
+	text_free(&D->text[d]);
+	text_adopt(&D->text[d], buf, n);
+	D->text[d].saved_upos = D->text[d].upos;
+	D->lstate_ok[d] = 0;
+	return d;
+}
+
 u32 doc_new_virtual(const char *name, const char *text, size_t n, int lang)
 {
 	u32 d = doc_new_untitled();

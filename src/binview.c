@@ -68,6 +68,8 @@ static void *dis_main(void *arg)
 	return NULL;
 }
 
+#define TAG_COLS(b) SOA((b)->t_off), SOA((b)->t_len), SOA((b)->t_name), SOA((b)->t_col)
+
 static void bd_free(BinDoc *b)
 {
 	if (!b->used)
@@ -80,10 +82,8 @@ static void bd_free(BinDoc *b)
 	free(b->jobs);
 	bin_free(&b->img);
 	free(b->part_sec);
-	free(b->t_off);
-	free(b->t_len);
-	free(b->t_name);
-	free(b->t_col);
+	SoaCol tc[] = {TAG_COLS(b)};
+	soa_free(tc, 4);
 	pool_free(&b->tpool);
 	free(b->path);
 	memset(b, 0, sizeof *b);
@@ -827,13 +827,8 @@ void binview_prompt_accept(int kind, const char *text)
 	u32 p = v->part;
 	if (kind == PR_HEX_TAG && *text) {
 		u64 a = VX_MIN(s->cur[p], s->anchor[p]), e = VX_MAX(s->cur[p], s->anchor[p]);
-		if (b->nt == b->ct) {
-			b->ct = b->ct ? b->ct * 2 : 16;
-			b->t_off = vx_realloc(b->t_off, b->ct * sizeof(u64));
-			b->t_len = vx_realloc(b->t_len, b->ct * sizeof(u64));
-			b->t_name = vx_realloc(b->t_name, b->ct * sizeof(u32));
-			b->t_col = vx_realloc(b->t_col, b->ct);
-		}
+		SoaCol c[] = {TAG_COLS(b)};
+		soa_grow(c, 4, &b->ct, b->nt + 1, b->nt);
 		u32 i = b->nt++;
 		b->t_off[i] = a;
 		b->t_len[i] = e - a + 1;

@@ -18,7 +18,7 @@
 typedef struct {
 	u32 nlines;
 	u32 *line_commit; /* index into the commit table */
-	u32 nc;
+	u32 nc, cc;            /* commit table (SoA), fitted to nc */
 	git_oid *oid;
 	u32 *author, *summary; /* pool offsets */
 	i64 *time;             /* author time */
