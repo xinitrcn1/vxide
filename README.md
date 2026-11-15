@@ -1,5 +1,9 @@
 # vxide
 
+![scr0](./scr0.png)
+![scr1](./scr1.png)
+![scr2](./scr2.png)
+
 A project-based code editor in C11, built with CMake, whose whole UI is
 drawn with Vulkan. Its look and its keyboard shortcuts follow VSCodium
 (Dark Modern / Light Modern themes, plus a near-black, higher-contrast
