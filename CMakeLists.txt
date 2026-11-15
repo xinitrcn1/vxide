@@ -57,7 +57,7 @@ add_custom_target(shaders DEPENDS ${SHADER_HDRS})
 
 # Core modules: no window or GPU, unit-tested on their own.
 set(CORE base heaptrace text syntax theme fstree fswatch json lsp git gitops gitgraph githunk lgblame blame regex search prof
-	png binfile dap cmake ucasproto llmtools)
+	png binfile dap cmake ucasproto llmtools llmchat)
 # Front end: window, Vulkan, fonts, UI.
 set(APP main gpu font icons draw ui editor panes menu actions gitui bgwork diffview binview vim projtools man dialog session
 	imgload profview mdview pmcview workflow ucasview ucasimg)
@@ -98,7 +98,7 @@ endif()
 # ---- tests (ctest) --------------------------------------------------------------
 enable_testing()
 set(TESTS t_text t_syntax t_json t_lsp t_git t_gitops t_gitgraph t_githunk t_blame t_fstree t_regex t_search
-	t_binfile t_prof t_dap t_cmake t_ucasproto t_llmtools)
+	t_binfile t_prof t_dap t_cmake t_ucasproto t_llmtools t_llmchat)
 foreach(t ${TESTS})
 	add_executable(${t} tests/${t}.c)
 	target_include_directories(${t} PRIVATE tests)
