@@ -74,7 +74,8 @@ DejaVu Sans Mono for code, with DejaVu Sans as the fallback.
   its own tabs: "Index" (every page, or the matches, as links; it cannot
   be closed) and one tab per open page. Pages are rendered by mandoc
   (no pager) with bold / italic kept, and every `name(sec)` is a link
-  (click or Enter, like info). "Open Manpage" in the editor's context
+  (click or Enter, like info). Ctrl+F finds in the page shown (Ctrl+L goes
+  to the apropos search). "Open Manpage" in the editor's context
   menu looks up the word under the mouse (`socket(` -> socket(2); C and
   C++ files try sections 2, 3, 9, 4 first).
 - **Settings**: a workspace with a search bar and one fixed tab per
