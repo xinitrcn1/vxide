@@ -951,6 +951,12 @@ bool man_ws_key(const Event *e)
 		mact = (mact + mn - 1) % mn;
 		return true;
 	}
+	/* Ctrl+F finds in the page shown (the editor's find widget, read-only);
+	 * Ctrl+L, or Ctrl+F with no page, goes to the apropos search */
+	if (mods == MOD_CTRL && (e->key == SDLK_F || e->key == SDLK_H) && man_active_view()) {
+		run_command(CMD_FIND);
+		return true;
+	}
 	if (mods == MOD_CTRL && (e->key == SDLK_F || e->key == SDLK_L)) {
 		app.focus = FOCUS_MAN_INPUT;
 		man_in.anchor = 0;

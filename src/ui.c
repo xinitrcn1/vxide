@@ -2772,7 +2772,7 @@ void ui_event(const Event *e)
 			}
 			if (app.find_open) {
 				app.find_open = false;
-				app.focus = FOCUS_EDITOR;
+				app.focus = ui_workspace() ? FOCUS_WORKSPACE : FOCUS_EDITOR;
 				return;
 			}
 		}

@@ -1598,7 +1598,8 @@ bool ed_command(View *v, int cmd)
 	case CMD_FIND:
 	case CMD_REPLACE: {
 		app.find_open = true;
-		app.find_replace = cmd == CMD_REPLACE;
+		/* read-only tabs (manual pages, diffs' originals, reports) only find */
+		app.find_replace = cmd == CMD_REPLACE && !app.docs.readonly[v->doc];
 		app.find_flags &= ~0x100;
 		app.focus = FOCUS_FIND;
 		/* seed from the selection or the word at the cursor */
@@ -1891,6 +1892,8 @@ static char *replacement_for(View *v, u32 k, u32 *len)
 
 void ed_replace_one(View *v)
 {
+	if (readonly_doc(v))
+		return;
 	find_matches(v);
 	u32 lo = sel_lo(v, 0), hi = sel_hi(v, 0);
 	u32 k = match_at_or_after(lo);
@@ -1906,6 +1909,8 @@ void ed_replace_one(View *v)
 
 void ed_replace_all(View *v)
 {
+	if (readonly_doc(v))
+		return;
 	find_matches(v);
 	u32 n = app.fm_n;
 	if (!n)
@@ -2622,7 +2627,7 @@ static bool find_widget_click(View *v, const Event *e)
 	int mx = e->x, my = e->y - fw_y;
 	bool row2 = my >= fw_row1;
 	if (mx < ix) {
-		app.find_replace = !app.find_replace;
+		app.find_replace = !app.find_replace && !app.docs.readonly[v->doc];
 		return true;
 	}
 	if (!row2) {
@@ -2646,7 +2651,7 @@ static bool find_widget_click(View *v, const Event *e)
 			ed_find_next(v, false);
 		else if (mx >= fw_x + fw_w - PX(28)) {
 			app.find_open = false;
-			app.focus = FOCUS_EDITOR;
+			app.focus = ui_workspace() ? FOCUS_WORKSPACE : FOCUS_EDITOR;
 		}
 		return true;
 	}
@@ -3103,8 +3108,9 @@ void ed_draw(Group *g, View *v, int x, int y, int w, int h, bool focused)
 			draw_rect(x, y, w - SCROLL_W, PX(3), (COL(C_SCROLLBAR_SHADOW) & 0xFFFFFF00u) | 0x40u);
 	}
 
-	/* find widget */
-	if (app.find_open && g == &app.groups[app.active_group])
+	/* find widget: over the view that has the focus (an editor group's,
+	 * or the page in the Manpages workspace) */
+	if (app.find_open && v == active_view())
 		find_widget_draw(x, y, w);
 }
 
