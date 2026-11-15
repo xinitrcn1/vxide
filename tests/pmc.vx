@@ -1,0 +1,13 @@
+# Profiling workspace with a stand-in pmcstat (run by tests/t_ui.sh):
+# toggle an event, type the program and its arguments, run.
+key ctrl+shift+p
+type View: Show Profiling
+key Return
+wait 800
+key space
+key Tab
+type ./mark.sh
+key Tab
+type a 'b c'
+key ctrl+Return
+wait 1500

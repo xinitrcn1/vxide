@@ -94,4 +94,22 @@ printf '# Main\n\nSee [the other doc](other.md#second) and [code](a.c).\n' > "$l
 printf '# Other\n\ntext\n\n## Second\n\nbody\n' > "$l/other.md"
 printf 'int x;\n' > "$l/a.c"
 VXIDE_NO_LSP=1 "$vx" --headless 1000x600 --script tests/mdlink.vx "$l"
+# Profiling workspace (FreeBSD): a stand-in pmcstat lists events and runs
+# the program; it must run in the project folder with its arguments
+if [ "$(uname)" = FreeBSD ]; then
+	pm="$tmp/pmc"
+	mkdir -p "$pm/sub"
+	cat > "$tmp/fake-pmcstat" <<'FAKE'
+#!/bin/sh
+if [ "$1" = -L ]; then printf '\tev.one\n\tev.two\nSOFT\n\tclock.hard\n'; exit 0; fi
+while [ $# -gt 0 ]; do case "$1" in -d) shift ;; -p|-P|-n|-O) shift 2 ;; *) break ;; esac; done
+"$@"; rc=$?
+printf '# p/ev.one\n            42\n' >&2
+exit $rc
+FAKE
+	printf '#!/bin/sh\nprintf "%%s|" "$@" > ran\n' > "$pm/mark.sh"
+	chmod +x "$tmp/fake-pmcstat" "$pm/mark.sh"
+	VXIDE_PMCSTAT="$tmp/fake-pmcstat" VXIDE_NO_LSP=1 "$vx" --headless 1100x700 --script tests/pmc.vx "$pm"
+	test "$(cat "$pm/ran")" = 'a|b c|'
+fi
 echo "ui test ok"
