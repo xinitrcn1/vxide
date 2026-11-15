@@ -104,6 +104,27 @@ DejaVu Sans Mono for code, with DejaVu Sans as the fallback.
   capstone on a background thread (labels from symbols, branch targets
   annotated; Enter or double-click follows a branch), data sections open
   in the hex editor.
+- **Profiles** (read-only tabs): valgrind massif (`massif.out.*`),
+  jemalloc heap profiles (`*.heap`, `heap_v2` and the older
+  `heap profile:` text, unbiased for sampling like jeprof), gprof
+  (`gmon.out`, FreeBSD's `prog.gmon`; BSD and GNU formats, the executable
+  is found next to it or set with "Profile: Set Executable for gprof...")
+  and gcov (`*.gcov`, or `*.gcda` run through gcov). Subtabs: Memory Graph
+  (massif: heap / extra heap / stacks over time, the peak, click a
+  detailed snapshot to look at it), Top (self / total / calls, the
+  selected function's callers and callees underneath), the bottom-up
+  call tree (allocation sites, or where the time went, then their
+  callers), a Flame Graph (click to zoom, Backspace out, Ctrl+F
+  highlights), Hot Lines (with the line's text) and, for gcov, Coverage
+  per file. gprof's flat histogram and call arcs are propagated the way
+  gprof does it, so its flame graph and call-site costs are real.
+  Addresses are symbolised with addr2line. A profile also colours source
+  files: each line's cost as a heat background (yellow to red), its share
+  or count in a gutter column with the five hottest lines numbered, call
+  sites marked with the cost of what they call, never-run lines in red,
+  marks in the overview ruler. "Profile: Go to Next / Previous Hot Line"
+  walks them; "Profile: Annotate Source with Profile..." picks the
+  profile; "Profile: Open Raw Report" shows gprof's or gcov's own text.
 - **Search**: the editor find widget and the Search view share one
   matcher: literal, case, whole word, and regex (Alt+C / Alt+W / Alt+R). The
   Search view has replace with a struck-out/inserted preview, Replace All
@@ -272,6 +293,7 @@ the script command `heap` measure it.
 | `src/ui.c` | Layout, input routing, keybindings, commands, tabs, status bar, quick input |
 | `src/editor.c` | Editor drawing and editing, find, completion, hover |
 | `src/binfile.c`, `src/binview.c` | ELF/PE/Mach-O sections and symbols, capstone disassembly, data inspector; the hex editor and section subtabs |
+| `src/prof.c`, `src/profview.c` | Profile parsers (massif, jemalloc, gmon, gcov), addr2line, gprof propagation, call trees; the profile tabs and source heat colouring |
 | `src/panes.c` | Explorer, Search, Source Control, Settings workspace, Problems, Output, wrapping input box |
 | `src/man.c` | Manpages workspace: mandoc rendering, links, apropos Index |
 | `src/projtools.c` | Qt and Godot: tools, project detection, run/stop with output |
@@ -290,7 +312,8 @@ Environment variables: `VXIDE_NO_LSP`, `VXIDE_CLANGD`, `VXIDE_RUST_ANALYZER`, `V
 `VXIDE_GODOT`, `VXIDE_GODOT_PORT`, `VXIDE_BG` / `VXIDE_BG_OPACITY`, `VXIDE_SETTINGS` (settings file; headless runs read none unless it is set), `VXIDE_THEME=light`,
 `VXIDE_GPU=<name substring>`, `VXIDE_VALIDATE` (Khronos validation layer),
 `VXIDE_LOG` (copy the Output log to stderr), `VXIDE_NO_BLAME`,
-`VXIDE_BLAME_LIBGIT2` (force the libgit2 blame).
+`VXIDE_BLAME_LIBGIT2` (force the libgit2 blame), `VXIDE_ADDR2LINE` / `VXIDE_GCOV` (the
+symboliser / gcov used for profiles).
 
 ## Not done yet
 
