@@ -1653,7 +1653,32 @@ void prof_from_gmon(Prof *p, const Gmon *g, ProfResolveFn resolve, void *ctx)
 	free(ad);
 }
 
-/* The executable that wrote a gmon file. */
+/* `which name`: the first executable regular file called name in PATH. */
+char *prof_which(const char *name)
+{
+	if (!name || !*name || strchr(name, '/'))
+		return NULL;
+	const char *path = getenv("PATH");
+	if (!path || !*path)
+		path = "/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/bin:/usr/local/sbin";
+	while (*path) {
+		const char *c = strchr(path, ':');
+		size_t n = c ? (size_t)(c - path) : strlen(path);
+		char p[4096];
+		snprintf(p, sizeof p, "%.*s/%s", (int)(n ? n : 1), n ? path : ".", name);
+		struct stat st;
+		if (stat(p, &st) == 0 && S_ISREG(st.st_mode) && access(p, X_OK) == 0) {
+			char r[4096];
+			return vx_strdup(realpath(p, r) ? r : p);
+		}
+		path += n + (c ? 1 : 0);
+	}
+	return NULL;
+}
+
+/* The executable that wrote a gmon file: prog.gmon -> prog next to it,
+ * then prog in PATH (like `which prog`), then the newest executable in the
+ * folder; NULL when none (the user is asked). */
 static char *find_gmon_exe(const char *gmon)
 {
 	char dir[4096];
@@ -1672,7 +1697,7 @@ static char *find_gmon_exe(const char *gmon)
 		stem[sn - 5] = 0;
 	DIR *dp = opendir(dir);
 	if (!dp)
-		return NULL;
+		return bsd && stem[0] ? prof_which(stem) : NULL;
 	char best[4096] = "";
 	int best_score = -1;
 	time_t best_t = 0;
@@ -1701,6 +1726,13 @@ static char *find_gmon_exe(const char *gmon)
 		}
 	}
 	closedir(dp);
+	if (best_score == 2)
+		return vx_strdup(best); /* prog.gmon and prog side by side */
+	if (bsd && stem[0]) {
+		char *w = prof_which(stem);
+		if (w)
+			return w;
+	}
 	return best[0] ? vx_strdup(best) : NULL;
 }
 
@@ -1751,7 +1783,8 @@ static int load_gmon(Prof *p, const char *path, const u8 *data, size_t n, const 
 	char *exe = exe_in && *exe_in ? vx_strdup(exe_in) : find_gmon_exe(path);
 	if (!exe) {
 		snprintf(p->err, sizeof p->err,
-		         "No executable next to %s: use \"Profile: Set Executable for gprof...\"", base_name(path));
+		         "No executable for %s next to it or in PATH: use \"Profile: Set Executable for gprof...\"",
+		         base_name(path));
 		return -1;
 	}
 	p->cmd = str_add(p, exe, strlen(exe));

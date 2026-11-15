@@ -115,6 +115,9 @@ char *prof_raw_report(int kind, const char *path, const char *exe, size_t *n);
  * together; NULL when it could not start (exit 127). Blocks: worker
  * threads only. */
 char *prof_run(const char *cwd, char *const argv[], size_t *len, int *status);
+/* Like `which name`: the absolute path of the first executable called
+ * name in PATH (malloc'd), NULL when there is none or name has a '/'. */
+char *prof_which(const char *name);
 
 /* Parsers on their own (no files read, no tools run): for tests. */
 int prof_parse_massif(Prof *p, const char *s, size_t n);

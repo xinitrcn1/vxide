@@ -371,6 +371,24 @@ static void test_gprof_e2e(void)
 	free(se);
 	free(to);
 	prof_free(&p);
+	/* the program elsewhere, in PATH: found like `which hot` */
+	if (!strcmp(gm + strlen(gm) - 9, "/hot.gmon")) {
+		snprintf(cmd, sizeof cmd, "mkdir -p %s/bin && mv %s/hot %s/bin/hot", dir, dir, dir);
+		CHECK(system(cmd) == 0);
+		char path[4600], *old = getenv("PATH");
+		snprintf(path, sizeof path, "%s/bin:%s", dir, old ? old : "/bin:/usr/bin");
+		char *keep = old ? strdup(old) : NULL;
+		setenv("PATH", path, 1);
+		rc = prof_load(&p, PK_GPROF, gm, (const u8 *)d, n, NULL);
+		CHECK(rc == 0);
+		CHECK(strstr(prof_str(&p, p.cmd), "/bin/hot") != NULL);
+		CHECK(fn_named(&p, "hotloop") != PROF_NONE);
+		prof_free(&p);
+		if (keep) {
+			setenv("PATH", keep, 1);
+			free(keep);
+		}
+	}
 	free(d);
 	snprintf(cmd, sizeof cmd, "rm -rf %s", dir);
 	(void)system(cmd);
@@ -424,6 +442,16 @@ static void test_pmc(void)
 	prof_free(&p);
 }
 
+static void test_which(void)
+{
+	char *w = prof_which("sh");
+	CHECK(w && strlen(w) > 3 && !strcmp(w + strlen(w) - 3, "/sh"));
+	free(w);
+	CHECK(prof_which("vxide-no-such-program-xyz") == NULL);
+	CHECK(prof_which("./sh") == NULL); /* paths are not looked up */
+	CHECK(prof_which("") == NULL);
+}
+
 static void test_fmt(void)
 {
 	char b[32];
@@ -449,6 +477,7 @@ int main(void)
 	test_gmon_file();
 	test_gprof_e2e();
 	test_pmc();
+	test_which();
 	test_fmt();
 	return tap_done();
 }

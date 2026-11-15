@@ -2569,13 +2569,25 @@ void profview_prompt_accept(int kind, const char *text)
 	if (!b)
 		return;
 	if (kind == PR_PROF_EXE && *text) {
+		/* a path (absolute, or relative to the project); a bare name is
+		 * looked for in the project, then in PATH like `which` */
 		char p[4096];
+		struct stat st;
 		if (text[0] == '/' || !app.root)
 			snprintf(p, sizeof p, "%s", text);
 		else
 			snprintf(p, sizeof p, "%s/%s", app.root, text);
+		char *w = NULL;
+		if (!strchr(text, '/') && (stat(p, &st) != 0 || !S_ISREG(st.st_mode)))
+			w = prof_which(text);
+		if (!w && (stat(p, &st) != 0 || !S_ISREG(st.st_mode))) {
+			ui_status("No executable \"%s\" in the project or in PATH", text);
+			return;
+		}
 		free(b->exe);
-		b->exe = vx_strdup(p);
+		b->exe = w ? w : vx_strdup(p);
+		if (w)
+			ui_status("Using %s", w);
 		pd_reload(b);
 	} else if (kind == PR_PROF_FIND) {
 		snprintf(b->find, sizeof b->find, "%s", text);
