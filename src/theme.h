@@ -104,6 +104,22 @@ enum {
 	C_DIFF_INSERTED,
 	C_DIFF_REMOVED,
 	C_CODELENS,
+	C_MENU_BG,
+	C_MENU_FG,
+	C_MENU_SEL_BG,
+	C_MENU_SEL_FG,
+	C_MENU_SEP,
+	C_MENU_BORDER,
+	C_GRAPH_1, /* scmGraph.foreground1..5: lane colours */
+	C_GRAPH_2,
+	C_GRAPH_3,
+	C_GRAPH_4,
+	C_GRAPH_5,
+	C_GRAPH_REF,        /* scmGraph.historyItemRefColor */
+	C_GRAPH_REMOTE_REF, /* scmGraph.historyItemRemoteRefColor */
+	C_GRAPH_BASE_REF,   /* scmGraph.historyItemBaseRefColor */
+	C_HOVER_BG,
+	C_LINK,
 	C_COUNT_
 };
 
