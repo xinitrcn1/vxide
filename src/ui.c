@@ -16,7 +16,7 @@
 
 App app;
 
-enum { DRAG_NONE, DRAG_SIDE, DRAG_PANEL, DRAG_EDITOR, DRAG_GROUP, DRAG_SIDEBAR /* = 5: a pane's scrollbar */ };
+enum { DRAG_NONE, DRAG_SIDE, DRAG_PANEL, DRAG_EDITOR, DRAG_GROUP, DRAG_SIDEBAR /* = 5: a pane's scrollbar */, DRAG_RIGHT };
 
 /* ---- messages ----------------------------------------------------------- */
 
@@ -1003,9 +1003,16 @@ void ui_layout(void)
 		app.panel_y = bottom - app.panel_h;
 		bottom = app.panel_y;
 	}
+	/* the Workflow pane, right of the editors (not in the full-area workspaces) */
+	int right = app.w;
+	if (app.right_visible && !ui_workspace()) {
+		app.right_w = VX_CLAMP(app.right_w, PX(240), VX_MAX(app.w - x - PX(240), PX(240)));
+		right = app.w - app.right_w;
+	}
+	app.right_x = right;
 	app.ed_x = x;
 	app.ed_y = app.top_h;
-	app.ed_w = app.w - x;
+	app.ed_w = right - x;
 	app.ed_h = bottom - app.top_h;
 	int gw = app.ed_w / (int)app.ngroups;
 	for (u32 i = 0; i < app.ngroups; i++) {
@@ -2552,8 +2559,7 @@ static void sidebar_event(const Event *e, int x, int y, int w, int h)
 		search_event(e, x, y, w, h);
 	else if (app.side_view == SIDE_SCM)
 		scm_event(e, x, y, w, h);
-	else if (app.side_view == SIDE_WORKFLOW)
-		workflow_event(e, x, y, w, h);
+
 }
 
 /* ---- tooltips ---------------------------------------------------------------
@@ -2722,6 +2728,15 @@ static void context_click(int mx, int my)
 	}
 	if (my >= app.h - app.status_h || mx < app.act_w)
 		return;
+	if (app.right_visible && !ui_workspace() && mx > app.right_x + PX(2) && my >= app.top_h) {
+		Event ev = {0};
+		ev.type = EV_MDOWN;
+		ev.button = 3;
+		ev.x = mx;
+		ev.y = my;
+		workflow_event(&ev, app.right_x, app.top_h, app.right_w, app.h - app.status_h - app.top_h);
+		return;
+	}
 	if (app.side_visible && mx < app.side_x + app.side_w) {
 		int x = app.side_x, w = app.side_w, h = app.h - app.status_h - app.top_h;
 		if (app.side_view == SIDE_EXPLORER) {
@@ -2735,13 +2750,6 @@ static void context_click(int mx, int my)
 		} else if (app.side_view == SIDE_SCM) {
 			extern bool scm_context(int x, int y, int w, int h, int mx, int my);
 			scm_context(x, app.top_h, w, h, mx, my);
-		} else if (app.side_view == SIDE_WORKFLOW) {
-			Event ev = {0};
-			ev.type = EV_MDOWN;
-			ev.button = 3;
-			ev.x = mx;
-			ev.y = my;
-			workflow_event(&ev, x, app.top_h, w, h);
 		}
 		return;
 	}
@@ -2801,8 +2809,14 @@ static int cursor_at(int mx, int my, int mods)
 	}
 	if (app.side_visible && abs(mx - (app.side_x + app.side_w)) <= PX(2) && my < app.h - app.status_h)
 		return CURSOR_EW;
-	if (app.panel_visible && abs(my - app.panel_y) <= PX(2) && mx >= app.ed_x)
+	if (app.panel_visible && abs(my - app.panel_y) <= PX(2) && mx >= app.ed_x && mx < app.right_x)
 		return CURSOR_NS;
+	if (app.right_visible && !ui_workspace() && my >= app.top_h && my < app.h - app.status_h) {
+		if (abs(mx - app.right_x) <= PX(2))
+			return CURSOR_EW;
+		if (mx > app.right_x)
+			return CURSOR_ARROW;
+	}
 	if (my >= app.h - app.status_h || mx < app.act_w)
 		return CURSOR_ARROW;
 	if (app.side_visible && mx < app.side_x + app.side_w) {
@@ -2939,9 +2953,12 @@ void ui_event(const Event *e)
 				ed_find_update(v);
 			return;
 		}
+		case FOCUS_SIDE_INPUT:
+		case FOCUS_RIGHT:
+			workflow_event(e, app.right_x, app.top_h, app.right_w, app.h - app.status_h - app.top_h);
+			return;
 		case FOCUS_SEARCH_INPUT:
 		case FOCUS_SCM_INPUT:
-		case FOCUS_SIDE_INPUT:
 		case FOCUS_SIDEBAR: {
 			int x, y, w, h;
 			sidebar_area(&x, &y, &w, &h);
@@ -2996,9 +3013,12 @@ void ui_event(const Event *e)
 				ed_find_update(v);
 			return;
 		}
+		case FOCUS_SIDE_INPUT:
+		case FOCUS_RIGHT:
+			workflow_event(e, app.right_x, app.top_h, app.right_w, app.h - app.status_h - app.top_h);
+			return;
 		case FOCUS_SEARCH_INPUT:
 		case FOCUS_SCM_INPUT:
-		case FOCUS_SIDE_INPUT:
 		case FOCUS_SIDEBAR: {
 			int x, y, w, h;
 			sidebar_area(&x, &y, &w, &h);
@@ -3057,6 +3077,9 @@ void ui_event(const Event *e)
 		if (app.drag == DRAG_SIDE) {
 			app.side_w = VX_CLAMP(mx - app.side_x, PX(100), app.w - PX(200));
 			ui_layout();
+		} else if (app.drag == DRAG_RIGHT) {
+			app.right_w = app.w - mx;
+			ui_layout();
 		} else if (app.drag == DRAG_PANEL) {
 			app.panel_h = app.h - app.status_h - my;
 			ui_layout();
@@ -3104,6 +3127,11 @@ void ui_event(const Event *e)
 			app.drag = DRAG_SIDE;
 			return;
 		}
+		if (app.right_visible && !ui_workspace() && abs(mx - app.right_x) <= PX(2) && my >= app.top_h &&
+		    my < app.h - app.status_h) {
+			app.drag = DRAG_RIGHT;
+			return;
+		}
 		if (app.panel_visible && abs(my - app.panel_y) <= PX(2) && mx >= app.ed_x) {
 			app.drag = DRAG_PANEL;
 			return;
@@ -3121,7 +3149,9 @@ void ui_event(const Event *e)
 	if (my < app.top_h) {
 		if (e->type == EV_MDOWN) {
 			int i = top_tab_hit(mx);
-			if (i >= 0) {
+			if (i >= 0 && top_tabs[i].view == SIDE_WORKFLOW) {
+				run_command(CMD_VIEW_WORKFLOW); /* toggles the pane on the right */
+			} else if (i >= 0) {
 				/* the active tab hides the side bar, like the activity bar did */
 				if (app.side_visible && app.side_view == top_tabs[i].view && !ui_workspace())
 					run_command(CMD_TOGGLE_SIDEBAR);
@@ -3129,6 +3159,13 @@ void ui_event(const Event *e)
 					run_command(top_tabs[i].cmd);
 			}
 		}
+		return;
+	}
+	if (app.right_visible && !ui_workspace() && mx > app.right_x + PX(2) && my >= app.top_h &&
+	    my < app.h - app.status_h) {
+		if (e->type == EV_MDOWN && app.focus != FOCUS_SIDE_INPUT)
+			app.focus = FOCUS_RIGHT;
+		workflow_event(e, app.right_x, app.top_h, app.right_w, app.h - app.status_h - app.top_h);
 		return;
 	}
 	if (ui_workspace() && !(app.panel_visible && my >= app.panel_y)) {
@@ -3598,7 +3635,8 @@ static void draw_top_tabs(void)
 		int w = top_tab_w(i);
 		/* a workspace is shown whatever the side bar does */
 		bool ws = top_tabs[i].view == SIDE_MAN || top_tabs[i].view == SIDE_SETTINGS || top_tabs[i].view == SIDE_PMC;
-		bool active = app.side_view == top_tabs[i].view && (ws || app.side_visible);
+		bool active = top_tabs[i].view == SIDE_WORKFLOW ? app.right_visible && !ui_workspace()
+		                                                : app.side_view == top_tabs[i].view && (ws || app.side_visible);
 		bool hover = in_rect(app.hover_x, app.hover_y, x, 0, w, h);
 		static const char *const tips[] = {"Project: Explorer (Ctrl+Shift+E)", "Git: Source Control (Ctrl+Shift+G)",
 		                                   "Search (Ctrl+Shift+F)",
@@ -3647,8 +3685,7 @@ static void draw_sidebar(void)
 		search_draw(x, y, w - PX(1), h);
 	else if (app.side_view == SIDE_SCM)
 		scm_draw(x, y, w - PX(1), h);
-	else if (app.side_view == SIDE_WORKFLOW)
-		workflow_draw(x, y, w - PX(1), h);
+
 	draw_noclip();
 	if (app.drag == DRAG_SIDE || (abs(app.hover_x - (x + w)) <= PX(2) && app.hover_y >= y && app.hover_y < y + h))
 		draw_rect(x + w - PX(2), y, PX(4), h, COL(C_SASH_HOVER));
@@ -3975,6 +4012,17 @@ void ui_draw(void)
 		}
 		if (app.side_visible)
 			draw_sidebar();
+		if (app.right_visible) {
+			/* the Workflow pane: its own background, a border and a sash on the left */
+			int rx = app.right_x, ry = app.top_h, rw = app.right_w, rh = app.h - app.status_h - app.top_h;
+			draw_rect(rx, ry, rw, rh, COL(C_SIDEBAR_BG));
+			draw_clip(rx + PX(1), ry, rw - PX(1), rh);
+			workflow_draw(rx + PX(1), ry, rw - PX(1), rh);
+			draw_noclip();
+			draw_rect(rx, ry, PX(1), rh, COL(C_SIDEBAR_BORDER));
+			if (app.drag == DRAG_RIGHT || (abs(app.hover_x - rx) <= PX(2) && app.hover_y >= ry && app.hover_y < ry + rh))
+				draw_rect(rx - PX(2), ry, PX(4), rh, COL(C_SASH_HOVER));
+		}
 	}
 	draw_top_tabs();
 	if (app.panel_visible)

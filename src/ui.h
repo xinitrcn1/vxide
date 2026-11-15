@@ -136,7 +136,8 @@ enum {
 	FOCUS_MAN_INPUT,
 	FOCUS_WORKSPACE, /* the Manpages page or the Settings page */
 	FOCUS_SCM_INPUT,
-	FOCUS_SIDE_INPUT, /* a text field in a side bar view (Workflow) */
+	FOCUS_SIDE_INPUT, /* a text field in the Workflow pane */
+	FOCUS_RIGHT,      /* the Workflow pane (right of the editors) */
 };
 enum { QUICK_NONE, QUICK_FILES, QUICK_COMMANDS, QUICK_GOTO_LINE, QUICK_PROMPT, QUICK_CONFIRM, QUICK_PICK };
 
@@ -177,6 +178,9 @@ typedef struct {
 	int side_x, ed_x, ed_y, ed_w, ed_h, panel_y;
 
 	bool side_visible, panel_visible;
+	bool right_visible; /* the Workflow pane, right of the editors */
+	int right_x, right_w;
+	bool raise;         /* bring the window to the front (the debugger stopped) */
 	int side_view, panel_view;
 	int focus;
 	int hover_x, hover_y;

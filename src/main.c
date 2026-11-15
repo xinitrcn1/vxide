@@ -523,6 +523,11 @@ int main(int argc, char **argv)
 				} while (SDL_PollEvent(&se));
 			}
 			ui_tick();
+			if (app.raise) {
+				app.raise = false;
+				if (win)
+					SDL_RaiseWindow(win);
+			}
 			apply_cursor(app.cursor);
 			u64 blink = (vx_now_ns() - app.blink_t0) / 530000000ull;
 			if (blink != last_blink) {

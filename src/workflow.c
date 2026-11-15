@@ -456,14 +456,21 @@ static bool program_path(char *out, size_t cap)
 	return true;
 }
 
+/* the Workflow pane, right of the editors (the left side bar stays) */
+static void show_pane(void)
+{
+	app.right_visible = true;
+	if (app.right_w < PX(340))
+		app.right_w = PX(340);
+	ui_layout();
+}
+
 static void dbg_launch(void)
 {
 	char prog[2200];
 	if (!program_path(prog, sizeof prog)) {
 		wf_status("Choose a target or type the program to debug (Workflow)");
-		app.side_view = SIDE_WORKFLOW;
-		app.side_visible = true;
-		ui_layout();
+		show_pane();
 		return;
 	}
 	struct stat st;
@@ -488,11 +495,7 @@ static void dbg_launch(void)
 	ui_log("[debug] %s: %s%s", dap_adapter(W.dap), prog, na ? " ..." : "");
 	wf_status("Debugging %s with %s", base_of(prog), dap_adapter(W.dap));
 	show_output();
-	app.side_view = SIDE_WORKFLOW;
-	app.side_visible = true;
-	if (app.side_w < PX(340))
-		app.side_w = PX(340);
-	ui_layout();
+	show_pane();
 }
 
 static void run_program(void)
@@ -670,6 +673,8 @@ static void on_stop(void)
 		open_file(p, false, line - 1, 0);
 	const char *why = dap_stop_reason(d), *txt = dap_stop_text(d);
 	wf_status("Paused%s%s%s in %s", *why ? " on " : "", *txt ? txt : why, "", dap_frame_name(d, f));
+	app.raise = true; /* the program may have had the focus: come back */
+	app.focus = FOCUS_EDITOR;
 	app.dirty = true;
 }
 
@@ -1237,7 +1242,7 @@ static void draw_stack(Pen *p)
 		for (u32 f = 0; f < nf && f < 64; f++) {
 			if (visible(p, h)) {
 				if (f == cf)
-					draw_rect(p->x, p->y, p->w, h, app.focus == FOCUS_SIDEBAR ? COL(C_LIST_ACTIVE_BG) : COL(C_LIST_INACTIVE_BG));
+					draw_rect(p->x, p->y, p->w, h, app.focus == FOCUS_RIGHT ? COL(C_LIST_ACTIVE_BG) : COL(C_LIST_INACTIVE_BG));
 				else if (in_r(app.hover_x, app.hover_y, p->x, p->y, p->w, h))
 					draw_rect(p->x, p->y, p->w, h, COL(C_LIST_HOVER_BG));
 				const char *fp = dap_frame_path(d, f);
@@ -1580,7 +1585,8 @@ static void draw_run(Pen *p)
 		checkbox(p, p->x + PX(12), W.build_first, "Build first", H_BUILDFIRST, 0, "cmake --build before running");
 		p->y += app.row_h;
 	}
-	checkbox(p, p->x + PX(12), W.stop_entry, "Stop at the start of main", H_STOPENTRY, 0, NULL);
+	checkbox(p, p->x + PX(12), W.stop_entry, "Stop at the start of main", H_STOPENTRY, 0,
+	         "Pause on main's first line (and show it), before anything runs");
 	p->y += app.row_h + PX(4);
 	int bx = p->x + PX(12);
 	if (W.job.kind == J_RUN || W.dap)
@@ -1784,7 +1790,7 @@ void workflow_event(const Event *e, int x, int y, int w, int h)
 		Input *in = W.field == F_PROG ? &W.prog : &W.args;
 		if (e->key == SDLK_ESCAPE) {
 			W.field = F_NONE;
-			app.focus = FOCUS_SIDEBAR;
+			app.focus = FOCUS_RIGHT;
 		} else if (e->key == SDLK_RETURN || e->key == SDLK_KP_ENTER) {
 			W.field = F_NONE;
 			app.focus = FOCUS_EDITOR;
@@ -1821,12 +1827,12 @@ void workflow_event(const Event *e, int x, int y, int w, int h)
 			}
 			if (W.field)
 				W.field = F_NONE;
-			app.focus = FOCUS_SIDEBAR;
+			app.focus = FOCUS_RIGHT;
 			hit_run(hits[i].act, hits[i].arg, e);
 			return;
 		}
 	W.field = F_NONE;
-	app.focus = FOCUS_SIDEBAR;
+	app.focus = FOCUS_RIGHT;
 }
 
 /* ---- commands --------------------------------------------------------------------------------- */
@@ -1842,13 +1848,17 @@ bool workflow_command(int cmd)
 	View *v = active_view();
 	switch (cmd) {
 	case CMD_VIEW_WORKFLOW:
+		/* the tab toggles the pane */
 		wf_init();
-		app.side_view = SIDE_WORKFLOW;
-		app.side_visible = true;
-		if (app.side_w < PX(340))
-			app.side_w = PX(340); /* the debug views need the room */
-		app.focus = FOCUS_SIDEBAR;
-		ui_layout();
+		if (app.right_visible) {
+			app.right_visible = false;
+			if (app.focus == FOCUS_RIGHT || app.focus == FOCUS_SIDE_INPUT)
+				app.focus = FOCUS_EDITOR;
+			ui_layout();
+		} else {
+			show_pane();
+			app.focus = FOCUS_RIGHT;
+		}
 		return true;
 	case CMD_DBG_START:
 		wf_init();
@@ -2019,8 +2029,7 @@ void workflow_pick_accept(int kind, u32 val)
 		         W.target != NONE ? cm_str(&W.cm, W.cm.tgt_name[W.target]) : "*custom*");
 		if (W.target == NONE) {
 			W.field = F_PROG;
-			app.side_view = SIDE_WORKFLOW;
-			app.side_visible = true;
+			show_pane();
 			app.focus = FOCUS_SIDE_INPUT;
 		}
 	}
@@ -2070,6 +2079,7 @@ void workflow_session_save(void *file)
 	if (W.args.n)
 		fprintf(f, "wfargs\t%.*s\n", (int)W.args.n, W.args.b);
 	fprintf(f, "wfflags\t%d\t%d\n", W.build_first, W.stop_entry);
+	fprintf(f, "wfpane\t%d\t%d\n", app.right_visible, app.right_w);
 }
 
 bool workflow_session_line(const char *l)
@@ -2109,6 +2119,11 @@ bool workflow_session_line(const char *l)
 	}
 	if (!strcmp(f[0], "wfargs") && k >= 2) {
 		input_set(&W.args, f[1], strlen(f[1]));
+		return true;
+	}
+	if (!strcmp(f[0], "wfpane") && k >= 3) {
+		app.right_visible = atoi(f[1]) != 0;
+		app.right_w = atoi(f[2]);
 		return true;
 	}
 	if (!strcmp(f[0], "wfflags") && k >= 3) {
