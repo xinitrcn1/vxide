@@ -77,17 +77,20 @@ u32 bin_symbol_at(const BinImage *img, u64 addr, u64 *delta);
 
 enum { BR_INSN, BR_LABEL, BR_DATA };
 
-/* Rows (SoA): instructions, symbol labels before the address they name,
- * and ".byte" rows for undecodable bytes. */
+/* Rows: instructions, symbol labels before the address they name, and
+ * ".byte" rows for undecodable bytes. Five bytes a row (coalesced SoA):
+ * where the row is and what it is; the text and the branch target are
+ * decoded again when a row is shown (bin_row_text), which costs a few
+ * microseconds for a screenful and saves ~40 bytes a row (a 2 MB .text
+ * has ~500k rows). */
 typedef struct {
 	u32 n, cap;
-	u8 *kind;     /* BR_* */
-	u64 *addr;    /* virtual address */
-	u64 *off;     /* file offset */
-	u8 *len;      /* bytes (0 for labels) */
-	u32 *text;    /* pool: "mov rax, qword ptr [rsp + 8]" / symbol name */
-	u64 *target;  /* direct branch/call target, UINT64_MAX when none */
-	Pool pool;
+	u32 sec;      /* the section disassembled */
+	u64 base;     /* its virtual address */
+	u64 base_off; /* its file offset */
+	u32 *rel;     /* instruction / data: address - base; label: symbol index */
+	u8 *kl;       /* kind << 4 | length in bytes (0 for labels; x86 tops out at 15) */
+	size_t cs, csd; /* capstone handles for bin_row_text (plain / with detail), opened on first use */
 	char err[128];
 } BinDisasm;
 
@@ -95,6 +98,20 @@ typedef struct {
  * 0 on success; -1 with err for unsupported architectures. */
 int bin_disasm(const BinImage *img, u32 section, const u8 *data, size_t n, BinDisasm *out);
 void bin_disasm_free(BinDisasm *d);
+
+static inline u32 bin_row_kind(const BinDisasm *d, u32 r) { return d->kl[r] >> 4; }
+static inline u32 bin_row_len(const BinDisasm *d, u32 r) { return d->kl[r] & 15; }
+static inline u64 bin_row_addr(const BinImage *img, const BinDisasm *d, u32 r)
+{
+	return bin_row_kind(d, r) == BR_LABEL ? img->y_addr[d->rel[r]] : d->base + d->rel[r];
+}
+/* file offset of an instruction / data row */
+static inline u64 bin_row_off(const BinDisasm *d, u32 r) { return d->base_off + d->rel[r]; }
+/* "mov rax, qword ptr [rsp + 8]", ".byte 0x0f" or a label's symbol name,
+ * and the row's direct branch / call target (UINT64_MAX when none; target
+ * may be NULL). */
+void bin_row_text(const BinImage *img, BinDisasm *d, const u8 *data, size_t n, u32 r, char *buf, size_t cap,
+                  u64 *target);
 
 /* ---- data inspector -------------------------------------------------------------- */
 

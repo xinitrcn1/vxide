@@ -351,10 +351,8 @@ static u32 page_to_doc(Page *p, const char *title)
 		return d;
 	Docs *D = &app.docs;
 	D->man[d] = 1;
-	VX_GROW(D->s_line[d], D->scap[d], p->sn + 1);
-	D->s_col[d] = vx_realloc(D->s_col[d], D->scap[d] * sizeof(u32));
-	D->s_len[d] = vx_realloc(D->s_len[d], D->scap[d] * sizeof(u32));
-	D->s_cls[d] = vx_realloc(D->s_cls[d], D->scap[d]);
+	SoaCol sc[] = {SEM_COLS(D, d)};
+	soa_grow(sc, 4, &D->scap[d], p->sn + 1, 0);
 	if (p->sn) {
 		memcpy(D->s_line[d], p->line, p->sn * sizeof(u32));
 		memcpy(D->s_col[d], p->col, p->sn * sizeof(u32));
@@ -570,27 +568,30 @@ void man_open_at(View *v, u32 off)
 static Input man_in;
 static u64 man_due;       /* run the search at this time (typing debounce) */
 static char man_last[512] = "\x01"; /* query the Index shows; \x01 = not built */
-static View *mv[MAN_TABS]; /* [0] = Index */
+static u32 mv[MAN_TABS]; /* view id + 1; [0] = the Index (0 while it loads) */
 static u32 mn, mact;
 static Group man_g;        /* ed_draw wants a group; this one is never in app.groups */
 
-static View *view_new(u32 d)
+/* workspace tabs are views in app.views like the editor's; they hold a
+ * reference on their document */
+static u32 mview_new(u32 d)
 {
-	View *v = vx_alloc(sizeof *v);
-	v->diff_left = UINT32_MAX;
-	v->doc = d;
-	v->nc = 1;
-	v->want_x[0] = -1;
+	View *v = view_new(d);
 	app.docs.refs[d]++;
-	return v;
+	return view_id(v) + 1; /* 0 = no view (the Index while it loads) */
 }
 
-static void view_free(View *v)
+static void mview_free(u32 id)
 {
+	if (!id)
+		return;
+	View *v = &app.views[id - 1];
 	u32 d = v->doc;
-	free(v);
+	view_free(v);
 	doc_release(d);
 }
+
+#define MV(i) (mv[i] ? &app.views[mv[i] - 1] : NULL)
 
 /* The Index text: "name(sec)   description" per page, links on the names. */
 static void index_text(const char *q, Page *pp)
@@ -702,7 +703,7 @@ void man_prefetch(void) { ensure_index(); }
 static bool man_focus_title(const char *title)
 {
 	for (u32 i = 1; i < mn; i++)
-		if (mv[i] && !strcmp(app.docs.rel[mv[i]->doc], title)) {
+		if (mv[i] && !strcmp(app.docs.rel[MV(i)->doc], title)) {
 			mact = i;
 			app.side_view = SIDE_MAN;
 			app.focus = FOCUS_WORKSPACE;
@@ -717,14 +718,14 @@ static void man_add_tab(u32 d)
 	if (mn == 0)
 		mn = 1; /* slot 0 is the Index, filled when it arrives */
 	if (mn == MAN_TABS) { /* drop the oldest page */
-		view_free(mv[1]);
-		memmove(mv + 1, mv + 2, (MAN_TABS - 2) * sizeof(View *));
+		mview_free(mv[1]);
+		memmove(mv + 1, mv + 2, (MAN_TABS - 2) * sizeof(u32));
 		mn--;
 	}
 	/* new tabs open right of the active one, like the editor's */
 	u32 at = mact + 1;
-	memmove(mv + at + 1, mv + at, (mn - at) * sizeof(View *));
-	mv[at] = view_new(d);
+	memmove(mv + at + 1, mv + at, (mn - at) * sizeof(u32));
+	mv[at] = mview_new(d);
 	mn++;
 	mact = at;
 	app.side_view = SIDE_MAN;
@@ -736,8 +737,8 @@ static void close_tab_at(u32 i)
 {
 	if (i == 0 || i >= mn)
 		return; /* the Index stays */
-	view_free(mv[i]);
-	memmove(mv + i, mv + i + 1, (mn - i - 1) * sizeof(View *));
+	mview_free(mv[i]);
+	memmove(mv + i, mv + i + 1, (mn - i - 1) * sizeof(u32));
 	mn--;
 	if (mact >= i && mact > 0)
 		mact--;
@@ -748,14 +749,14 @@ static void close_tab_at(u32 i)
 View *man_active_view(void)
 {
 	ensure_index();
-	return mn ? mv[mact] : NULL; /* NULL while the Index loads */
+	return mn ? MV(mact) : NULL; /* NULL while the Index loads */
 }
 
 static int search_h(void) { return PX(44); }
 
 static int mtab_w(u32 i)
 {
-	const char *t = i == 0 || !mv[i] ? "Index" : app.docs.rel[mv[i]->doc];
+	const char *t = i == 0 || !mv[i] ? "Index" : app.docs.rel[MV(i)->doc];
 	return PX(12) + font_width(FONT_UI, t, strlen(t)) + (i ? PX(36) : PX(12));
 }
 
@@ -812,7 +813,7 @@ void man_ws_draw(int x, int y, int w, int h)
 		draw_rect(tx + tw - PX(1), ty, PX(1), app.tabs_h, COL(C_TAB_BORDER));
 		if (act)
 			draw_rect(tx, ty, tw, PX(1), COL(C_TAB_ACTIVE_BORDER_TOP));
-		const char *t = i == 0 || !mv[i] ? "Index" : app.docs.rel[mv[i]->doc];
+		const char *t = i == 0 || !mv[i] ? "Index" : app.docs.rel[MV(i)->doc];
 		u32 fg = act ? COL(C_TAB_ACTIVE_FG) : COL(C_TAB_INACTIVE_FG);
 		draw_text(FONT_UI, tx + PX(12), ty + (app.tabs_h - font_m[FONT_UI].line) / 2, t, strlen(t), fg);
 		bool hover = app.hover_x >= tx && app.hover_x < tx + tw && app.hover_y >= ty && app.hover_y < ty + app.tabs_h;
@@ -842,7 +843,7 @@ void man_ws_draw(int x, int y, int w, int h)
 	man_g.y = cy;
 	man_g.w = w;
 	man_g.h = y + h - cy;
-	ed_draw(&man_g, mv[mact], x, cy, w, y + h - cy, app.focus == FOCUS_WORKSPACE);
+	ed_draw(&man_g, MV(mact), x, cy, w, y + h - cy, app.focus == FOCUS_WORKSPACE);
 }
 
 static char man_asked[512]; /* the query last sent to the worker */
@@ -895,11 +896,10 @@ static void man_collect(void)
 		if (ix.done_gen == idx_gen) { /* superseded searches are dropped */
 			u32 d = page_to_doc(&ix.p, "Index");
 			if (d != UINT32_MAX) {
-				View *nv = view_new(d);
+				u32 nv = mview_new(d);
 				if (mn == 0)
 					mn = 1;
-				if (mv[0])
-					view_free(mv[0]);
+				mview_free(mv[0]);
 				mv[0] = nv;
 				snprintf(man_last, sizeof man_last, "%s", ix.done_q);
 			}
@@ -965,7 +965,7 @@ bool man_ws_key(const Event *e)
 		return false;
 	}
 	if (app.focus == FOCUS_WORKSPACE && mn && mv[mact] && !mods && (e->key == SDLK_RETURN || e->key == SDLK_KP_ENTER)) {
-		man_follow(mv[mact]->doc, mv[mact]->head[0]);
+		man_follow(MV(mact)->doc, MV(mact)->head[0]);
 		return true;
 	}
 	return false;
@@ -988,7 +988,7 @@ void man_ws_event(const Event *e, int x, int y, int w, int h)
 			if (man_in.n != before)
 				man_due = vx_now_ns() + 250000000ull;
 		} else if (mn && mv[mact]) {
-			ed_key(mv[mact], e);
+			ed_key(MV(mact), e);
 		}
 		return;
 	}
@@ -1027,7 +1027,7 @@ void man_ws_event(const Event *e, int x, int y, int w, int h)
 	}
 	if (!mn || !mv[mact] || e->y < cy)
 		return;
-	View *v = mv[mact];
+	View *v = MV(mact);
 	if (e->type == EV_MDOWN && e->button == 1) {
 		app.focus = FOCUS_WORKSPACE;
 		if (!(e->mods & (MOD_SHIFT | MOD_CTRL | MOD_ALT))) {
@@ -1045,7 +1045,7 @@ bool man_ws_context(int mx, int my, int x, int y, int w)
 	int cy = content_y(y, w);
 	if (!mn || !mv[mact] || my < cy)
 		return true;
-	View *v = mv[mact];
+	View *v = MV(mact);
 	app.ctx = CTX_EDITOR;
 	app.ctx_off = ed_offset_at(v, mx, my, x, cy);
 	menu_open(mx, my);
@@ -1060,8 +1060,7 @@ bool man_ws_context(int mx, int my, int x, int y, int w)
 void man_shutdown(void)
 {
 	for (u32 i = 0; i < mn; i++)
-		if (mv[i])
-			view_free(mv[i]);
+		mview_free(mv[i]);
 	mn = mact = 0;
 	man_last[0] = '\x01';
 	man_last[1] = 0;

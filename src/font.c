@@ -75,7 +75,11 @@ bool font_init(int ui_px, int mono_px, int mono_line, int small_px)
 {
 	if (FT_Init_FreeType(&ft))
 		return false;
-	font_atlas = vx_alloc((size_t)ATLAS_SIZE * ATLAS_SIZE);
+	/* the atlas is the GPU's mapped staging buffer: no heap copy */
+	font_atlas = gpu_atlas_pixels();
+	if (!font_atlas)
+		return false;
+	memset(font_atlas, 0, (size_t)ATLAS_SIZE * ATLAS_SIZE);
 	for (int f = 0; f < FONT_COUNT; f++) {
 		int px = f <= FONT_UI_BOLD ? ui_px : f <= FONT_SMALL_BOLD ? small_px : mono_px;
 		for (int k = 0; k < MAX_FACES && font_files[f][k]; k++)
@@ -116,8 +120,7 @@ void font_shutdown(void)
 				faces[f][k] = NULL;
 			}
 	FT_Done_FreeType(ft);
-	free(font_atlas);
-	font_atlas = NULL;
+	font_atlas = NULL; /* owned by gpu.c */
 }
 
 bool font_atlas_alloc(int w, int h, u16 *u, u16 *v)

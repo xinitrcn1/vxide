@@ -305,7 +305,7 @@ bool gitui_command(int cmd)
 		} else if (app.git) {
 			/* palette / gutter: changes of the active file */
 			View *v = active_view();
-			const char *rel = v ? (v->diff_left != UINT32_MAX ? v->diff_rel : doc_repo_rel(v->doc)) : NULL;
+			const char *rel = v ? (v->diff_left != UINT32_MAX ? view_rel(v) : doc_repo_rel(v->doc)) : NULL;
 			if (rel) {
 				char r2[1024];
 				snprintf(r2, sizeof r2, "%s", rel);

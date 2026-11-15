@@ -13,34 +13,25 @@ static const char *src_ptr(const Text *t, u32 p)
 	return (t->psrc[p] == SRC_FILE ? t->file : t->add) + t->poff[p];
 }
 
+/* The piece table and the undo log are coalesced SoA tables: one block
+ * each, rows addressed by u32 index. */
+#define PIECE_COLS(t) SOA((t)->poff), SOA((t)->plen), SOA((t)->pstart), SOA((t)->psrc)
+#define UNDO_COLS(t) SOA((t)->u_pos), SOA((t)->u_del), SOA((t)->u_delo), SOA((t)->u_ins), SOA((t)->u_inso), SOA((t)->u_group)
+
 static void pieces_reserve(Text *t, u32 n)
 {
 	if (n <= t->pcap)
 		return;
-	u32 c = t->pcap ? t->pcap : 16;
-	while (c < n)
-		c *= 2;
-	t->psrc = vx_realloc(t->psrc, c);
-	t->poff = vx_realloc(t->poff, c * sizeof(u32));
-	t->plen = vx_realloc(t->plen, c * sizeof(u32));
-	t->pstart = vx_realloc(t->pstart, c * sizeof(u32));
-	t->pcap = c;
+	SoaCol c[] = {PIECE_COLS(t)};
+	soa_grow(c, 4, &t->pcap, n, t->np);
 }
 
 static void undo_reserve(Text *t, u32 n)
 {
 	if (n <= t->ucap)
 		return;
-	u32 c = t->ucap ? t->ucap * 2 : 64;
-	while (c < n)
-		c *= 2;
-	t->u_pos = vx_realloc(t->u_pos, c * sizeof(u32));
-	t->u_del = vx_realloc(t->u_del, c * sizeof(u32));
-	t->u_delo = vx_realloc(t->u_delo, c * sizeof(u32));
-	t->u_ins = vx_realloc(t->u_ins, c * sizeof(u32));
-	t->u_inso = vx_realloc(t->u_inso, c * sizeof(u32));
-	t->u_group = vx_realloc(t->u_group, c * sizeof(u32));
-	t->ucap = c;
+	SoaCol c[] = {UNDO_COLS(t)};
+	soa_grow(c, 6, &t->ucap, VX_MAX(n, 64u), t->nu);
 }
 
 void text_init(Text *t)
@@ -69,17 +60,10 @@ void text_free(Text *t)
 {
 	unmap(t);
 	free(t->add);
-	free(t->psrc);
-	free(t->poff);
-	free(t->plen);
-	free(t->pstart);
+	SoaCol pc[] = {PIECE_COLS(t)}, uc[] = {UNDO_COLS(t)};
+	soa_free(pc, 4);
+	soa_free(uc, 6);
 	free(t->ls);
-	free(t->u_pos);
-	free(t->u_del);
-	free(t->u_delo);
-	free(t->u_ins);
-	free(t->u_inso);
-	free(t->u_group);
 	pool_free(&t->upool);
 	free(t->scratch);
 	free(t->flat);
@@ -167,6 +151,9 @@ static int load(Text *t, const char *path)
 	t->len = (u32)t->file_len;
 	t->add_n = 0;
 	index_lines(t);
+	/* loaded: the line index gets its exact size (doubling left up to half unused) */
+	t->ls = vx_realloc(t->ls, ((size_t)t->nl + 1) * sizeof(u32));
+	t->lcap = t->nl + 1;
 	t->version++;
 	t->flat_ok = false;
 	return 0;
@@ -315,6 +302,26 @@ const char *text_line(Text *t, u32 line, u32 *n)
 
 const char *text_flat(Text *t)
 {
+	if (t->len == 0)
+		return "";
+	/* Unchanged since loading: the file's bytes are the text. A mapping is
+	 * zero-filled past the end of the file to the end of its page, so it is
+	 * already NUL-terminated, unless the size is a whole number of pages;
+	 * a read (non-regular) file got a NUL from vx_read_file. No copy then:
+	 * a big file costs no heap to search or send to a language server. */
+	if (t->np == 1 && t->psrc[0] == SRC_FILE && t->poff[0] == 0 && t->plen[0] == t->len && t->file) {
+		static long page;
+		if (!page)
+			page = sysconf(_SC_PAGESIZE);
+		if (!t->mapped || (page > 0 && t->len % (u32)page != 0)) {
+			if (t->flat) { /* an older copy is not needed any more */
+				free(t->flat);
+				t->flat = NULL;
+				t->flat_ok = false;
+			}
+			return t->file;
+		}
+	}
 	if (t->flat_ok && t->flat_version == t->version)
 		return t->flat;
 	t->flat = vx_realloc(t->flat, t->len + 1);

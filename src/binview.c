@@ -481,17 +481,17 @@ static void draw_hex(BinDoc *b, BinView *s, u32 part, int x, int y, int w, int h
 	draw_inspector(b, s, part, x + g.main_w, y, w - g.main_w, h);
 }
 
-static u32 dis_row_of_addr(const BinDisasm *d, u64 addr)
+static u32 dis_row_of_addr(const BinImage *img, const BinDisasm *d, u64 addr)
 {
 	u32 lo = 0, hi = d->n;
 	while (lo < hi) {
 		u32 mid = (lo + hi) / 2;
-		if (d->addr[mid] < addr)
+		if (bin_row_addr(img, d, mid) < addr)
 			lo = mid + 1;
 		else
 			hi = mid;
 	}
-	while (lo < d->n && d->kind[lo] == BR_LABEL && lo + 1 < d->n && d->addr[lo + 1] == addr)
+	while (lo < d->n && bin_row_kind(d, lo) == BR_LABEL && lo + 1 < d->n && bin_row_addr(img, d, lo + 1) == addr)
 		lo++; /* the instruction, not its label */
 	return lo;
 }
@@ -533,23 +533,29 @@ static void draw_disasm(BinDoc *b, BinView *s, u32 part, int x, int y, int w, in
 		int ry = y + r * lh;
 		if (row >= sa && row <= se)
 			draw_rect(x, ry, w, lh, row == (u64)cur ? COL(C_LIST_ACTIVE_BG) : COL(C_SELECTION));
-		const char *t = d->pool.b + d->text[row];
+		/* decoded for the rows on screen only (the table keeps 5 bytes a row) */
+		char tbuf[256];
+		u64 target;
+		bin_row_text(&b->img, d, b->data, b->n, (u32)row, tbuf, sizeof tbuf, &target);
+		const char *t = tbuf;
+		u64 raddr = bin_row_addr(&b->img, d, (u32)row);
 		char buf[64];
-		if (d->kind[row] == BR_LABEL) {
-			int n2 = snprintf(buf, sizeof buf, "%0*llX", adigits, (unsigned long long)d->addr[row]);
+		if (bin_row_kind(d, (u32)row) == BR_LABEL) {
+			int n2 = snprintf(buf, sizeof buf, "%0*llX", adigits, (unsigned long long)raddr);
 			draw_text(FONT_MONO, ax, ry, buf, (size_t)n2, COL(C_LINE_NUMBER));
 			int ex = draw_text(FONT_MONO, bx, ry, "<", 1, COL(C_FG));
 			ex = draw_text(FONT_MONO, ex, ry, t, strlen(t), TOK(TK_FUNCTION));
 			draw_text(FONT_MONO, ex, ry, ">:", 2, COL(C_FG));
 			continue;
 		}
-		int n2 = snprintf(buf, sizeof buf, "%0*llX", adigits, (unsigned long long)d->addr[row]);
+		int n2 = snprintf(buf, sizeof buf, "%0*llX", adigits, (unsigned long long)raddr);
 		draw_text(FONT_MONO, ax, ry, buf, (size_t)n2, COL(C_LINE_NUMBER));
-		/* instruction bytes (up to 7 shown) */
+		/* instruction bytes (up to 6 shown) */
 		char hx[64];
-		u32 nb = d->len[row], k = 0;
-		for (u32 i = 0; i < nb && i < 6 && d->off[row] + i < b->n; i++)
-			k += (u32)snprintf(hx + k, sizeof hx - k, "%02x ", b->data[d->off[row] + i]);
+		u32 nb = bin_row_len(d, (u32)row), k = 0;
+		u64 roff = bin_row_off(d, (u32)row);
+		for (u32 i = 0; i < nb && i < 6 && roff + i < b->n; i++)
+			k += (u32)snprintf(hx + k, sizeof hx - k, "%02x ", b->data[roff + i]);
 		if (nb > 6)
 			k += (u32)snprintf(hx + k, sizeof hx - k, "..");
 		draw_text(FONT_MONO, bx, ry, hx, k, COL(C_DESCRIPTION_FG));
@@ -568,9 +574,9 @@ static void draw_disasm(BinDoc *b, BinView *s, u32 part, int x, int y, int w, in
 				pos = sp.start[q] + sp.len[q];
 			}
 		}
-		if (d->target[row] != UINT64_MAX) {
+		if (target != UINT64_MAX) {
 			u64 delta;
-			u32 sym = bin_symbol_at(&b->img, d->target[row], &delta);
+			u32 sym = bin_symbol_at(&b->img, target, &delta);
 			/* only inside a symbol: the nearest one before may be far away */
 			if (sym != NONE && (delta == 0 || delta < b->img.y_size[sym])) {
 				char an[300];
@@ -630,7 +636,9 @@ static void jump_to_target(View *v, BinDoc *b, BinView *s)
 	DisJob *j = dis_for(b, v->part);
 	if (atomic_load(&j->state) != 2 || s->cur[v->part] >= j->dis.n)
 		return;
-	u64 t = j->dis.target[s->cur[v->part]];
+	char tb[256];
+	u64 t;
+	bin_row_text(&b->img, &j->dis, b->data, b->n, (u32)s->cur[v->part], tb, sizeof tb, &t);
 	if (t == UINT64_MAX)
 		return;
 	/* the section holding the target (may be another subtab) */
@@ -643,7 +651,7 @@ static void jump_to_target(View *v, BinDoc *b, BinView *s)
 				nanosleep(&ts, NULL);
 			}
 			v->part = p;
-			s->cur[p] = s->anchor[p] = dis_row_of_addr(&k->dis, t);
+			s->cur[p] = s->anchor[p] = dis_row_of_addr(&b->img, &k->dis, t);
 			s->scroll[p] = (i64)s->cur[p] - 5;
 			return;
 		}
@@ -839,7 +847,7 @@ void binview_prompt_accept(int kind, const char *text)
 		if (part_is_code(b, p)) {
 			DisJob *j = dis_for(b, p);
 			if (atomic_load(&j->state) == 2)
-				s->cur[p] = s->anchor[p] = dis_row_of_addr(&j->dis, o);
+				s->cur[p] = s->anchor[p] = dis_row_of_addr(&b->img, &j->dis, o);
 		} else {
 			u64 lo, hi;
 			part_range(b, p, &lo, &hi);
@@ -903,8 +911,10 @@ bool binview_command(int cmd)
 			u32 a = (u32)VX_MIN(s->cur[p], s->anchor[p]), e = (u32)VX_MAX(s->cur[p], s->anchor[p]);
 			for (u32 r = a; r <= e && r < j->dis.n; r++) {
 				char line[400];
-				int k = snprintf(line, sizeof line, "%llx:\t%s\n", (unsigned long long)j->dis.addr[r],
-				                 j->dis.pool.b + j->dis.text[r]);
+				char tb[256];
+				bin_row_text(&b->img, &j->dis, b->data, b->n, r, tb, sizeof tb, NULL);
+				int k = snprintf(line, sizeof line, "%llx:\t%s\n",
+				                 (unsigned long long)bin_row_addr(&b->img, &j->dis, r), tb);
 				VX_GROW(out.b, out.cap, out.n + (u32)k + 1);
 				memcpy(out.b + out.n, line, (size_t)k);
 				out.n += (u32)k;
@@ -966,7 +976,7 @@ void binview_status(View *v, char *buf, size_t cap)
 	if (part_is_code(b, p)) {
 		DisJob *j = dis_for(b, p);
 		if (atomic_load(&j->state) == 2 && s->cur[p] < j->dis.n)
-			snprintf(buf, cap, "%s %s  0x%llx", fmt ? fmt : "", arch ? arch : "", (unsigned long long)j->dis.addr[s->cur[p]]);
+			snprintf(buf, cap, "%s %s  0x%llx", fmt ? fmt : "", arch ? arch : "", (unsigned long long)bin_row_addr(&b->img, &j->dis, (u32)s->cur[p]));
 		else
 			snprintf(buf, cap, "%s %s", fmt ? fmt : "", arch ? arch : "");
 	} else {

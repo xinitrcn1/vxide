@@ -195,17 +195,14 @@ u32 find_in(const char *hay, u32 n, const char *q, u32 nq, int flags, u32 from, 
 	return UINT32_MAX;
 }
 
+/* results: one coalesced block */
+#define RESULT_COLS(r) SOA((r)->file), SOA((r)->line), SOA((r)->col), SOA((r)->len), SOA((r)->text), SOA((r)->text_col)
+
 static void res_add(SearchResults *r, u32 file, u32 line, u32 col, u32 len, const char *ls, u32 ll)
 {
 	if (r->n == r->cap) {
-		u32 c = r->cap ? r->cap * 2 : 256;
-		r->file = vx_realloc(r->file, c * sizeof(u32));
-		r->line = vx_realloc(r->line, c * sizeof(u32));
-		r->col = vx_realloc(r->col, c * sizeof(u32));
-		r->len = vx_realloc(r->len, c * sizeof(u32));
-		r->text = vx_realloc(r->text, c * sizeof(u32));
-		r->text_col = vx_realloc(r->text_col, c * sizeof(u32));
-		r->cap = c;
+		SoaCol c[] = {RESULT_COLS(r)};
+		soa_grow(c, 6, &r->cap, VX_MAX(r->n + 1, 256u), r->n);
 	}
 	/* Preview: trim leading whitespace, keep some context before the match. */
 	u32 s = 0;
@@ -594,12 +591,8 @@ void search_text(SearchResults *r, const char *root, const FileList *fl, Matcher
 
 void search_free(SearchResults *r)
 {
-	free(r->file);
-	free(r->line);
-	free(r->col);
-	free(r->len);
-	free(r->text);
-	free(r->text_col);
+	SoaCol c[] = {RESULT_COLS(r)};
+	soa_free(c, 6);
 	pool_free(&r->pool);
 	memset(r, 0, sizeof *r);
 }

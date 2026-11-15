@@ -65,7 +65,6 @@ static struct {
 	VkBuffer stage;
 	VkDeviceMemory stage_mem;
 	u8 *stage_map;
-	const u8 *atlas_cpu;
 	int dx0, dy0, dx1, dy1; /* dirty rect, empty when dx0 >= dx1 */
 
 	/* background image (binding 1) */
@@ -622,7 +621,16 @@ void gpu_resize(int w, int h)
 	recreate();
 }
 
-void gpu_set_atlas(const u8 *pixels) { G.atlas_cpu = pixels; }
+u8 *gpu_atlas_pixels(void) { return G.stage_map; }
+
+Quad *gpu_frame_quads(u32 *cap)
+{
+	Frame *f = &G.fr[G.fi];
+	VK(vkWaitForFences(G.dev, 1, &f->fence, VK_TRUE, UINT64_MAX));
+	*cap = MAX_QUADS;
+	return (Quad *)f->inst_map;
+}
+bool gpu_atlas_ready(void) { return G.stage_map != NULL; }
 
 void gpu_atlas_dirty(int x, int y, int w, int h)
 {
@@ -658,30 +666,28 @@ static void barrier(VkCommandBuffer c, VkImage img, VkImageLayout from, VkImageL
  * frames in flight, so wait for the other frame first (rare: glyph adds). */
 static void upload_atlas(VkCommandBuffer c)
 {
-	if (!G.atlas_cpu || G.dx0 >= G.dx1)
+	if (G.dx0 >= G.dx1)
 		return;
-	Frame *other = &G.fr[(G.fi + 1) % FRAMES];
-	vkWaitForFences(G.dev, 1, &other->fence, VK_TRUE, UINT64_MAX);
+	/* The staging buffer is the atlas (full pitch): the dirty rect is copied
+	 * from where it already is. A glyph written while an earlier copy is in
+	 * flight lands in a rect that is uploaded again next frame. */
 	int x0 = VX_MAX(G.dx0, 0), y0 = VX_MAX(G.dy0, 0);
 	int x1 = VX_MIN(G.dx1, ATLAS_SIZE), y1 = VX_MIN(G.dy1, ATLAS_SIZE);
 	int w = x1 - x0, h = y1 - y0;
-	for (int y = 0; y < h; y++)
-		memcpy(G.stage_map + (size_t)y * w, G.atlas_cpu + (size_t)(y0 + y) * ATLAS_SIZE + x0,
-		       (size_t)w);
 	barrier(c, G.atlas,
 	        G.atlas_init ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
 	        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
 	        VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 	        VK_PIPELINE_STAGE_TRANSFER_BIT);
 	VkBufferImageCopy r = {0};
-	r.bufferRowLength = (u32)w;
+	r.bufferOffset = (VkDeviceSize)y0 * ATLAS_SIZE + (VkDeviceSize)x0;
+	r.bufferRowLength = ATLAS_SIZE;
 	r.imageSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
 	r.imageOffset = (VkOffset3D){x0, y0, 0};
 	r.imageExtent = (VkExtent3D){(u32)w, (u32)h, 1};
 	if (!G.atlas_init) {
 		/* First upload: whole atlas so no texel is undefined. */
-		memcpy(G.stage_map, G.atlas_cpu, (size_t)ATLAS_SIZE * ATLAS_SIZE);
-		r.bufferRowLength = ATLAS_SIZE;
+		r.bufferOffset = 0;
 		r.imageOffset = (VkOffset3D){0, 0, 0};
 		r.imageExtent = (VkExtent3D){ATLAS_SIZE, ATLAS_SIZE, 1};
 	}
@@ -777,7 +783,8 @@ bool gpu_frame(const Quad *q, u32 n, u32 clear)
 
 	if (n > MAX_QUADS)
 		n = MAX_QUADS;
-	memcpy(f->inst_map, q, (size_t)n * sizeof(Quad));
+	if ((const void *)q != f->inst_map) /* draw.c normally wrote in place */
+		memcpy(f->inst_map, q, (size_t)n * sizeof(Quad));
 
 	VkCommandBuffer c = f->cmd;
 	VK(vkResetCommandBuffer(c, 0));

@@ -90,7 +90,7 @@ void session_save(void)
 	for (u32 gi = 0; gi < app.ngroups; gi++) {
 		Group *g = &app.groups[gi];
 		for (u32 t = 0; t < g->nt; t++) {
-			View *v = g->tab[t];
+			View *v = gview(g, t);
 			const char *p = app.docs.path[v->doc];
 			/* real files only: diffs, man pages and untitled buffers are not kept */
 			if (!p || v->diff_left != UINT32_MAX || app.docs.man[v->doc])

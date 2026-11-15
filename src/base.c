@@ -1,3 +1,4 @@
+#define VX_HEAPTRACE_IMPL /* the real allocators live here */
 #define _POSIX_C_SOURCE 200809L
 #include "base.h"
 
@@ -51,6 +52,54 @@ void vx_grow(void **p, u32 *cap, u32 need, size_t elem)
 		c = c < 0x40000000u ? c * 2 : need;
 	*p = vx_realloc(*p, (size_t)c * elem);
 	*cap = c;
+}
+
+/* Re-lay the columns into one block of capacity cap, keeping n rows. */
+static void soa_relayout(const SoaCol *cols, u32 ncols, u32 cap, u32 n)
+{
+	size_t off[64], total = 0;
+	if (ncols > 64)
+		vx_die("soa: too many columns");
+	for (u32 i = 0; i < ncols; i++) {
+		total = (total + 7) & ~(size_t)7;
+		off[i] = total;
+		total += (size_t)cap * cols[i].size;
+	}
+	char *nb = vx_alloc(total ? total : 1);
+	char *old = ncols ? (char *)*cols[0].p : NULL;
+	for (u32 i = 0; i < ncols; i++) {
+		if (old && n)
+			memcpy(nb + off[i], *cols[i].p, (size_t)n * cols[i].size);
+		*cols[i].p = nb + off[i];
+	}
+	free(old);
+}
+
+void soa_grow(const SoaCol *cols, u32 ncols, u32 *cap, u32 need, u32 n)
+{
+	if (need <= *cap && (ncols == 0 || *cols[0].p))
+		return;
+	u32 c = *cap ? *cap : 16;
+	while (c < need)
+		c = c < 0x40000000u ? c * 2 : need;
+	soa_relayout(cols, ncols, c, n);
+	*cap = c;
+}
+
+void soa_fit(const SoaCol *cols, u32 ncols, u32 *cap, u32 n)
+{
+	if (*cap == n || ncols == 0 || !*cols[0].p)
+		return;
+	soa_relayout(cols, ncols, n ? n : 1, n);
+	*cap = n ? n : 1;
+}
+
+void soa_free(const SoaCol *cols, u32 ncols)
+{
+	if (ncols)
+		free(*cols[0].p);
+	for (u32 i = 0; i < ncols; i++)
+		*cols[i].p = NULL;
 }
 
 u32 pool_add(Pool *p, const char *s, u32 n)

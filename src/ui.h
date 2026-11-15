@@ -84,12 +84,17 @@ typedef struct {
 /* ---- editor views and groups -------------------------------------------- */
 
 #define MAX_CURSORS 512
+#define MAX_VIEWS 512
 
+/* A view (an editor tab's state) lives in app.views and is named by its
+ * u32 index everywhere it is stored (groups, workspaces); a View * is only
+ * a working handle (the table never moves). Its cursors are a coalesced SoA
+ * block that grows on demand (view_reserve), not 512 inline slots. */
 typedef struct {
 	u32 doc;
-	u32 nc;
-	u32 head[MAX_CURSORS], anchor[MAX_CURSORS];
-	i32 want_x[MAX_CURSORS]; /* preferred x in pixels for up/down, -1 none */
+	u32 nc, ccap;    /* cursors in use / capacity of the block */
+	u32 *head, *anchor;
+	i32 *want_x;     /* preferred x in pixels for up/down, -1 none */
 	i64 scroll_y;            /* pixels */
 	i32 scroll_x;
 	bool preview; /* italic tab, replaced by the next preview open */
@@ -99,8 +104,8 @@ typedef struct {
 	/* multi-part views (an executable's sections): subtabs under the tabs */
 	u32 nparts, part;
 	u8 diff_kind; /* DIFF_WORKTREE, DIFF_STAGED, DIFF_COMMIT */
-	char diff_rel[512];
-	u32 group;    /* undo group currently being extended */
+	u32 diff_rel_at; /* the diffed path: offset in app.strs (view_rel) */
+	u32 group;       /* undo group currently being extended */
 	u8 group_kind;
 	u64 group_ns;
 } View;
@@ -110,7 +115,7 @@ typedef struct {
 
 typedef struct {
 	u32 nt, active;
-	View *tab[MAX_TABS];
+	u32 tab[MAX_TABS]; /* view ids (app.views) */
 	u32 mru[MAX_TABS]; /* tab indices, most recent first */
 	int x, y, w, h;
 } Group;
@@ -178,6 +183,10 @@ typedef struct {
 	int drag_off;
 
 	Docs docs;
+	/* views (u32-indexed table) and their strings */
+	View views[MAX_VIEWS];
+	u8 view_used[MAX_VIEWS];
+	Pool strs;
 	Group groups[MAX_GROUPS];
 	u32 ngroups, active_group;
 
@@ -333,6 +342,17 @@ typedef struct {
 } App;
 
 extern App app;
+
+static inline View *gview(const Group *g, u32 t) { return &app.views[g->tab[t]]; }
+/* a document's diagnostics / semantic tokens: coalesced SoA blocks */
+#define DIAG_COLS(D, d) SOA((D)->d_line0[d]), SOA((D)->d_col0[d]), SOA((D)->d_line1[d]), SOA((D)->d_col1[d]), SOA((D)->d_msg[d]), SOA((D)->d_sev[d])
+#define SEM_COLS(D, d) SOA((D)->s_line[d]), SOA((D)->s_col[d]), SOA((D)->s_len[d]), SOA((D)->s_cls[d])
+static inline u32 view_id(const View *v) { return (u32)(v - app.views); }
+static inline const char *view_rel(const View *v) { return app.strs.b ? app.strs.b + v->diff_rel_at : ""; }
+View *view_new(u32 doc);            /* a free slot, one cursor at 0 */
+void view_free(View *v);            /* back to the table, cursors freed */
+void view_reserve(View *v, u32 n);  /* room for n cursors */
+void view_set_rel(View *v, const char *rel);
 
 #define PX(n) ((n) * app.scale)
 #define COL(id) (themes[app.theme].c[id])

@@ -14,6 +14,10 @@ set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O2 -g")
 add_compile_options(-pedantic -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
 
 option(VXIDE_SANITIZE "Build with AddressSanitizer and UBSan" OFF)
+option(VXIDE_HEAPTRACE "Tag heap allocations with their call site (script command: heap)" OFF)
+if(VXIDE_HEAPTRACE)
+	add_compile_definitions(VXIDE_HEAPTRACE)
+endif()
 if(VXIDE_SANITIZE)
 	add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
 	add_link_options(-fsanitize=address,undefined)
@@ -43,7 +47,7 @@ endforeach()
 add_custom_target(shaders DEPENDS ${SHADER_HDRS})
 
 # Core modules: no window or GPU, unit-tested on their own.
-set(CORE base text syntax theme fstree fswatch json lsp git gitops gitgraph githunk lgblame blame regex search
+set(CORE base heaptrace text syntax theme fstree fswatch json lsp git gitops gitgraph githunk lgblame blame regex search
 	png binfile)
 # Front end: window, Vulkan, fonts, UI.
 set(APP main gpu font icons draw ui editor panes menu actions gitui bgwork diffview binview vim projtools man dialog session

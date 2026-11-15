@@ -11,6 +11,14 @@
 #include <time.h>
 #include <unistd.h>
 
+/* a row's text (decoded on demand) */
+static const char *row_text(const BinImage *img, BinDisasm *d, const u8 *data, size_t n, u32 r)
+{
+	static char buf[256];
+	bin_row_text(img, d, data, n, r, buf, sizeof buf, NULL);
+	return buf;
+}
+
 static char dir[] = "/tmp/vxide-bin-XXXXXX";
 
 static u8 *load(const char *path, size_t *n)
@@ -67,13 +75,19 @@ static void check_call(const char *path, const char *fmt, const char *arch, bool
 	CHECK(bin_disasm(&img, t, d, n, &ds) == 0);
 	bool label = false, call = false;
 	for (u32 i = 0; i < ds.n; i++) {
-		const char *tx = ds.pool.b + ds.text[i];
-		if (ds.kind[i] == BR_LABEL && !strcmp(tx, "main"))
+		char tx[256];
+		u64 target;
+		bin_row_text(&img, &ds, d, n, i, tx, sizeof tx, &target);
+		if (bin_row_kind(&ds, i) == BR_LABEL && !strcmp(tx, "main"))
 			label = true;
-		if (ds.kind[i] == BR_INSN && hs != UINT32_MAX && ds.target[i] == img.y_addr[hs] &&
+		if (bin_row_kind(&ds, i) == BR_INSN && hs != UINT32_MAX && target == img.y_addr[hs] &&
 		    (!strncmp(tx, "call", 4) || !strncmp(tx, "bl", 2)))
 			call = true;
 	}
+	/* rows are in address order, 5 bytes each, no slack */
+	for (u32 i = 1; i < ds.n; i++)
+		CHECK(bin_row_addr(&img, &ds, i - 1) <= bin_row_addr(&img, &ds, i));
+	CHECK(ds.cap == ds.n);
 	CHECK(label);
 	if (want_call)
 		CHECK(call);
@@ -134,10 +148,11 @@ static void test_pe(void)
 	BinDisasm ds;
 	CHECK(bin_disasm(&img, 0, b, sizeof b, &ds) == 0);
 	u32 first = 0;
-	while (first < ds.n && ds.kind[first] != BR_INSN)
+	while (first < ds.n && bin_row_kind(&ds, first) != BR_INSN)
 		first++;
-	CHECK(first < ds.n && !strcmp(ds.pool.b + ds.text[first], "push rbp"));
-	CHECK(ds.n >= 3 && !strcmp(ds.pool.b + ds.text[ds.n - 1], "ret"));
+	CHECK(first < ds.n && !strcmp(row_text(&img, &ds, b, sizeof b, first), "push rbp"));
+	CHECK(ds.n >= 3 && !strcmp(row_text(&img, &ds, b, sizeof b, ds.n - 1), "ret"));
+	CHECK(first < ds.n && bin_row_addr(&img, &ds, first) == 0x140001000ull && bin_row_len(&ds, first) == 1);
 	bin_disasm_free(&ds);
 	bin_free(&img);
 	/* "MZ" without a PE header is not an executable image */
@@ -188,7 +203,8 @@ static void test_macho(void)
 	CHECK(img.nsym == 1 && !strcmp(bin_str(&img, img.y_name[0]), "_main") && img.y_func[0]);
 	BinDisasm ds;
 	CHECK(bin_disasm(&img, 0, b, sizeof b, &ds) == 0);
-	CHECK(ds.n >= 2 && ds.kind[0] == BR_LABEL && !strcmp(ds.pool.b + ds.text[1], "xor eax, eax"));
+	CHECK(ds.n >= 2 && bin_row_kind(&ds, 0) == BR_LABEL && !strcmp(row_text(&img, &ds, b, sizeof b, 0), "_main") &&
+	      !strcmp(row_text(&img, &ds, b, sizeof b, 1), "xor eax, eax"));
 	bin_disasm_free(&ds);
 	bin_free(&img);
 	/* a Java class file (same magic as fat Mach-O) is not an image */
@@ -396,7 +412,7 @@ int main(int argc, char **argv)
 		bin_disasm(&img, sec(&img, ".text"), d, n, &ds);
 		bool ret = false;
 		for (u32 i = 0; i < ds.n; i++)
-			ret |= !strcmp(ds.pool.b + ds.text[i], "ret");
+			ret |= !strcmp(row_text(&img, &ds, d, n, i), "ret");
 		CHECK(ret);
 		bin_disasm_free(&ds);
 		bin_free(&img);

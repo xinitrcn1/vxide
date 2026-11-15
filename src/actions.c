@@ -232,7 +232,7 @@ void ctx_menu_tab(int x, int y, u32 group, u32 tab)
 	menu_item("Close to the Right", CMD_CLOSE_RIGHT, tab + 1 < g->nt);
 	menu_item("Close All", CMD_CLOSE_ALL, true);
 	menu_sep();
-	bool has_path = tab < g->nt && app.docs.path[g->tab[tab]->doc];
+	bool has_path = tab < g->nt && app.docs.path[gview(g, tab)->doc];
 	menu_item("Copy Path", CMD_COPY_PATH, has_path);
 	menu_item("Copy Relative Path", CMD_COPY_REL_PATH, has_path);
 	menu_sep();
@@ -268,8 +268,7 @@ void ctx_menu_scm_file(int x, int y, const char *repo_rel, bool staged)
 void cursor_history_push(View *v)
 {
 	if (app.ch_n == VX_COUNT(app.ch_doc)) {
-		free(app.ch_head[0]);
-		free(app.ch_anchor[0]);
+		free(app.ch_head[0]); /* the anchors share the block */
 		memmove(app.ch_doc, app.ch_doc + 1, sizeof app.ch_doc - sizeof app.ch_doc[0]);
 		memmove(app.ch_nc, app.ch_nc + 1, sizeof app.ch_nc - sizeof app.ch_nc[0]);
 		memmove(app.ch_head, app.ch_head + 1, sizeof app.ch_head - sizeof app.ch_head[0]);
@@ -279,8 +278,9 @@ void cursor_history_push(View *v)
 	u32 i = app.ch_n++;
 	app.ch_doc[i] = v->doc;
 	app.ch_nc[i] = v->nc;
-	app.ch_head[i] = vx_alloc(v->nc * sizeof(u32));
-	app.ch_anchor[i] = vx_alloc(v->nc * sizeof(u32));
+	/* heads and anchors in one block */
+	app.ch_head[i] = vx_alloc(2 * (size_t)v->nc * sizeof(u32));
+	app.ch_anchor[i] = app.ch_head[i] + v->nc;
 	memcpy(app.ch_head[i], v->head, v->nc * sizeof(u32));
 	memcpy(app.ch_anchor[i], v->anchor, v->nc * sizeof(u32));
 }
@@ -292,6 +292,7 @@ static void cursor_undo(View *v)
 		bool ok = app.ch_doc[i] == v->doc;
 		if (ok) {
 			u32 len = app.docs.text[v->doc].len;
+			view_reserve(v, app.ch_nc[i]);
 			v->nc = app.ch_nc[i];
 			for (u32 c = 0; c < v->nc; c++) {
 				v->head[c] = VX_MIN(app.ch_head[i][c], len);
@@ -299,8 +300,7 @@ static void cursor_undo(View *v)
 				v->want_x[c] = -1;
 			}
 		}
-		free(app.ch_head[i]);
-		free(app.ch_anchor[i]);
+		free(app.ch_head[i]); /* the anchors share the block */
 		if (ok) {
 			ed_reveal(v, v->head[v->nc - 1], false);
 			return;
@@ -323,6 +323,7 @@ static void cursors_at_line_ends(View *v)
 		for (u32 l = l0; l <= l1 && n < MAX_CURSORS; l++)
 			nh[n++] = text_line_start(t, l) + text_line_len(t, l);
 	}
+	view_reserve(v, n);
 	v->nc = n ? n : 1;
 	for (u32 c = 0; c < n; c++) {
 		v->head[c] = v->anchor[c] = nh[c];
@@ -340,7 +341,7 @@ static bool ctx_abs_path(char *out, size_t cap)
 		fs_relpath(&app.tree, app.ctx_a, rel, sizeof rel);
 		snprintf(out, cap, "%s/%s", app.root, rel);
 	} else if (app.ctx == CTX_TAB && app.ctx_a < app.ngroups && app.ctx_b < app.groups[app.ctx_a].nt) {
-		u32 d = app.groups[app.ctx_a].tab[app.ctx_b]->doc;
+		u32 d = gview(&app.groups[app.ctx_a], app.ctx_b)->doc;
 		if (app.docs.path[d])
 			snprintf(out, cap, "%s", app.docs.path[d]);
 	} else if (app.ctx == CTX_SCM_FILE && app.git) {
@@ -472,13 +473,13 @@ bool actions_command(int cmd)
 		u32 gi = app.ctx == CTX_TAB ? app.ctx_a : app.active_group;
 		Group *g = &app.groups[gi];
 		u32 keep = app.ctx == CTX_TAB ? app.ctx_b : g->active;
-		View *kv = keep < g->nt ? g->tab[keep] : NULL;
+		View *kv = keep < g->nt ? gview(g, keep) : NULL;
 		for (u32 t = g->nt; t-- > 0;) {
-			if (g->tab[t] == kv)
+			if (gview(g, t) == kv)
 				continue;
 			if (cmd == CMD_CLOSE_RIGHT && t < keep)
 				continue;
-			if (text_dirty(&app.docs.text[g->tab[t]->doc]) && app.docs.refs[g->tab[t]->doc] == 1)
+			if (text_dirty(&app.docs.text[gview(g, t)->doc]) && app.docs.refs[gview(g, t)->doc] == 1)
 				continue; /* keep unsaved editors open */
 			close_tab(gi, t);
 		}

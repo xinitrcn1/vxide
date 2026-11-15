@@ -5,6 +5,7 @@ DrawList draw;
 
 void draw_begin(int w, int h)
 {
+	draw.q = gpu_frame_quads(&draw.cap); /* straight into the GPU's buffer */
 	draw.n = 0;
 	draw.w = w;
 	draw.h = h;
@@ -40,10 +41,8 @@ static void push(int x, int y, int w, int h, u16 u, u16 v, u32 c)
 	} else if (u == QUAD_SQUIGGLE && (cx0 != x || cy0 != y)) {
 		return; /* squiggles are cut whole */
 	}
-	if (draw.n == draw.cap) {
-		draw.cap = draw.cap ? draw.cap * 2 : 16384;
-		draw.q = vx_realloc(draw.q, draw.cap * sizeof(Quad));
-	}
+	if (draw.n == draw.cap)
+		return; /* the frame is full (262144 quads): nothing more fits on screen anyway */
 	Quad *q = &draw.q[draw.n++];
 	q->x = (i16)cx0;
 	q->y = (i16)cy0;

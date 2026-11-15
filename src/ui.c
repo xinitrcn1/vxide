@@ -351,7 +351,19 @@ void doc_release(u32 d)
 	D->untitled[d] = 0;
 	D->readonly[d] = 0;
 	D->dn[d] = D->sn[d] = D->gm_n[d] = 0;
-	pool_clear(&D->d_pool[d]);
+	/* a closed document keeps nothing: its per-line and per-token tables go */
+	SoaCol dc[] = {DIAG_COLS(D, d)}, sc[] = {SEM_COLS(D, d)};
+	soa_free(dc, 6);
+	soa_free(sc, 4);
+	D->dcap[d] = D->scap[d] = 0;
+	pool_free(&D->d_pool[d]);
+	free(D->gm[d]);
+	D->gm[d] = NULL;
+	D->gm_cap[d] = 0;
+	free(D->lstate[d]);
+	D->lstate[d] = NULL;
+	D->lstate_cap[d] = 0;
+	D->lstate_ok[d] = 0;
 }
 
 static void git_marks_due(u32 d, u64 delay)
@@ -460,7 +472,7 @@ void doc_replace(u32 d, u32 pos, u32 del, const char *ins, u32 nins, u32 group)
 	i64 delta = (i64)nins - (i64)del;
 	for (u32 g = 0; g < app.ngroups; g++)
 		for (u32 k = 0; k < app.groups[g].nt; k++) {
-			View *v = app.groups[g].tab[k];
+			View *v = gview(&app.groups[g], k);
 			if (v->doc != d)
 				continue;
 			for (u32 c = 0; c < v->nc; c++) {
@@ -484,6 +496,56 @@ void doc_replace(u32 d, u32 pos, u32 del, const char *ins, u32 nins, u32 group)
 
 /* ---- views, tabs ---------------------------------------------------------- */
 
+/* ---- the view table ----------------------------------------------------------- */
+
+#define CURSOR_COLS(v) SOA((v)->head), SOA((v)->anchor), SOA((v)->want_x)
+
+View *view_new(u32 doc)
+{
+	for (u32 i = 0; i < MAX_VIEWS; i++)
+		if (!app.view_used[i]) {
+			View *v = &app.views[i];
+			memset(v, 0, sizeof *v);
+			app.view_used[i] = 1;
+			v->doc = doc;
+			v->diff_left = UINT32_MAX;
+			view_reserve(v, 1);
+			v->nc = 1;
+			v->want_x[0] = -1;
+			return v;
+		}
+	vx_die("more than %d editor views", MAX_VIEWS);
+}
+
+void view_free(View *v)
+{
+	SoaCol c[] = {CURSOR_COLS(v)};
+	soa_free(c, 3);
+	app.view_used[view_id(v)] = 0;
+	memset(v, 0, sizeof *v);
+}
+
+void view_reserve(View *v, u32 n)
+{
+	if (n > v->ccap) {
+		SoaCol c[] = {CURSOR_COLS(v)};
+		soa_grow(c, 3, &v->ccap, VX_MAX(n, 4u), v->nc);
+	}
+}
+
+/* A diff view's path, interned in app.strs (the same paths come back). */
+void view_set_rel(View *v, const char *rel)
+{
+	u32 n = (u32)strlen(rel);
+	for (u32 i = 0; i < MAX_VIEWS; i++)
+		if (app.view_used[i] && &app.views[i] != v && app.views[i].diff_left != UINT32_MAX &&
+		    !strcmp(view_rel(&app.views[i]), rel)) {
+			v->diff_rel_at = app.views[i].diff_rel_at;
+			return;
+		}
+	v->diff_rel_at = pool_add(&app.strs, rel, n);
+}
+
 bool ui_workspace(void) { return app.side_view == SIDE_MAN || app.side_view == SIDE_SETTINGS; }
 
 void workspace_area(int *x, int *y, int *w, int *h)
@@ -499,7 +561,7 @@ View *active_view(void)
 	if (app.side_view == SIDE_MAN)
 		return man_active_view(); /* the page shown in the Manpages workspace */
 	Group *g = &app.groups[app.active_group];
-	return g->nt ? g->tab[g->active] : NULL;
+	return g->nt ? gview(g, g->active) : NULL;
 }
 
 static void mru_touch(Group *g, u32 t)
@@ -519,7 +581,7 @@ static void activate_tab(u32 gi, u32 t)
 	app.active_group = gi;
 	app.compl_open = false;
 	app.hover_open = false;
-	View *v = g->tab[t];
+	View *v = gview(g, t);
 	if (v)
 		explorer_reveal(v->doc);
 	app.dirty = true;
@@ -605,7 +667,7 @@ static bool find_view_of(u32 d, u32 *gi, u32 *t)
 {
 	for (u32 g = 0; g < app.ngroups; g++)
 		for (u32 i = 0; i < app.groups[g].nt; i++)
-			if (app.groups[g].tab[i]->doc == d && app.groups[g].tab[i]->diff_left == UINT32_MAX) {
+			if (gview(&app.groups[g], i)->doc == d && gview(&app.groups[g], i)->diff_left == UINT32_MAX) {
 				*gi = g;
 				*t = i;
 				return true;
@@ -617,7 +679,7 @@ static void close_all_tabs(void)
 {
 	for (u32 gi = app.ngroups; gi-- > 0;)
 		for (u32 t = app.groups[gi].nt; t-- > 0;)
-			if (!doc_unsaved(app.groups[gi].tab[t]->doc) || app.docs.refs[app.groups[gi].tab[t]->doc] > 1)
+			if (!doc_unsaved(gview(&app.groups[gi], t)->doc) || app.docs.refs[gview(&app.groups[gi], t)->doc] > 1)
 				close_tab(gi, t);
 	/* what is left was chosen to be discarded, or could not be saved */
 }
@@ -665,8 +727,8 @@ void close_tab_safe(u32 gi, u32 t)
 	Group *g = &app.groups[gi];
 	if (t >= g->nt)
 		return;
-	u32 d = g->tab[t]->doc;
-	if (g->tab[t]->diff_left == UINT32_MAX && doc_unsaved(d) && app.docs.refs[d] == 1) {
+	u32 d = gview(g, t)->doc;
+	if (gview(g, t)->diff_left == UINT32_MAX && doc_unsaved(d) && app.docs.refs[d] == 1) {
 		activate_tab(gi, t);
 		ask_save_one(DLG_CLOSE_TAB, d);
 		return;
@@ -679,13 +741,13 @@ void close_tab(u32 gi, u32 t)
 	Group *g = &app.groups[gi];
 	if (t >= g->nt)
 		return;
-	View *v = g->tab[t];
+	View *v = gview(g, t);
 	u32 d = v->doc;
 	if (v->diff_left != UINT32_MAX)
 		diff_view_closed(v);
 	binview_closed(v);
-	free(v);
-	memmove(g->tab + t, g->tab + t + 1, (g->nt - t - 1) * sizeof(View *));
+	view_free(v);
+	memmove(g->tab + t, g->tab + t + 1, (g->nt - t - 1) * sizeof(u32));
 	/* fix MRU: drop t, shift indices above it */
 	u32 k = 0;
 	for (u32 i = 0; i < g->nt; i++) {
@@ -750,24 +812,22 @@ static u32 show_doc(u32 d, bool preview)
 		app.side_view = SIDE_EXPLORER; /* opening a file leaves Manpages / Settings */
 	Group *g = &app.groups[app.active_group];
 	for (u32 t = 0; t < g->nt; t++)
-		if (g->tab[t]->doc == d && g->tab[t]->diff_left == UINT32_MAX) {
+		if (gview(g, t)->doc == d && gview(g, t)->diff_left == UINT32_MAX) {
 			if (!preview)
-				g->tab[t]->preview = false;
+				gview(g, t)->preview = false;
 			activate_tab(app.active_group, t);
 			return t;
 		}
 	/* a preview tab is replaced by the next preview */
 	if (preview)
 		for (u32 t = 0; t < g->nt; t++)
-			if (g->tab[t]->preview && !text_dirty(&app.docs.text[g->tab[t]->doc])) {
-				View *v = g->tab[t];
-				binview_closed(v);
-				doc_release(v->doc);
-				memset(v, 0, sizeof *v);
-				v->diff_left = UINT32_MAX;
-				v->doc = d;
-				v->nc = 1;
-				v->want_x[0] = -1;
+			if (gview(g, t)->preview && !text_dirty(&app.docs.text[gview(g, t)->doc])) {
+				View *old = gview(g, t);
+				binview_closed(old);
+				doc_release(old->doc);
+				view_free(old);
+				View *v = view_new(d); /* takes the tab's place */
+				g->tab[t] = view_id(v);
 				v->preview = true;
 				app.docs.refs[d]++;
 				if (app.docs.bin[d])
@@ -777,22 +837,18 @@ static u32 show_doc(u32 d, bool preview)
 			}
 	if (g->nt == MAX_TABS)
 		close_tab(app.active_group, g->mru[g->nt - 1]);
-	View *v = vx_alloc(sizeof *v);
-	v->diff_left = UINT32_MAX;
-	v->doc = d;
-	v->nc = 1;
-	v->want_x[0] = -1;
+	View *v = view_new(d);
 	v->preview = preview;
 	app.docs.refs[d]++;
 	if (app.docs.bin[d])
 		binview_init(v);
 	/* VSCodium opens new tabs to the right of the active one */
 	u32 at = g->nt ? g->active + 1 : 0;
-	memmove(g->tab + at + 1, g->tab + at, (g->nt - at) * sizeof(View *));
+	memmove(g->tab + at + 1, g->tab + at, (g->nt - at) * sizeof(u32));
 	for (u32 i = 0; i < g->nt; i++)
 		if (g->mru[i] >= at)
 			g->mru[i]++;
-	g->tab[at] = v;
+	g->tab[at] = view_id(v);
 	g->mru[g->nt] = at;
 	g->nt++;
 	activate_tab(app.active_group, at);
@@ -804,8 +860,8 @@ View *show_view_diff(u32 d, u32 left, u8 kind, const char *rel)
 {
 	Group *g = &app.groups[app.active_group];
 	for (u32 t = 0; t < g->nt; t++) {
-		View *o = g->tab[t];
-		if (o->doc == d && o->diff_left != UINT32_MAX && o->diff_kind == kind && !strcmp(o->diff_rel, rel)) {
+		View *o = gview(g, t);
+		if (o->doc == d && o->diff_left != UINT32_MAX && o->diff_kind == kind && !strcmp(view_rel(o), rel)) {
 			/* already open: drop the new original, keep the tab */
 			if (app.docs.refs[left] == 0)
 				doc_release_unref(left);
@@ -816,21 +872,18 @@ View *show_view_diff(u32 d, u32 left, u8 kind, const char *rel)
 	}
 	if (g->nt == MAX_TABS)
 		close_tab(app.active_group, g->mru[g->nt - 1]);
-	View *v = vx_alloc(sizeof *v);
-	v->doc = d;
-	v->nc = 1;
-	v->want_x[0] = -1;
+	View *v = view_new(d);
 	v->diff_left = left;
 	v->diff_kind = kind;
-	snprintf(v->diff_rel, sizeof v->diff_rel, "%s", rel);
+	view_set_rel(v, rel);
 	app.docs.refs[d]++;
 	app.docs.refs[left]++;
 	u32 at = g->nt ? g->active + 1 : 0;
-	memmove(g->tab + at + 1, g->tab + at, (g->nt - at) * sizeof(View *));
+	memmove(g->tab + at + 1, g->tab + at, (g->nt - at) * sizeof(u32));
 	for (u32 i = 0; i < g->nt; i++)
 		if (g->mru[i] >= at)
 			g->mru[i]++;
-	g->tab[at] = v;
+	g->tab[at] = view_id(v);
 	g->mru[g->nt] = at;
 	g->nt++;
 	activate_tab(app.active_group, at);
@@ -1377,7 +1430,7 @@ static void quick_update(void)
 			Group *g = &app.groups[app.active_group];
 			quick_reserve(g->nt + 1);
 			for (u32 i = 0; i < g->nt; i++) {
-				app.quick_items[app.quick_n] = 0x80000000u | g->tab[g->mru[i]]->doc;
+				app.quick_items[app.quick_n] = 0x80000000u | gview(g, g->mru[i])->doc;
 				app.quick_mask[app.quick_n] = 0;
 				app.quick_n++;
 			}
@@ -2028,7 +2081,7 @@ void run_command(int cmd)
 	case CMD_REVERT_AND_CLOSE: {
 		Group *g = &app.groups[app.active_group];
 		if (g->nt) {
-			u32 d = g->tab[g->active]->doc;
+			u32 d = gview(g, g->active)->doc;
 			if (app.docs.refs[d] == 1)
 				app.docs.text[d].saved_upos = app.docs.text[d].upos; /* nothing to keep */
 			close_tab(app.active_group, g->active);
@@ -2577,7 +2630,7 @@ static void context_click(int mx, int my)
 			continue;
 		if (my < g->y + group_tabs_h(g)) {
 			for (u32 t = 0; t < g->nt; t++) {
-				int w = tab_width(g->tab[t]);
+				int w = tab_width(gview(g, t));
 				int x, ty;
 				tab_layout(g, t, &x, &ty);
 				if (mx >= x && mx < x + w && my >= ty && my < ty + app.tabs_h) {
@@ -2591,7 +2644,7 @@ static void context_click(int mx, int my)
 			return;
 		app.active_group = gi;
 		app.focus = FOCUS_EDITOR;
-		View *v = g->tab[g->active];
+		View *v = gview(g, g->active);
 		if (app.docs.bin[v->doc] && v->diff_left == UINT32_MAX) {
 			binview_context(v, mx, my);
 			return;
@@ -2642,7 +2695,7 @@ static int cursor_at(int mx, int my, int mods)
 		int ey = g->y + group_head_h(g);
 		if (my < ey)
 			return CURSOR_ARROW;
-		View *v = g->tab[g->active];
+		View *v = gview(g, g->active);
 		return ed_cursor_shape(v, mx, my, g->x, ey, g->w, g->h - group_head_h(g), mods);
 	}
 	return CURSOR_ARROW;
@@ -2999,7 +3052,7 @@ void ui_event(const Event *e)
 			if (app.focus != FOCUS_FIND)
 				app.focus = FOCUS_EDITOR;
 		}
-		View *v = g->tab[g->active];
+		View *v = gview(g, g->active);
 		if (e->type == EV_MDOWN && e->button == 1 && app.docs.man[v->doc] && v->diff_left == UINT32_MAX &&
 		    !key_mods(e->mods)) {
 			/* man pages: a click on name(sec) opens it, like info */
@@ -3109,7 +3162,7 @@ static int tab_layout(Group *g, u32 want, int *ox, int *oy)
 {
 	int x = g->x, row = 0;
 	for (u32 t = 0; t < g->nt; t++) {
-		int w = tab_width(g->tab[t]);
+		int w = tab_width(gview(g, t));
 		if (x + w > g->x + g->w && x > g->x) {
 			x = g->x;
 			row++;
@@ -3133,7 +3186,7 @@ int group_tabs_h(Group *g)
 {
 	int ox, oy;
 	int rows = g->nt ? tab_layout(g, g->nt, &ox, &oy) : 1;
-	View *v = g->nt ? g->tab[g->active] : NULL;
+	View *v = g->nt ? gview(g, g->active) : NULL;
 	return rows * app.tabs_h + (v && v->nparts > 1 ? view_subtabs_height(v, g->w) : 0);
 }
 
@@ -3144,7 +3197,7 @@ static bool tabs_mouse(Group *g, u32 gi, const Event *e)
 {
 	if (e->type != EV_MDOWN)
 		return false;
-	View *av = g->nt ? g->tab[g->active] : NULL;
+	View *av = g->nt ? gview(g, g->active) : NULL;
 	int ox, oy;
 	int rows = g->nt ? tab_layout(g, g->nt, &ox, &oy) : 1;
 	if (av && av->nparts > 1 && e->y >= g->y + rows * app.tabs_h) {
@@ -3152,7 +3205,7 @@ static bool tabs_mouse(Group *g, u32 gi, const Event *e)
 		return true;
 	}
 	for (u32 t = 0; t < g->nt; t++) {
-		int w = tab_width(g->tab[t]);
+		int w = tab_width(gview(g, t));
 		int x, ty;
 		tab_layout(g, t, &x, &ty);
 		if (e->x >= x && e->x < x + w && e->y >= ty && e->y < ty + app.tabs_h) {
@@ -3163,7 +3216,7 @@ static bool tabs_mouse(Group *g, u32 gi, const Event *e)
 				activate_tab(gi, t);
 				app.focus = FOCUS_EDITOR;
 				if (e->clicks >= 2)
-					g->tab[t]->preview = false;
+					gview(g, t)->preview = false;
 			}
 			return true;
 		}
@@ -3262,7 +3315,7 @@ static void draw_tabs(Group *g, u32 gi)
 	draw_clip(g->x, g->y, g->w, area);
 	bool group_active = gi == app.active_group;
 	for (u32 t = 0; t < g->nt; t++) {
-		View *v = g->tab[t];
+		View *v = gview(g, t);
 		int w = tab_width(v);
 		int x, y;
 		tab_layout(g, t, &x, &y);
@@ -3282,7 +3335,7 @@ static void draw_tabs(Group *g, u32 gi)
 			         text_dirty(&app.docs.text[v->doc]) && !app.docs.readonly[v->doc] ? " - unsaved changes" : "");
 			ui_tip(x, y, w, app.tabs_h, tt);
 		}
-		const char *iname = v->diff_left != UINT32_MAX ? v->diff_rel : app.docs.rel[v->doc];
+		const char *iname = v->diff_left != UINT32_MAX ? view_rel(v) : app.docs.rel[v->doc];
 		const char *isl = strrchr(iname, '/');
 		int tx = file_icon_draw(isl ? isl + 1 : iname, x + PX(10), y, app.tabs_h);
 		char letter;
@@ -3314,14 +3367,14 @@ static void draw_tabs(Group *g, u32 gi)
 			draw_icon(ICON_CLOSE, cx, cy, active ? COL(C_TAB_ACTIVE_FG) : COL(C_TAB_INACTIVE_FG));
 	}
 	draw_noclip();
-	View *av = g->nt ? g->tab[g->active] : NULL;
+	View *av = g->nt ? gview(g, g->active) : NULL;
 	if (av && av->nparts > 1)
 		view_subtabs_draw(av, g->x, g->y + area, g->w, view_subtabs_height(av, g->w));
 }
 
 static void draw_breadcrumbs(Group *g)
 {
-	View *v = g->nt ? g->tab[g->active] : NULL;
+	View *v = g->nt ? gview(g, g->active) : NULL;
 	int y = g->y + group_tabs_h(g);
 	draw_rect(g->x, y, g->w, app.crumbs_h, COL(C_EDITOR_BG));
 	if (!v)
@@ -3397,7 +3450,7 @@ static void draw_group(Group *g, u32 gi)
 		}
 		return;
 	}
-	View *v = g->tab[g->active];
+	View *v = gview(g, g->active);
 	ed_draw(g, v, g->x, y, g->w, h, gi == app.active_group && app.focus == FOCUS_EDITOR);
 }
 
@@ -3821,14 +3874,8 @@ static void take_diags(const LspEvent *ev)
 	const LspDiags *g = ev->diags;
 	u32 n = g->count;
 	if (n > D->dcap[d]) {
-		u32 c = n;
-		D->d_line0[d] = vx_realloc(D->d_line0[d], c * sizeof(u32));
-		D->d_col0[d] = vx_realloc(D->d_col0[d], c * sizeof(u32));
-		D->d_line1[d] = vx_realloc(D->d_line1[d], c * sizeof(u32));
-		D->d_col1[d] = vx_realloc(D->d_col1[d], c * sizeof(u32));
-		D->d_sev[d] = vx_realloc(D->d_sev[d], c);
-		D->d_msg[d] = vx_realloc(D->d_msg[d], c * sizeof(u32));
-		D->dcap[d] = c;
+		SoaCol c[] = {DIAG_COLS(D, d)};
+		soa_grow(c, 6, &D->dcap[d], n, 0); /* all rows are rewritten */
 	}
 	pool_clear(&D->d_pool[d]);
 	for (u32 i = 0; i < n; i++) {
@@ -3864,11 +3911,8 @@ static void take_semantic(const LspEvent *ev)
 	const LspSemantic *s = ev->semantic;
 	u32 n = s->count;
 	if (n > D->scap[d]) {
-		D->s_line[d] = vx_realloc(D->s_line[d], n * sizeof(u32));
-		D->s_col[d] = vx_realloc(D->s_col[d], n * sizeof(u32));
-		D->s_len[d] = vx_realloc(D->s_len[d], n * sizeof(u32));
-		D->s_cls[d] = vx_realloc(D->s_cls[d], n);
-		D->scap[d] = n;
+		SoaCol c[] = {SEM_COLS(D, d)};
+		soa_grow(c, 4, &D->scap[d], n, 0);
 	}
 	memcpy(D->s_line[d], s->line, n * sizeof(u32));
 	memcpy(D->s_col[d], s->col, n * sizeof(u32));
@@ -4302,13 +4346,15 @@ bool ui_init(const char *root, int w, int h, int scale, bool headless)
 	app.ngroups = 1;
 	app.compl_req = app.hover_req = app.def_req = -1;
 	app.hover_pending_off = -1;
+	{ extern void heap_report(const char *); if (getenv("VXIDE_HEAPPROBE")) heap_report("before-font"); }
 	if (!font_init(PX(13), PX(14), PX(19), PX(11)))
 		return false;
 	app.line_h = font_m[FONT_MONO].line;
 	app.char_w = font_m[FONT_MONO].adv;
+	{ extern void heap_report(const char *); if (getenv("VXIDE_HEAPPROBE")) heap_report("after-font"); }
 	icons_init();
+	{ extern void heap_report(const char *); if (getenv("VXIDE_HEAPPROBE")) heap_report("after-icons"); }
 	font_atlas_was_reset(); /* pins the icon rows */
-	gpu_set_atlas(font_atlas);
 	fs_init(&app.tree, root);
 	app.tree_sel = FS_NONE;
 	/* nothing waits on the disk at start-up: the first git status runs on

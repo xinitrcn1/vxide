@@ -130,6 +130,10 @@ static u32 name_at(BinImage *img, const Rd *r, u64 off, u64 max)
 
 /* ---- image tables --------------------------------------------------------------------- */
 
+/* the coalesced tables' columns (8-byte ones first: no padding) */
+#define SEC_COLS(m) SOA((m)->s_off), SOA((m)->s_size), SOA((m)->s_addr), SOA((m)->s_name), SOA((m)->s_flags)
+#define SYM_COLS(m) SOA((m)->y_addr), SOA((m)->y_size), SOA((m)->y_name), SOA((m)->y_func)
+
 static void add_section(BinImage *img, u32 name, u64 off, u64 size, u64 addr, u32 flags, size_t file_n)
 {
 	if (off >= file_n || !size)
@@ -137,13 +141,8 @@ static void add_section(BinImage *img, u32 name, u64 off, u64 size, u64 addr, u3
 	if (size > file_n - off)
 		size = file_n - off; /* clip to the file */
 	if (img->ns == img->ns_cap) {
-		u32 c = img->ns_cap ? img->ns_cap * 2 : 32;
-		img->s_name = vx_realloc(img->s_name, c * sizeof(u32));
-		img->s_off = vx_realloc(img->s_off, c * sizeof(u64));
-		img->s_size = vx_realloc(img->s_size, c * sizeof(u64));
-		img->s_addr = vx_realloc(img->s_addr, c * sizeof(u64));
-		img->s_flags = vx_realloc(img->s_flags, c * sizeof(u32));
-		img->ns_cap = c;
+		SoaCol c[] = {SEC_COLS(img)};
+		soa_grow(c, 5, &img->ns_cap, img->ns + 1, img->ns);
 	}
 	u32 i = img->ns++;
 	img->s_name[i] = name;
@@ -158,12 +157,8 @@ static void add_symbol(BinImage *img, u32 name, u64 addr, u64 size, bool func)
 	if (img->nsym >= (8u << 20))
 		return;
 	if (img->nsym == img->sym_cap) {
-		u32 c = img->sym_cap ? img->sym_cap * 2 : 256;
-		img->y_name = vx_realloc(img->y_name, c * sizeof(u32));
-		img->y_addr = vx_realloc(img->y_addr, c * sizeof(u64));
-		img->y_size = vx_realloc(img->y_size, c * sizeof(u64));
-		img->y_func = vx_realloc(img->y_func, c);
-		img->sym_cap = c;
+		SoaCol c[] = {SYM_COLS(img)};
+		soa_grow(c, 4, &img->sym_cap, img->nsym + 1, img->nsym);
 	}
 	u32 i = img->nsym++;
 	img->y_name[i] = name;
@@ -195,9 +190,13 @@ static void sort_symbols(BinImage *img)
 		perm[i] = i;
 	g_sort = img;
 	qsort(perm, n, sizeof(u32), sym_cmp);
-	u32 *nn = vx_alloc(n * sizeof(u32));
-	u64 *na = vx_alloc(n * sizeof(u64)), *ns = vx_alloc(n * sizeof(u64));
-	u8 *nf = vx_alloc(n);
+	/* the sorted table is built in a new block, then replaces the old one */
+	BinImage t = {0};
+	SoaCol tc[] = {SYM_COLS(&t)};
+	soa_grow(tc, 4, &t.sym_cap, n, 0);
+	u32 *nn = t.y_name;
+	u64 *na = t.y_addr, *ns = t.y_size;
+	u8 *nf = t.y_func;
 	u32 k = 0;
 	for (u32 i = 0; i < n; i++) {
 		u32 p = perm[i];
@@ -210,30 +209,24 @@ static void sort_symbols(BinImage *img)
 		nf[k] = img->y_func[p];
 		k++;
 	}
-	free(img->y_name);
-	free(img->y_addr);
-	free(img->y_size);
-	free(img->y_func);
+	SoaCol oc[] = {SYM_COLS(img)};
+	soa_free(oc, 4);
 	img->y_name = nn;
 	img->y_addr = na;
 	img->y_size = ns;
 	img->y_func = nf;
 	img->nsym = k;
-	img->sym_cap = n;
+	img->sym_cap = t.sym_cap;
+	SoaCol fc[] = {SYM_COLS(img)};
+	soa_fit(fc, 4, &img->sym_cap, k); /* duplicates gone: no slack */
 	free(perm);
 }
 
 void bin_free(BinImage *img)
 {
-	free(img->s_name);
-	free(img->s_off);
-	free(img->s_size);
-	free(img->s_addr);
-	free(img->s_flags);
-	free(img->y_name);
-	free(img->y_addr);
-	free(img->y_size);
-	free(img->y_func);
+	SoaCol sc[] = {SEC_COLS(img)}, yc[] = {SYM_COLS(img)};
+	soa_free(sc, 5);
+	soa_free(yc, 4);
 	pool_free(&img->pool);
 	memset(img, 0, sizeof *img);
 }
@@ -736,47 +729,29 @@ int bin_parse(const u8 *d, size_t n, BinImage *img)
 
 /* ---- disassembly -------------------------------------------------------------------------- */
 
-static void row_add(BinDisasm *o, u8 kind, u64 addr, u64 off, u8 len, const char *t1, const char *t2, u64 target)
+static void row_add(BinDisasm *o, u8 kind, u32 rel, u8 len)
 {
 	if (o->n == o->cap) {
-		u32 c = o->cap ? o->cap * 2 : 4096;
-		o->kind = vx_realloc(o->kind, c);
-		o->addr = vx_realloc(o->addr, c * sizeof(u64));
-		o->off = vx_realloc(o->off, c * sizeof(u64));
-		o->len = vx_realloc(o->len, c);
-		o->text = vx_realloc(o->text, c * sizeof(u32));
-		o->target = vx_realloc(o->target, c * sizeof(u64));
-		o->cap = c;
+		SoaCol c[] = {SOA(o->rel), SOA(o->kl)};
+		soa_grow(c, 2, &o->cap, o->n + 1, o->n);
 	}
 	u32 i = o->n++;
-	o->kind[i] = kind;
-	o->addr[i] = addr;
-	o->off[i] = off;
-	o->len[i] = len;
-	o->target[i] = target;
-	/* "mnemonic operands" without a temporary buffer */
-	u32 l1 = (u32)strlen(t1), l2 = t2 ? (u32)strlen(t2) : 0;
-	VX_GROW(o->pool.b, o->pool.cap, o->pool.n + l1 + l2 + 2);
-	o->text[i] = o->pool.n;
-	memcpy(o->pool.b + o->pool.n, t1, l1);
-	o->pool.n += l1;
-	if (l2) {
-		o->pool.b[o->pool.n++] = ' ';
-		memcpy(o->pool.b + o->pool.n, t2, l2);
-		o->pool.n += l2;
-	}
-	o->pool.b[o->pool.n++] = 0;
+	o->rel[i] = rel;
+	o->kl[i] = (u8)(kind << 4 | (len & 15));
 }
 
 void bin_disasm_free(BinDisasm *d)
 {
-	free(d->kind);
-	free(d->addr);
-	free(d->off);
-	free(d->len);
-	free(d->text);
-	free(d->target);
-	pool_free(&d->pool);
+	SoaCol c[] = {SOA(d->rel), SOA(d->kl)};
+	soa_free(c, 2);
+	if (d->cs) {
+		csh h = (csh)d->cs;
+		cs_close(&h);
+	}
+	if (d->csd) {
+		csh h = (csh)d->csd;
+		cs_close(&h);
+	}
 	memset(d, 0, sizeof *d);
 }
 
@@ -882,7 +857,8 @@ typedef struct {
 	cs_mode mode;
 	const u8 *data;
 	u64 off, addr, size;
-	u64 sec_end; /* labels only inside the section */
+	u64 sec_end;  /* labels only inside the section */
+	u64 sec_base; /* rows are relative to it */
 	BinDisasm out;
 	int rc;
 } Chunk;
@@ -892,27 +868,15 @@ static void disasm_chunk(Chunk *c)
 	const BinImage *img = c->img;
 	BinDisasm *o = &c->out;
 	memset(o, 0, sizeof *o);
-	csh h, hd;
+	csh h;
 	if (cs_open(c->arch, c->mode, &h) != CS_ERR_OK) {
 		snprintf(o->err, sizeof o->err, "capstone does not support %s here", img->arch_name);
 		c->rc = -1;
 		return;
 	}
-	if (cs_open(c->arch, c->mode, &hd) != CS_ERR_OK) {
-		cs_close(&h);
-		snprintf(o->err, sizeof o->err, "capstone does not support %s here", img->arch_name);
-		c->rc = -1;
-		return;
-	}
-	/* the main pass runs without detail; instructions whose mnemonic can be
-	 * a branch are decoded again with detail on for their target */
-	if (c->arch == CS_ARCH_X86) {
-		cs_option(h, CS_OPT_SYNTAX, CS_OPT_SYNTAX_INTEL);
-		cs_option(hd, CS_OPT_SYNTAX, CS_OPT_SYNTAX_INTEL);
-	}
-	cs_option(hd, CS_OPT_DETAIL, CS_OPT_ON);
+	/* only where instructions are: no detail, no text kept */
 	cs_option(h, CS_OPT_SKIPDATA, CS_OPT_ON);
-	cs_insn *in = cs_malloc(h), *ind = cs_malloc(hd);
+	cs_insn *in = cs_malloc(h);
 	const u8 *code = c->data + c->off;
 	size_t left = (size_t)c->size;
 	u64 addr = c->addr, a = addr, end = addr + c->size;
@@ -931,26 +895,14 @@ static void disasm_chunk(Chunk *c)
 		if (!cs_disasm_iter(h, &code, &left, &a, in))
 			break;
 		while (si < img->nsym && img->y_addr[si] <= here && img->y_addr[si] < end) {
-			row_add(o, BR_LABEL, img->y_addr[si], c->off + (img->y_addr[si] - addr), 0,
-			        img->pool.b + img->y_name[si], NULL, UINT64_MAX);
+			row_add(o, BR_LABEL, si, 0); /* labels keep their symbol index */
 			si++;
 		}
 		bool data_row = in->id == 0; /* SKIPDATA ".byte" */
-		u64 tgt = UINT64_MAX;
-		if (!data_row && maybe_branch(img->arch, in->mnemonic)) {
-			const u8 *ip = c->data + c->off + (in->address - addr);
-			size_t il = in->size;
-			u64 ia = in->address;
-			if (cs_disasm_iter(hd, &ip, &il, &ia, ind))
-				tgt = branch_target(hd, img->arch, ind);
-		}
-		row_add(o, data_row ? BR_DATA : BR_INSN, in->address, c->off + (in->address - addr), (u8)in->size,
-		        in->mnemonic, in->op_str[0] ? in->op_str : NULL, tgt);
+		row_add(o, data_row ? BR_DATA : BR_INSN, (u32)(in->address - c->sec_base), (u8)in->size);
 	}
 	cs_free(in, 1);
-	cs_free(ind, 1);
 	cs_close(&h);
-	cs_close(&hd);
 	c->rc = 0;
 }
 
@@ -960,35 +912,14 @@ static void *chunk_main(void *arg)
 	return NULL;
 }
 
-/* Append chunk output to o (rows in order, text pool rebased). */
+/* Append chunk output to o (rows in order; both are relative to the section). */
 static void merge(BinDisasm *o, BinDisasm *c)
 {
-	u32 need = o->n + c->n;
-	if (need > o->cap) {
-		u32 cap = o->cap ? o->cap : 4096;
-		while (cap < need)
-			cap *= 2;
-		o->kind = vx_realloc(o->kind, cap);
-		o->addr = vx_realloc(o->addr, cap * sizeof(u64));
-		o->off = vx_realloc(o->off, cap * sizeof(u64));
-		o->len = vx_realloc(o->len, cap);
-		o->text = vx_realloc(o->text, cap * sizeof(u32));
-		o->target = vx_realloc(o->target, cap * sizeof(u64));
-		o->cap = cap;
-	}
-	u32 base = o->pool.n;
-	VX_GROW(o->pool.b, o->pool.cap, o->pool.n + c->pool.n + 1);
-	if (c->pool.n)
-		memcpy(o->pool.b + o->pool.n, c->pool.b, c->pool.n);
-	o->pool.n += c->pool.n;
+	SoaCol cols[] = {SOA(o->rel), SOA(o->kl)};
+	soa_grow(cols, 2, &o->cap, o->n + c->n, o->n);
 	if (c->n) {
-		memcpy(o->kind + o->n, c->kind, c->n);
-		memcpy(o->addr + o->n, c->addr, c->n * sizeof(u64));
-		memcpy(o->off + o->n, c->off, c->n * sizeof(u64));
-		memcpy(o->len + o->n, c->len, c->n);
-		memcpy(o->target + o->n, c->target, c->n * sizeof(u64));
-		for (u32 i = 0; i < c->n; i++)
-			o->text[o->n + i] = c->text[i] + base;
+		memcpy(o->rel + o->n, c->rel, c->n * sizeof(u32));
+		memcpy(o->kl + o->n, c->kl, c->n);
 	}
 	o->n += c->n;
 }
@@ -1059,6 +990,7 @@ int bin_disasm(const BinImage *img, u32 sec, const u8 *data, size_t n, BinDisasm
 		ch[i].addr = addr + cut[i];
 		ch[i].size = cut[i + 1] - cut[i];
 		ch[i].sec_end = addr + size;
+		ch[i].sec_base = addr;
 	}
 	if (nc == 1) {
 		disasm_chunk(&ch[0]);
@@ -1093,7 +1025,71 @@ int bin_disasm(const BinImage *img, u32 sec, const u8 *data, size_t n, BinDisasm
 		}
 	}
 	free(ch);
+	o->sec = sec;
+	o->base = addr;
+	o->base_off = off;
+	/* the rows are final: drop the doubling slack */
+	SoaCol cols[] = {SOA(o->rel), SOA(o->kl)};
+	soa_fit(cols, 2, &o->cap, o->n);
 	return rc;
+}
+
+void bin_row_text(const BinImage *img, BinDisasm *d, const u8 *data, size_t n, u32 r, char *buf, size_t cap,
+                  u64 *target)
+{
+	if (target)
+		*target = UINT64_MAX;
+	buf[0] = 0;
+	if (r >= d->n)
+		return;
+	u32 kind = bin_row_kind(d, r), len = bin_row_len(d, r);
+	if (kind == BR_LABEL) {
+		snprintf(buf, cap, "%s", bin_str(img, img->y_name[d->rel[r]]));
+		return;
+	}
+	u64 off = bin_row_off(d, r);
+	if (off + len > n)
+		return;
+	const u8 *code = data + off;
+	if (kind == BR_DATA) {
+		size_t k = (size_t)snprintf(buf, cap, ".byte");
+		for (u32 i = 0; i < len && k < cap; i++)
+			k += (size_t)snprintf(buf + k, cap - k, "%s0x%02x", i ? ", " : " ", code[i]);
+		return;
+	}
+	if (!d->cs) {
+		cs_arch arch;
+		cs_mode mode;
+		char err[64];
+		csh h, hd;
+		if (!cs_arch_mode(img, d->sec, &arch, &mode, err, sizeof err) || cs_open(arch, mode, &h) != CS_ERR_OK)
+			return;
+		if (cs_open(arch, mode, &hd) != CS_ERR_OK) {
+			cs_close(&h);
+			return;
+		}
+		if (arch == CS_ARCH_X86) {
+			cs_option(h, CS_OPT_SYNTAX, CS_OPT_SYNTAX_INTEL);
+			cs_option(hd, CS_OPT_SYNTAX, CS_OPT_SYNTAX_INTEL);
+		}
+		cs_option(hd, CS_OPT_DETAIL, CS_OPT_ON);
+		d->cs = (size_t)h;
+		d->csd = (size_t)hd;
+	}
+	cs_insn *in;
+	u64 addr = d->base + d->rel[r];
+	size_t got = cs_disasm((csh)d->cs, code, len, addr, 1, &in);
+	if (!got)
+		return;
+	snprintf(buf, cap, "%s%s%s", in[0].mnemonic, in[0].op_str[0] ? " " : "", in[0].op_str);
+	if (target && maybe_branch(img->arch, in[0].mnemonic)) {
+		cs_insn *id;
+		if (cs_disasm((csh)d->csd, code, len, addr, 1, &id)) {
+			*target = branch_target((csh)d->csd, img->arch, &id[0]);
+			cs_free(id, 1);
+		}
+	}
+	cs_free(in, 1);
 }
 
 /* ---- data inspector -------------------------------------------------------------------- */

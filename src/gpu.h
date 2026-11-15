@@ -25,7 +25,15 @@ void gpu_shutdown(void);
 void gpu_resize(int w, int h);
 /* The CPU atlas (ATLAS_SIZE^2 bytes, R8). Mark changed rects; the next
  * frame uploads their union. */
-void gpu_set_atlas(const u8 *pixels);
+/* The glyph atlas pixels (ATLAS_SIZE^2, R8): the persistently mapped
+ * staging buffer itself, so there is no second copy on the heap. Write
+ * glyphs here, then mark the rect with gpu_atlas_dirty. */
+u8 *gpu_atlas_pixels(void);
+bool gpu_atlas_ready(void);
+/* Where the next frame's quads go: that frame's mapped instance buffer
+ * (waits until the GPU is done with it). draw.c writes there directly, so
+ * there is no CPU quad list and no per-frame copy. */
+Quad *gpu_frame_quads(u32 *cap);
 void gpu_atlas_dirty(int x, int y, int w, int h);
 /* Background image (RGBA8, straight alpha), NULL to clear; copied. */
 void gpu_set_background(const u8 *rgba, int w, int h);

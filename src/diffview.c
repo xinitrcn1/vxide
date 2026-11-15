@@ -244,8 +244,8 @@ static void refresh_index_sides(const char *rel)
 {
 	for (u32 gi = 0; gi < app.ngroups; gi++)
 		for (u32 t = 0; t < app.groups[gi].nt; t++) {
-			View *v = app.groups[gi].tab[t];
-			if (v->diff_left == NONE || strcmp(v->diff_rel, rel))
+			View *v = gview(&app.groups[gi], t);
+			if (v->diff_left == NONE || strcmp(view_rel(v), rel))
 				continue;
 			u32 d = v->diff_kind == DIFF_WORKTREE ? v->diff_left : v->diff_kind == DIFF_STAGED ? v->doc : NONE;
 			if (d == NONE)
@@ -431,16 +431,17 @@ static void doc_set_text_minimal(u32 d, const char *s, size_t n)
 	doc_replace(d, p, on - p - q, s + p, (u32)(n - p - q), ed_new_group());
 }
 
-static const char *view_rel(View *v)
+/* the repository path a view stands for: the diffed path, else its file's */
+static const char *repo_rel_of(View *v)
 {
 	if (v->diff_left != NONE)
-		return v->diff_rel;
+		return view_rel(v);
 	return doc_repo_rel(v->doc);
 }
 
 static void stage_lines(View *v, u32 *lo, u32 *hi, u32 n, int what)
 {
-	const char *rel = view_rel(v);
+	const char *rel = repo_rel_of(v);
 	if (!rel || !app.git || !n)
 		return;
 	char relc[1024];
@@ -686,7 +687,7 @@ bool diff_command(View *v, int cmd)
 		return true;
 	}
 	case CMD_GIT_MARK_RESOLVED: {
-		const char *rel = app.ctx == CTX_SCM_FILE ? app.ctx_path : v ? view_rel(v) : NULL;
+		const char *rel = app.ctx == CTX_SCM_FILE ? app.ctx_path : v ? repo_rel_of(v) : NULL;
 		app.ctx = CTX_NONE;
 		if (!rel || !app.git)
 			return true;

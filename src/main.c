@@ -120,6 +120,28 @@ static bool translate(const SDL_Event *s, Event *e)
 
 static void send(const Event *e) { ui_event(e); }
 
+#if defined(__FreeBSD__)
+#include <malloc_np.h>
+#endif
+
+void heap_report(const char *label)
+{
+#if defined(__FreeBSD__)
+	u64 epoch = 1;
+	size_t sz = sizeof epoch;
+	mallctl("epoch", &epoch, &sz, &epoch, sz);
+	size_t alloc = 0, resident = 0, n = sizeof alloc;
+	mallctl("stats.allocated", &alloc, &n, NULL, 0);
+	n = sizeof resident;
+	mallctl("stats.resident", &resident, &n, NULL, 0);
+	fprintf(stderr, "heap %-18s allocated %8.2f MB  resident %8.2f MB  (App %zu KB static)\n", label,
+	        (double)alloc / 1048576.0, (double)resident / 1048576.0, sizeof app / 1024);
+	heap_trace_report(18);
+#else
+	fprintf(stderr, "heap %s: no allocator statistics on this platform\n", label);
+#endif
+}
+
 static void pump_for(u64 ms)
 {
 	u64 end = vx_now_ns() + ms * 1000000ull;
@@ -308,6 +330,9 @@ static int run_script(const char *path)
 			e.y = y;
 			e.wy = dy;
 			send(&e);
+		} else if (!strcmp(s, "heap")) {
+			/* heap use at this point of a script (jemalloc counters) */
+			heap_report(arg);
 		} else if (!strcmp(s, "wait")) {
 			pump_for((u64)atoi(arg));
 		} else if (!strcmp(s, "waitlsp")) {
@@ -449,10 +474,12 @@ int main(int argc, char **argv)
 	}
 	if (!scale)
 		scale = 1;
+	if (getenv("VXIDE_HEAPPROBE")) heap_report("before-gpu");
 	if (!gpu_init(win, w, h)) {
 		fprintf(stderr, "vxide: Vulkan initialisation failed\n");
 		return 1;
 	}
+	if (getenv("VXIDE_HEAPPROBE")) heap_report("after-gpu");
 	if (!ui_init(root, w, h, scale, headless)) {
 		fprintf(stderr, "vxide: UI initialisation failed (fonts?)\n");
 		return 1;

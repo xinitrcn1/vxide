@@ -357,6 +357,7 @@ static void box_apply(View *v)
 		int end = x_of(t, l, text_line_start(t, l) + text_line_len(t, l));
 		if (end < VX_MIN(box.ax, box.hx) && box.ax != box.hx && l != box.hl)
 			continue;
+		view_reserve(v, v->nc + 1);
 		u32 k = v->nc++;
 		v->anchor[k] = off_at_x(t, l, box.ax);
 		v->head[k] = off_at_x(t, l, box.hx);
@@ -1006,6 +1007,7 @@ static void add_cursor_vert(View *v, int dir)
 	int x = v->want_x[c] >= 0 ? v->want_x[c] : x_of(t, l, v->head[c]);
 	u32 nl = dir < 0 ? l - 1 : l + 1;
 	u32 off = off_at_x(t, nl, x);
+	view_reserve(v, v->nc + 1);
 	u32 k = v->nc++;
 	v->head[k] = v->anchor[k] = off;
 	v->want_x[k] = x;
@@ -1184,6 +1186,7 @@ static void select_word_or_next(View *v, bool all)
 			if (m == UINT32_MAX)
 				break;
 			m += pos;
+			view_reserve(v, v->nc + 1);
 			u32 k = v->nc++;
 			v->anchor[k] = m;
 			v->head[k] = m + len;
@@ -1203,6 +1206,7 @@ static void select_word_or_next(View *v, bool all)
 				if (sel_lo(v, k) == m)
 					dup = true;
 			if (!dup) {
+				view_reserve(v, v->nc + 1);
 				u32 k = v->nc++;
 				v->anchor[k] = m;
 				v->head[k] = m + len;
@@ -1315,7 +1319,7 @@ static bool undo_redo_at(View *v, bool redo, u32 *at)
 	D->gm_due_ns[v->doc] = vx_now_ns() + 300000000ull;
 	for (u32 gi = 0; gi < app.ngroups; gi++)
 		for (u32 k = 0; k < app.groups[gi].nt; k++) {
-			View *o = app.groups[gi].tab[k];
+			View *o = gview(&app.groups[gi], k);
 			if (o->doc != v->doc)
 				continue;
 			for (u32 c = 0; c < o->nc; c++) {
@@ -2278,6 +2282,7 @@ void ed_mouse(View *v, const Event *e, int x, int y, int w, int h)
 		if (e->mods & MOD_ALT) {
 			cursor_history_push(v);
 			if (v->nc < MAX_CURSORS) {
+				view_reserve(v, v->nc + 1);
 				u32 k = v->nc++;
 				v->head[k] = v->anchor[k] = off;
 				v->want_x[k] = -1;
