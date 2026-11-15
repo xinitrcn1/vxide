@@ -166,11 +166,22 @@ void binview_closed(View *v)
 		}
 }
 
-void binview_doc_released(u32 d) { bd_free(&bdoc[d]); }
+void binview_doc_released(u32 d)
+{
+	if (app.docs.prof[d])
+		profview_doc_released(d);
+	bd_free(&bdoc[d]);
+}
+
+#define PROF_VIEW(v) (app.docs.prof[(v)->doc])
 
 /* Set up a view of a binary document (parts = subtabs). */
 void binview_init(View *v)
 {
+	if (PROF_VIEW(v)) {
+		profview_init(v);
+		return;
+	}
 	BinDoc *b = bd_get(v->doc);
 	v->nparts = b->nparts;
 	v->part = 0;
@@ -244,6 +255,8 @@ static int subtab_layout(BinDoc *b, int w, u32 want, int *ox, int *oy)
 
 int view_subtabs_height(View *v, int w)
 {
+	if (v->nparts > 1 && PROF_VIEW(v))
+		return profview_subtabs_height(v, w);
 	if (v->nparts <= 1 || !app.docs.bin[v->doc])
 		return 0;
 	BinDoc *b = bd_get(v->doc);
@@ -256,6 +269,10 @@ void view_subtabs_draw(View *v, int x, int y, int w, int h)
 	(void)h;
 	if (!app.docs.bin[v->doc])
 		return;
+	if (PROF_VIEW(v)) {
+		profview_subtabs_draw(v, x, y, w);
+		return;
+	}
 	BinDoc *b = bd_get(v->doc);
 	int hh = view_subtabs_height(v, w);
 	draw_rect(x, y, w, hh, COL(C_EDITOR_BG));
@@ -279,6 +296,10 @@ void view_subtabs_draw(View *v, int x, int y, int w, int h)
 
 void view_subtab_click(View *v, int rel_x, int rel_y, int w)
 {
+	if (PROF_VIEW(v)) {
+		profview_subtab_click(v, rel_x, rel_y, w);
+		return;
+	}
 	BinDoc *b = bd_get(v->doc);
 	for (u32 p = 0; p < b->nparts; p++) {
 		int ox, oy;
@@ -309,6 +330,8 @@ static DisJob *dis_for(BinDoc *b, u32 part)
 
 bool binview_busy(void)
 {
+	if (profview_busy())
+		return true;
 	for (u32 d = 0; d < MAX_DOCS; d++)
 		if (bdoc[d].used)
 			for (u32 s = 0; s < bdoc[d].img.ns; s++)
@@ -594,6 +617,10 @@ static void draw_disasm(BinDoc *b, BinView *s, u32 part, int x, int y, int w, in
 
 void binview_draw(View *v, int x, int y, int w, int h, bool focused)
 {
+	if (PROF_VIEW(v)) {
+		profview_draw(v, x, y, w, h, focused);
+		return;
+	}
 	BinDoc *b = bd_get(v->doc);
 	if (v->nparts != b->nparts)
 		binview_init(v);
@@ -661,6 +688,8 @@ static void jump_to_target(View *v, BinDoc *b, BinView *s)
 
 bool binview_key(View *v, const Event *e)
 {
+	if (PROF_VIEW(v))
+		return profview_key(v, e);
 	BinDoc *b = bd_get(v->doc);
 	BinView *s = bv_get(v, b);
 	u32 p = v->part;
@@ -711,6 +740,10 @@ bool binview_key(View *v, const Event *e)
 
 void binview_mouse(View *v, const Event *e, int x, int y, int w, int h)
 {
+	if (PROF_VIEW(v)) {
+		profview_mouse(v, e, x, y, w, h);
+		return;
+	}
 	BinDoc *b = bd_get(v->doc);
 	BinView *s = bv_get(v, b);
 	u32 p = v->part;
@@ -819,6 +852,10 @@ static View *bin_active(BinDoc **bp, BinView **sp)
 
 void binview_prompt_accept(int kind, const char *text)
 {
+	if (kind >= 250) {
+		profview_prompt_accept(kind, text);
+		return;
+	}
 	BinDoc *b;
 	BinView *s;
 	View *v = bin_active(&b, &s);
@@ -866,6 +903,9 @@ bool binview_command(int cmd)
 {
 	BinDoc *b;
 	BinView *s;
+	View *av = active_view();
+	if (av && PROF_VIEW(av))
+		return profview_view_command(av, cmd);
 	View *v = bin_active(&b, &s);
 	if (!v)
 		return false;
@@ -945,6 +985,10 @@ bool binview_command(int cmd)
 
 void binview_context(View *v, int x, int y)
 {
+	if (PROF_VIEW(v)) {
+		profview_context(v, x, y);
+		return;
+	}
 	BinDoc *b = bd_get(v->doc);
 	bool code = part_is_code(b, v->part);
 	app.ctx = CTX_EDITOR;
@@ -963,6 +1007,10 @@ void binview_context(View *v, int x, int y)
 /* Status bar text for binary views. */
 void binview_status(View *v, char *buf, size_t cap)
 {
+	if (PROF_VIEW(v)) {
+		profview_status(v, buf, cap);
+		return;
+	}
 	BinDoc *b = bd_get(v->doc);
 	BinView *s = bv_get(v, b);
 	u32 p = v->part;

@@ -91,6 +91,9 @@ void pick_accept(int kind, u32 item)
 		if (v < loc_n)
 			open_file(loc_pool.b + loc_path[v], false, loc_line[v], loc_col[v]);
 		break;
+	case 401: /* profview.c: the profile that annotates sources */
+		profview_pick_accept(kind, v);
+		break;
 	default: {
 		extern void gitui_pick_accept(int kind, u32 item);
 		gitui_pick_accept(kind, item);

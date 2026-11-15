@@ -44,8 +44,9 @@ typedef struct {
 	u8 untitled[MAX_DOCS];
 	u8 tabs[MAX_DOCS]; /* indentation uses tabs (detected) */
 	u8 readonly[MAX_DOCS]; /* virtual documents (diffs, commits) */
-	u8 bin[MAX_DOCS];
-	u8 man[MAX_DOCS];      /* a manual page (man.c): read-only, links */      /* binary: hex editor / disassembly (binview.c) */
+	u8 bin[MAX_DOCS];      /* binary: hex editor / disassembly (binview.c) */
+	u8 man[MAX_DOCS];      /* a manual page (man.c): read-only, links */
+	u8 prof[MAX_DOCS];     /* a profile (PK_* of prof.h): bin is set too, profview.c draws it */
 	u32 refs[MAX_DOCS]; /* views showing it */
 
 	/* highlighter: lexer state at the start of each line */
@@ -391,6 +392,30 @@ void binview_context(View *v, int x, int y);
 void binview_prompt_accept(int kind, const char *text);
 void binview_status(View *v, char *buf, size_t cap);
 bool binview_busy(void);
+/* profview.c: profiles (massif, jemalloc, gprof, gcov). Profile documents
+ * are binary documents (read-only, own drawing): binview.c hands them over. */
+void profview_init(View *v);
+void profview_doc_released(u32 d);
+void profview_draw(View *v, int x, int y, int w, int h, bool focused);
+bool profview_key(View *v, const Event *e);
+void profview_mouse(View *v, const Event *e, int x, int y, int w, int h);
+bool profview_view_command(View *v, int cmd);
+bool profview_command(int cmd); /* global: annotation, hot lines */
+void profview_context(View *v, int x, int y);
+void profview_status(View *v, char *buf, size_t cap);
+void profview_prompt_accept(int kind, const char *text);
+void profview_pick_accept(int kind, u32 val);
+bool profview_busy(void);
+void profview_tick(void);
+int profview_subtabs_height(View *v, int w);
+void profview_subtabs_draw(View *v, int x, int y, int w);
+void profview_subtab_click(View *v, int rel_x, int rel_y, int w);
+/* source annotation, drawn by the editor */
+int profann_gutter_w(u32 d); /* 0 when the document is not annotated */
+void profann_gutter(u32 d, u32 first, u32 last, int x, int y0, int lh);
+void profann_lines(u32 d, u32 first, u32 last, int text_x, int text_w, int y0, int lh);
+void profann_ruler(u32 d, int x, int y, int w, int h, u32 nl);
+void profann_status(u32 d, char *buf, size_t cap);
 u32 doc_new_untitled(void);
 void doc_release(u32 d);
 void doc_release_unref(u32 d);
@@ -759,6 +784,18 @@ enum {
 	CMD_HEX_REMOVE_TAG,
 	CMD_HEX_GOTO,
 	CMD_HEX_ENDIAN,
+	CMD_PROF_ANNOTATE,
+	CMD_PROF_CLEAR,
+	CMD_PROF_NEXT_HOT,
+	CMD_PROF_PREV_HOT,
+	CMD_PROF_METRIC,
+	CMD_PROF_SET_EXE,
+	CMD_PROF_RELOAD,
+	CMD_PROF_RAW,
+	CMD_PROF_OPEN_SOURCE,
+	CMD_PROF_RESET_ZOOM,
+	CMD_PROF_FLIP,
+	CMD_PROF_FIND,
 	CMD_COUNT
 };
 

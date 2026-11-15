@@ -4,6 +4,7 @@
 #include "ui.h"
 #include "syntax.h"
 #include "binfile.h"
+#include "prof.h"
 #include "imgload.h"
 #include "gpu.h"
 
@@ -264,6 +265,10 @@ u32 doc_open(const char *abs)
 	u32 hn = VX_MIN(t->len, (u32)sizeof head);
 	text_copy(t, 0, hn, head);
 	D->bin[d] = bin_is_binary(head, hn);
+	/* profiles (massif, jemalloc, gmon, gcov) get their own read-only view */
+	D->prof[d] = (u8)prof_detect(abs, head, hn);
+	if (D->prof[d])
+		D->bin[d] = 1;
 	D->lang[d] = D->bin[d] ? LANG_NONE : (u8)syn_lang_for_path(abs, head, hn);
 	D->untitled[d] = 0;
 	{
@@ -314,6 +319,7 @@ u32 doc_new_untitled(void)
 	D->lang[d] = LANG_NONE;
 	D->bin[d] = 0;
 	D->man[d] = 0;
+	D->prof[d] = 0;
 	D->untitled[d] = 1;
 	D->refs[d] = 0;
 	D->lstate_ok[d] = 0;
@@ -343,6 +349,7 @@ void doc_release(u32 d)
 		binview_doc_released(d);
 	D->bin[d] = 0;
 	D->man[d] = 0;
+	D->prof[d] = 0;
 	text_free(&D->text[d]);
 	free(D->path[d]);
 	free(D->rel[d]);
@@ -1129,6 +1136,18 @@ static const char *cmd_titles[CMD_COUNT] = {
     [CMD_HEX_REMOVE_TAG] = "Hex: Remove Tag",
     [CMD_HEX_GOTO] = "Hex: Go to Offset",
     [CMD_HEX_ENDIAN] = "Hex: Toggle Inspector Byte Order",
+    [CMD_PROF_ANNOTATE] = "Profile: Annotate Source with Profile...",
+    [CMD_PROF_CLEAR] = "Profile: Clear Source Annotation",
+    [CMD_PROF_NEXT_HOT] = "Profile: Go to Next Hot Line",
+    [CMD_PROF_PREV_HOT] = "Profile: Go to Previous Hot Line",
+    [CMD_PROF_METRIC] = "Profile: Switch Metric",
+    [CMD_PROF_SET_EXE] = "Profile: Set Executable for gprof...",
+    [CMD_PROF_RELOAD] = "Profile: Reload",
+    [CMD_PROF_RAW] = "Profile: Open Raw Report",
+    [CMD_PROF_OPEN_SOURCE] = "Profile: Open Source of Selection",
+    [CMD_PROF_RESET_ZOOM] = "Profile: Reset Flame Graph Zoom",
+    [CMD_PROF_FLIP] = "Profile: Flip Flame Graph",
+    [CMD_PROF_FIND] = "Profile: Highlight Functions in Flame Graph...",
     [CMD_PASTE] = "Paste",
     [CMD_SELECT_ALL] = "Select All",
     [CMD_SELECT_LINE] = "Expand Line Selection",
@@ -2009,6 +2028,8 @@ void run_command(int cmd)
 	} else if (v && ed_command(v, cmd))
 		return;
 	if (diff_command(v, cmd))
+		return;
+	if (profview_command(cmd))
 		return;
 	if (actions_command(cmd))
 		return;
@@ -3721,6 +3742,13 @@ static void draw_status(void)
 		}
 		const char *ln = D->man[v->doc] ? "Manual Page" : syn_lang_name(D->lang[v->doc]);
 		rx = status_item_ex(rx, y, ln, strlen(ln), true, D->man[v->doc] ? 0 : CMD_CHANGE_LANGUAGE, D->man[v->doc] ? NULL : "Select Language Mode");
+		{
+			char pa[300];
+			profann_status(v->doc, pa, sizeof pa);
+			if (pa[0])
+				rx = status_item_ex(rx, y, pa, strlen(pa), true, CMD_PROF_CLEAR,
+				                    "Lines are coloured by this profile (click to clear)");
+		}
 		if (app.overtype)
 			rx = status_item_ex(rx, y, "OVR", 3, true, CMD_TOGGLE_OVERTYPE, "Overtype: typing replaces characters (Insert)");
 		const char *eol = t->crlf ? "CRLF" : "LF";
@@ -4258,6 +4286,7 @@ void ui_tick(void)
 	{
 		/* a background disassembly finished: show it */
 		static bool bin_was_busy;
+		profview_tick();
 		bool busy = binview_busy();
 		if (bin_was_busy && !busy)
 			app.dirty = true;
