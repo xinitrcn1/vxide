@@ -35,6 +35,8 @@ static bool state_dir(char *out, size_t cap)
 	return true;
 }
 
+bool session_state_dir(char *out, size_t cap) { return state_dir(out, cap); }
+
 static void mkdirs(const char *path)
 {
 	char d[4096];

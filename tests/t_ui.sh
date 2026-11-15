@@ -134,4 +134,13 @@ if "$vx" --ucas -e 'range (x: u2)' >/dev/null 2>&1; then
 	VXIDE_NO_LSP=1 "$vx" --headless 1400x900 --script tests/ucas.vx "$uc"
 	head -c 6 "$uc/plot.gif" | grep -q GIF89a
 fi
+# the LLM agent tab with the mock model: tools run in the project, a link
+# opens the file, the chat is saved
+la="$tmp/llm"
+mkdir -p "$la/src" "$tmp/llmstate"
+printf '# Demo\n\nA tiny demo project that answers questions.\n' > "$la/README.md"
+printf '#include <stdio.h>\n\nstatic int answer(void)\n{\n\treturn 42;\n}\n\nint main(void)\n{\n\tprintf("%%d\\n", answer());\n\treturn 0;\n}\n' > "$la/src/main.c"
+VXIDE_STATE_DIR="$tmp/llmstate" VXIDE_LLM_BACKEND=mock VXIDE_NO_LSP=1 "$vx" --headless 1600x900 --script tests/llm.vx "$la"
+chat=$(ls "$tmp"/llmstate/llm/*/*.json)
+grep -q '"name":"read"' "$chat" && grep -q '"name":"search"' "$chat" && grep -q 'src/main.c:3' "$chat"
 echo "ui test ok"

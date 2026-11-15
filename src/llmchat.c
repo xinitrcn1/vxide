@@ -1205,6 +1205,10 @@ static void mock_answer(const LlmRun *r, u32 user, JBuf *o)
 		jb_free(&path);
 		jb_free(&cmd);
 	}
+	/* why it is the mock, once a chat */
+	for (u32 i = 0; i < user; i++)
+		if (c->m[i].role == LLM_ASSISTANT && c->m[i].text.b && strstr(c->m[i].text.b, "*Written by the mock model"))
+			return;
 	char h[600];
 	snprintf(h, sizeof h,
 	         "---\n*Written by the mock model: no model answers at %s. Start one, for example "

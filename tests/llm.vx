@@ -1,0 +1,17 @@
+# The LLM agent tab (run by tests/t_ui.sh) with the mock model: a question
+# that reads a file, one that searches, a path:line link in the answer
+# opening the file there; the chat is kept in VXIDE_STATE_DIR.
+key ctrl+shift+p
+type View: Show LLM Agent
+key Return
+wait 200
+type What does src/main.c do?
+key Return
+wait 500
+type where is answer used?
+key Return
+wait 500
+click 352 757
+wait 100
+expect file src/main.c
+expect line 3

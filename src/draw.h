@@ -20,6 +20,7 @@ enum {
 	ICON_PULSE_S, /* Profiling */
 	ICON_PLAY_S,  /* Workflow */
 	ICON_SIGMA_S, /* ucas */
+	ICON_CHAT_S,  /* LLM agent */
 	/* 16 px */
 	ICON_CHEVRON_RIGHT,
 	ICON_CHEVRON_DOWN,

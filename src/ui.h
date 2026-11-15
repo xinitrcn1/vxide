@@ -124,7 +124,7 @@ typedef struct {
 /* ---- workbench ---------------------------------------------------------- */
 
 enum { DIFF_WORKTREE = 1, DIFF_STAGED, DIFF_COMMIT };
-enum { SIDE_EXPLORER, SIDE_SEARCH, SIDE_SCM, SIDE_SETTINGS, SIDE_MAN, SIDE_PMC, SIDE_WORKFLOW, SIDE_UCAS, SIDE_COUNT };
+enum { SIDE_EXPLORER, SIDE_SEARCH, SIDE_SCM, SIDE_SETTINGS, SIDE_MAN, SIDE_PMC, SIDE_WORKFLOW, SIDE_UCAS, SIDE_LLM, SIDE_COUNT };
 enum { PANEL_PROBLEMS, PANEL_OUTPUT, PANEL_COUNT };
 enum {
 	FOCUS_EDITOR,
@@ -172,6 +172,12 @@ typedef struct {
 	char bg_path[1024]; /* editor background image, "" = none */
 	int bg_opacity;     /* percent */
 	int bg_iw, bg_ih;   /* loaded image size, 0 = none */
+	/* the LLM agent: its model server, model, backend (LLM_AUTO ...) and
+	 * whether its tools may change the project */
+	char llm_server[256];
+	char llm_model[128];
+	int llm_backend;
+	bool llm_read_only;
 	int line_h, char_w, row_h;
 
 	/* layout results */
@@ -454,6 +460,16 @@ void ucasview_run_text(const char *src, size_t n); /* from an editor: run in the
 bool ucasview_command(int cmd);
 void ucasview_shutdown(void);
 void ucasview_session_save(void *file);    /* FILE * */
+/* llmview.c: the LLM agent workspace, chats with a local model that works
+ * on the project through the built-in harness (llmtools.h) */
+void llmview_open(void);
+void llmview_ws_draw(int x, int y, int w, int h);
+void llmview_ws_event(const Event *e, int x, int y, int w, int h);
+void llmview_tick(void);
+bool llmview_busy(void);
+bool llmview_command(int cmd);
+void llmview_shutdown(void);
+bool session_state_dir(char *out, size_t cap); /* session.c: $XDG_STATE_HOME/vxide, false when none */
 bool ucasview_session_line(const char *l); /* true when it was ours */
 /* mdview.c: Markdown tabs have two parts, Edit and Preview */
 void mdview_sync(View *v);       /* nparts = 2 for Markdown documents */
@@ -885,6 +901,11 @@ enum {
 	CMD_UCAS_CANCEL,
 	CMD_UCAS_RESTART,
 	CMD_UCAS_SAVE_PICTURE,
+	CMD_VIEW_LLM,
+	CMD_LLM_NEW,
+	CMD_LLM_STOP,
+	CMD_LLM_SYSTEM,
+	CMD_LLM_ASK_SELECTION,
 	CMD_VIEW_WORKFLOW,
 	CMD_DBG_START,      /* F5: start debugging / continue */
 	CMD_DBG_RUN,        /* Ctrl+F5: run without debugging */

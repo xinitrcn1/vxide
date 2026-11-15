@@ -607,7 +607,7 @@ void view_set_rel(View *v, const char *rel)
 bool ui_workspace(void)
 {
 	return app.side_view == SIDE_MAN || app.side_view == SIDE_SETTINGS || app.side_view == SIDE_PMC ||
-	       app.side_view == SIDE_UCAS;
+	       app.side_view == SIDE_UCAS || app.side_view == SIDE_LLM;
 }
 
 void workspace_area(int *x, int *y, int *w, int *h)
@@ -1227,6 +1227,11 @@ static const char *cmd_titles[CMD_COUNT] = {
     [CMD_UCAS_CANCEL] = "ucas: Cancel the Running Evaluation",
     [CMD_UCAS_RESTART] = "ucas: Restart (Clear Definitions)",
     [CMD_UCAS_SAVE_PICTURE] = "ucas: Save the Picture in the View",
+    [CMD_VIEW_LLM] = "View: Show LLM Agent",
+    [CMD_LLM_NEW] = "LLM Agent: New Chat",
+    [CMD_LLM_STOP] = "LLM Agent: Stop the Running Turn",
+    [CMD_LLM_SYSTEM] = "LLM Agent: Edit the System Prompt",
+    [CMD_LLM_ASK_SELECTION] = "LLM Agent: Ask About the Selection",
     [CMD_VIEW_WORKFLOW] = "View: Show Workflow (CMake, Run, Debug)",
     [CMD_DBG_START] = "Debug: Start Debugging / Continue",
     [CMD_DBG_RUN] = "Debug: Run Without Debugging",
@@ -2307,6 +2312,16 @@ void run_command(int cmd)
 	case CMD_UCAS_SAVE_PICTURE:
 		ucasview_command(cmd);
 		break;
+	case CMD_VIEW_LLM:
+		app.side_view = SIDE_LLM;
+		llmview_open();
+		break;
+	case CMD_LLM_NEW:
+	case CMD_LLM_STOP:
+	case CMD_LLM_SYSTEM:
+	case CMD_LLM_ASK_SELECTION:
+		llmview_command(cmd);
+		break;
 	case CMD_VIEW_EXPLORER:
 	case CMD_VIEW_SEARCH:
 	case CMD_VIEW_SCM: {
@@ -2667,6 +2682,7 @@ static const struct {
     {SIDE_MAN, ICON_BOOK_S, CMD_VIEW_MAN, "Manpages"},
     {SIDE_PMC, ICON_PULSE_S, CMD_VIEW_PMC, "Profiling"},
     {SIDE_UCAS, ICON_SIGMA_S, CMD_VIEW_UCAS, "ucas"},
+    {SIDE_LLM, ICON_CHAT_S, CMD_VIEW_LLM, "LLM agent"},
     {SIDE_SETTINGS, ICON_GEAR_S, CMD_VIEW_SETTINGS, "Settings"},
 };
 
@@ -2929,6 +2945,8 @@ void ui_event(const Event *e)
 				pmcview_ws_event(e, x, y, w, h);
 			else if (app.side_view == SIDE_UCAS)
 				ucasview_ws_event(e, x, y, w, h);
+			else if (app.side_view == SIDE_LLM)
+				llmview_ws_event(e, x, y, w, h);
 			else if (app.side_view == SIDE_SETTINGS)
 				settings_ws_event(e, x, y, w, h);
 			return;
@@ -3018,6 +3036,8 @@ void ui_event(const Event *e)
 				pmcview_ws_event(e, x, y, w, h);
 			else if (app.side_view == SIDE_UCAS)
 				ucasview_ws_event(e, x, y, w, h);
+			else if (app.side_view == SIDE_LLM)
+				llmview_ws_event(e, x, y, w, h);
 			else if (app.side_view == SIDE_SETTINGS)
 				settings_ws_event(e, x, y, w, h);
 			return;
@@ -3077,6 +3097,8 @@ void ui_event(const Event *e)
 			man_ws_event(e, x, y, w, h);
 		else if (app.side_view == SIDE_UCAS)
 			ucasview_ws_event(e, x, y, w, h); /* the end of a text selection */
+		else if (app.side_view == SIDE_LLM)
+			llmview_ws_event(e, x, y, w, h);
 		return;
 	}
 	if (e->type == EV_MUP) {
@@ -3202,6 +3224,8 @@ void ui_event(const Event *e)
 			pmcview_ws_event(e, x, y, w, h);
 		else if (app.side_view == SIDE_UCAS)
 			ucasview_ws_event(e, x, y, w, h);
+		else if (app.side_view == SIDE_LLM)
+			llmview_ws_event(e, x, y, w, h);
 		else
 			settings_ws_event(e, x, y, w, h);
 		return;
@@ -3660,7 +3684,7 @@ static void draw_top_tabs(void)
 		int w = top_tab_w(i);
 		/* a workspace is shown whatever the side bar does */
 		bool ws = top_tabs[i].view == SIDE_MAN || top_tabs[i].view == SIDE_SETTINGS || top_tabs[i].view == SIDE_PMC ||
-		          top_tabs[i].view == SIDE_UCAS;
+		          top_tabs[i].view == SIDE_UCAS || top_tabs[i].view == SIDE_LLM;
 		bool active = top_tabs[i].view == SIDE_WORKFLOW ? app.right_visible && !ui_workspace()
 		                                                : app.side_view == top_tabs[i].view && (ws || app.side_visible);
 		bool hover = in_rect(app.hover_x, app.hover_y, x, 0, w, h);
@@ -4028,6 +4052,8 @@ void ui_draw(void)
 			pmcview_ws_draw(x, y, w, h);
 		else if (app.side_view == SIDE_UCAS)
 			ucasview_ws_draw(x, y, w, h);
+		else if (app.side_view == SIDE_LLM)
+			llmview_ws_draw(x, y, w, h);
 		else
 			settings_ws_draw(x, y, w, h);
 	} else {
@@ -4485,6 +4511,7 @@ void ui_tick(void)
 		profview_tick();
 		pmcview_tick();
 		ucasview_tick();
+		llmview_tick();
 		workflow_tick();
 		binview_tick(); /* a disassembly search in progress */
 		bool busy = binview_busy();
@@ -4541,7 +4568,8 @@ u64 ui_wait_hint_ms(void)
 	for (int sv = 0; sv < LSV_COUNT; sv++)
 		if (app.lsps[sv] && !app.lsps_ready[sv])
 			return 30;
-	if (binview_busy() || projtools_busy() || pmcview_busy() || workflow_busy() || ucasview_busy())
+	if (binview_busy() || projtools_busy() || pmcview_busy() || workflow_busy() || ucasview_busy() ||
+	    llmview_busy())
 		return 20;
 	if (ucasview_wait_hint() < 250)
 		return ucasview_wait_hint();
@@ -4629,6 +4657,7 @@ void ui_shutdown(void)
 	projtools_shutdown();
 	pmcview_shutdown();
 	ucasview_shutdown();
+	llmview_shutdown();
 	workflow_shutdown();
 	temp_cleanup_all();
 	/* tabs first: closing a document still talks to the language server */

@@ -189,6 +189,21 @@ static void art_sigma(float W)
 	line(6.0f, 19.0f, 18.0f, 19.0f, W);
 }
 
+/* the LLM agent: a speech bubble with two lines of text */
+static void art_chat(float W)
+{
+	begin((int)(24.0f * G + 0.5f));
+	line(3.5f, 4.5f, 20.5f, 4.5f, W);
+	line(20.5f, 4.5f, 20.5f, 16.0f, W);
+	line(20.5f, 16.0f, 11.0f, 16.0f, W);
+	line(11.0f, 16.0f, 6.5f, 20.5f, W);
+	line(6.5f, 20.5f, 6.5f, 16.0f, W);
+	line(6.5f, 16.0f, 3.5f, 16.0f, W);
+	line(3.5f, 16.0f, 3.5f, 4.5f, W);
+	line(7.5f, 8.5f, 16.5f, 8.5f, W);
+	line(7.5f, 12.0f, 13.5f, 12.0f, W);
+}
+
 static void art_gear(float W)
 {
 	const float PI = 3.14159265f;
@@ -229,6 +244,8 @@ void icons_init(void)
 			store(ICON_PLAY_S);
 			art_sigma(W);
 			store(ICON_SIGMA_S);
+			art_chat(W);
+			store(ICON_CHAT_S);
 		}
 	}
 	G = 1.0f;

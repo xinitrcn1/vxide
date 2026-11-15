@@ -175,6 +175,13 @@ static void input_wrap(const Input *in, int tw0, int tw, Wrap *wr)
 	for (u32 i = 0; i < in->n;) {
 		u32 cp;
 		u32 k = utf8_decode(in->b + i, in->n - i, &cp);
+		if (cp == '\n' && wr->n < WRAP_MAX) { /* a box that takes several lines (the LLM agent's) */
+			i += k;
+			wr->start[wr->n++] = i;
+			pen = 0;
+			last_space = UINT32_MAX;
+			continue;
+		}
 		int a = font_glyphs.adv[font_glyph(FONT_UI, cp)];
 		if (pen + a > (wr->n == 1 ? tw0 : tw) && i > wr->start[wr->n - 1] && wr->n < WRAP_MAX) {
 			/* break after the last space of the row when there is one */
@@ -238,7 +245,10 @@ int input_draw_ex(Input *in, int x, int y, int w, int reserve, const char *ph, b
 			int sx = font_width(FONT_UI, in->b + rs, sa - rs), ex = font_width(FONT_UI, in->b + rs, sb - rs);
 			draw_rect(x + pad + sx, ty, ex - sx, lh, COL(C_SELECTION));
 		}
-		draw_text(FONT_UI, x + pad, ty, in->b + rs, re - rs, COL(C_INPUT_FG));
+		u32 rl = re - rs;
+		if (rl && in->b[re - 1] == '\n')
+			rl--;
+		draw_text(FONT_UI, x + pad, ty, in->b + rs, rl, COL(C_INPUT_FG));
 	}
 	if (focused) {
 		u32 r = wrap_row(&wr, in->cur);
@@ -265,6 +275,8 @@ void input_click_ex(Input *in, int x, int y, int w, int reserve, int mx, int my,
 	int r = (my - ty0) / VX_MAX(lh, 1);
 	r = VX_CLAMP(r, 0, (int)wr.n - 1);
 	u32 rs = wr.start[r], re = wr.start[r + 1];
+	if (re > rs && in->b[re - 1] == '\n')
+		re--; /* a click past a line's end stays on it */
 	int px = x + pad;
 	u32 i = rs;
 	while (i < re) {
@@ -2196,6 +2208,14 @@ void settings_load(void)
 			snprintf(app.bg_path, sizeof app.bg_path, "%s", v);
 		else if (!strcmp(k, "background_opacity"))
 			app.bg_opacity = VX_CLAMP(atoi(v), 0, 100);
+		else if (!strcmp(k, "llm_server"))
+			snprintf(app.llm_server, sizeof app.llm_server, "%s", v);
+		else if (!strcmp(k, "llm_model"))
+			snprintf(app.llm_model, sizeof app.llm_model, "%s", v);
+		else if (!strcmp(k, "llm_backend"))
+			app.llm_backend = !strcmp(v, "server") ? 1 : !strcmp(v, "mock") ? 2 : 0;
+		else if (!strcmp(k, "llm_read_only"))
+			app.llm_read_only = atoi(v) != 0;
 	}
 	fclose(f);
 }
@@ -2228,6 +2248,8 @@ void settings_save(void)
 	fprintf(f, "# vxide settings\ntheme=%s\nminimap=%d\nblame=%d\nvim=%d\nbackground=%s\nbackground_opacity=%d\n",
 	        app.theme == THEME_LIGHT ? "light" : app.theme == THEME_DARKER ? "darker" : "dark", app.minimap_on, app.blame_on, app.vim_on, app.bg_path,
 	        app.bg_opacity);
+	fprintf(f, "llm_server=%s\nllm_model=%s\nllm_backend=%s\nllm_read_only=%d\n", app.llm_server, app.llm_model,
+	        app.llm_backend == 1 ? "server" : app.llm_backend == 2 ? "mock" : "auto", app.llm_read_only);
 	if (fclose(f) == 0)
 		rename(tmp, p);
 }
