@@ -350,6 +350,7 @@ void doc_release(u32 d)
 	D->bin[d] = 0;
 	D->man[d] = 0;
 	D->prof[d] = 0;
+	mdview_doc_changed(d);
 	text_free(&D->text[d]);
 	free(D->path[d]);
 	free(D->rel[d]);
@@ -753,6 +754,7 @@ void close_tab(u32 gi, u32 t)
 	if (v->diff_left != UINT32_MAX)
 		diff_view_closed(v);
 	binview_closed(v);
+	mdview_closed(v);
 	view_free(v);
 	memmove(g->tab + t, g->tab + t + 1, (g->nt - t - 1) * sizeof(u32));
 	/* fix MRU: drop t, shift indices above it */
@@ -831,6 +833,7 @@ static u32 show_doc(u32 d, bool preview)
 			if (gview(g, t)->preview && !text_dirty(&app.docs.text[gview(g, t)->doc])) {
 				View *old = gview(g, t);
 				binview_closed(old);
+				mdview_closed(old);
 				doc_release(old->doc);
 				view_free(old);
 				View *v = view_new(d); /* takes the tab's place */
@@ -1019,6 +1022,7 @@ static const Binding bindings[] = {
     {C | S, SDLK_Z, W_EDITOR, CMD_REDO, 0},
     {C, SDLK_X, W_EDITOR, CMD_CUT, 0},
     {C, SDLK_C, W_EDITOR, CMD_COPY, 0},
+    {C | S, SDLK_V, W_EDITOR, CMD_MD_PREVIEW, 0},
     {C, SDLK_V, W_EDITOR, CMD_PASTE, 0},
     {S, SDLK_DELETE, W_EDITOR, CMD_CUT, 0},
     {C, SDLK_INSERT, W_EDITOR, CMD_COPY, 0},
@@ -1148,6 +1152,7 @@ static const char *cmd_titles[CMD_COUNT] = {
     [CMD_PROF_RESET_ZOOM] = "Profile: Reset Flame Graph Zoom",
     [CMD_PROF_FLIP] = "Profile: Flip Flame Graph",
     [CMD_PROF_FIND] = "Profile: Highlight Functions in Flame Graph...",
+    [CMD_MD_PREVIEW] = "Markdown: Toggle Preview",
     [CMD_PASTE] = "Paste",
     [CMD_SELECT_ALL] = "Select All",
     [CMD_SELECT_LINE] = "Expand Line Selection",
@@ -3204,6 +3209,7 @@ int group_tabs_h(Group *g)
 	int ox, oy;
 	int rows = g->nt ? tab_layout(g, g->nt, &ox, &oy) : 1;
 	View *v = g->nt ? gview(g, g->active) : NULL;
+	mdview_sync(v); /* Markdown: Edit / Preview subtabs */
 	return rows * app.tabs_h + (v && v->nparts > 1 ? view_subtabs_height(v, g->w) : 0);
 }
 

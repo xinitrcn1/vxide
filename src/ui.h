@@ -410,6 +410,19 @@ void profview_tick(void);
 int profview_subtabs_height(View *v, int w);
 void profview_subtabs_draw(View *v, int x, int y, int w);
 void profview_subtab_click(View *v, int rel_x, int rel_y, int w);
+/* mdview.c: Markdown tabs have two parts, Edit and Preview */
+void mdview_sync(View *v);       /* nparts = 2 for Markdown documents */
+bool mdview_preview(View *v);    /* the preview is showing */
+void mdview_draw(View *v, int x, int y, int w, int h);
+bool mdview_key(View *v, const Event *e);
+void mdview_mouse(View *v, const Event *e, int x, int y, int w, int h);
+int mdview_cursor(View *v, int mx, int my, int x, int y, int w);
+bool mdview_command(View *v, int cmd);
+void mdview_closed(View *v);
+void mdview_doc_changed(u32 d);
+int mdview_subtabs_height(View *v, int w);
+void mdview_subtabs_draw(View *v, int x, int y, int w);
+void mdview_subtab_click(View *v, int rel_x, int rel_y, int w);
 /* source annotation, drawn by the editor */
 int profann_gutter_w(u32 d); /* 0 when the document is not annotated */
 void profann_gutter(u32 d, u32 first, u32 last, int x, int y0, int lh);
@@ -805,6 +818,7 @@ enum {
 	CMD_PROF_RESET_ZOOM,
 	CMD_PROF_FLIP,
 	CMD_PROF_FIND,
+	CMD_MD_PREVIEW,
 	CMD_COUNT
 };
 

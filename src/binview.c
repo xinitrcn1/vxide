@@ -268,6 +268,8 @@ int view_subtabs_height(View *v, int w)
 {
 	if (v->nparts > 1 && PROF_VIEW(v))
 		return profview_subtabs_height(v, w);
+	if (v->nparts > 1 && !app.docs.bin[v->doc])
+		return mdview_subtabs_height(v, w); /* Markdown: Edit / Preview */
 	if (v->nparts <= 1 || !app.docs.bin[v->doc])
 		return 0;
 	BinDoc *b = bd_get(v->doc);
@@ -278,8 +280,11 @@ int view_subtabs_height(View *v, int w)
 void view_subtabs_draw(View *v, int x, int y, int w, int h)
 {
 	(void)h;
-	if (!app.docs.bin[v->doc])
+	if (!app.docs.bin[v->doc]) {
+		if (v->nparts > 1)
+			mdview_subtabs_draw(v, x, y, w);
 		return;
+	}
 	if (PROF_VIEW(v)) {
 		profview_subtabs_draw(v, x, y, w);
 		return;
@@ -309,6 +314,10 @@ void view_subtab_click(View *v, int rel_x, int rel_y, int w)
 {
 	if (PROF_VIEW(v)) {
 		profview_subtab_click(v, rel_x, rel_y, w);
+		return;
+	}
+	if (!app.docs.bin[v->doc]) {
+		mdview_subtab_click(v, rel_x, rel_y, w);
 		return;
 	}
 	BinDoc *b = bd_get(v->doc);

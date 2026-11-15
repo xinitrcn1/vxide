@@ -51,7 +51,7 @@ set(CORE base heaptrace text syntax theme fstree fswatch json lsp git gitops git
 	png binfile)
 # Front end: window, Vulkan, fonts, UI.
 set(APP main gpu font icons draw ui editor panes menu actions gitui bgwork diffview binview vim projtools man dialog session
-	imgload profview)
+	imgload profview mdview)
 
 list(TRANSFORM CORE PREPEND src/ OUTPUT_VARIABLE CORE_SRC)
 list(TRANSFORM CORE_SRC APPEND .c)

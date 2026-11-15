@@ -505,7 +505,7 @@ static bool word_before(Text *t, u32 off) { return off > 0 && is_word_byte(text_
 
 void ed_text(View *v, const char *s, size_t n)
 {
-	if (app.docs.bin[v->doc] && v->diff_left == UINT32_MAX)
+	if ((app.docs.bin[v->doc] && v->diff_left == UINT32_MAX) || mdview_preview(v))
 		return;
 	if (app.vim_on && vim_text(v, s, n))
 		return;
@@ -1459,6 +1459,10 @@ static void move_sel_next_match(View *v)
 
 bool ed_command(View *v, int cmd)
 {
+	if (mdview_command(v, cmd))
+		return true;
+	if (mdview_preview(v))
+		return false; /* the rendered Markdown is read-only */
 	Text *t = T(v);
 	switch (cmd) {
 	case CMD_CUT:
@@ -1649,6 +1653,8 @@ bool ed_key(View *v, const Event *e)
 {
 	if (app.docs.bin[v->doc] && v->diff_left == UINT32_MAX)
 		return binview_key(v, e);
+	if (mdview_preview(v))
+		return mdview_key(v, e);
 	if (app.vim_on && vim_key(v, e))
 		return true;
 	int mods = e->mods & (MOD_CTRL | MOD_SHIFT | MOD_ALT);
@@ -2172,6 +2178,8 @@ u32 ed_offset_at(View *v, int mx, int my, int x, int y);
 
 int ed_cursor_shape(View *v, int mx, int my, int x, int y, int w, int h, int mods)
 {
+	if (mdview_preview(v))
+		return mdview_cursor(v, mx, my, x, y, w);
 	int mm = minimap_w(w);
 	if (mx >= x + w - SCROLL_W - mm || mx < x + ed_gutter_w(v))
 		return CURSOR_ARROW;
@@ -2208,6 +2216,10 @@ void ed_mouse(View *v, const Event *e, int x, int y, int w, int h)
 		if (e->type == EV_MDOWN && e->button == 1)
 			app.drag = 3; /* DRAG_EDITOR in ui.c: drag-select */
 		binview_mouse(v, e, x, y, w, h);
+		return;
+	}
+	if (mdview_preview(v)) {
+		mdview_mouse(v, e, x, y, w, h);
 		return;
 	}
 	Text *t = T(v);
@@ -2687,6 +2699,10 @@ void ed_draw(Group *g, View *v, int x, int y, int w, int h, bool focused)
 	}
 	if (app.docs.bin[v->doc]) {
 		binview_draw(v, x, y, w, h, focused);
+		return;
+	}
+	if (mdview_preview(v)) {
+		mdview_draw(v, x, y, w, h);
 		return;
 	}
 	if (v->doc == blame_rect_doc)
