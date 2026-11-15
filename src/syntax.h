@@ -106,6 +106,10 @@ const char *syn_lang_lsp_id(int lang); /* LSP languageId: "c", "asm", "lisp" or 
  * Pure function of (lang, state, bytes): the editor caches per-line states. */
 u32 syn_line(int lang, u32 state, const char *s, u32 n, SynSpans *out);
 
+/* The language of a Markdown fence's info string ("c", "rust", "sh"...),
+ * LANG_NONE when unknown. */
+int syn_fence_lang(const char *w, u32 n);
+
 /* Line-comment prefix for toggle comment (Ctrl+/), or NULL. */
 const char *syn_line_comment(int lang);
 

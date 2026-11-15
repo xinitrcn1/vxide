@@ -34,6 +34,10 @@ static const char *font_files[FONT_COUNT][MAX_FACES] = {
     {"DejaVuSansMono-Bold.ttf", "DejaVuSans-Bold.ttf", "NotoSansSymbols2-Regular.ttf", NULL},
     {"DejaVuSansMono-Oblique.ttf", "DejaVuSans-Oblique.ttf", "DejaVuSansMono.ttf", NULL},
     {"DejaVuSansMono-BoldOblique.ttf", "DejaVuSans-BoldOblique.ttf", "DejaVuSansMono-Bold.ttf", NULL},
+    {"NotoSans-Italic.ttf", "DejaVuSans-Oblique.ttf", "NotoSans-Regular.ttf", NULL},
+    {"NotoSans-Bold.ttf", "DejaVuSans-Bold.ttf", "NotoSansSymbols2-Regular.ttf", NULL},
+    {"NotoSans-Bold.ttf", "DejaVuSans-Bold.ttf", "NotoSansSymbols2-Regular.ttf", NULL},
+    {"NotoSans-Bold.ttf", "DejaVuSans-Bold.ttf", "NotoSansSymbols2-Regular.ttf", NULL},
 };
 
 static const char *font_dirs[] = {
@@ -81,7 +85,13 @@ bool font_init(int ui_px, int mono_px, int mono_line, int small_px)
 		return false;
 	memset(font_atlas, 0, (size_t)ATLAS_SIZE * ATLAS_SIZE);
 	for (int f = 0; f < FONT_COUNT; f++) {
-		int px = f <= FONT_UI_BOLD ? ui_px : f <= FONT_SMALL_BOLD ? small_px : mono_px;
+		bool mono = f >= FONT_MONO && f <= FONT_MONO_BOLD_ITALIC;
+		int px = f <= FONT_UI_BOLD || f == FONT_UI_ITALIC ? ui_px
+		         : f <= FONT_SMALL_BOLD                  ? small_px
+		         : f == FONT_H1                          ? ui_px * 2
+		         : f == FONT_H2                          ? ui_px * 3 / 2
+		         : f == FONT_H3                          ? ui_px * 5 / 4
+		                                                 : mono_px;
 		for (int k = 0; k < MAX_FACES && font_files[f][k]; k++)
 			faces[f][k] = open_face(font_files[f][k], px);
 		if (!faces[f][0]) {
@@ -97,7 +107,7 @@ bool font_init(int ui_px, int mono_px, int mono_line, int small_px)
 			fprintf(stderr, "vxide: no font for slot %d (%s)\n", f, font_files[f][0]);
 			return false;
 		}
-		metrics(f, px, f >= FONT_MONO ? mono_line : 0);
+		metrics(f, px, mono ? mono_line : 0);
 	}
 	/* Mild contrast boost, closer to how browser engines render text. */
 	for (int i = 0; i < 256; i++)
@@ -215,7 +225,7 @@ static u32 rasterize(int font, u32 cp)
 	g->bx[id] = (i16)s->bitmap_left;
 	g->by[id] = (i16)(font_m[font].ascent - s->bitmap_top);
 	int adv = (int)((s->advance.x + 32) >> 6);
-	if (font >= FONT_MONO && cp < 0x2E80)
+	if (font >= FONT_MONO && font <= FONT_MONO_BOLD_ITALIC && cp < 0x2E80)
 		adv = font_m[font].adv; /* keep the grid even for fallback glyphs */
 	g->adv[id] = (i16)adv;
 	g->count++;

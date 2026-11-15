@@ -10093,3 +10093,5 @@ int syn_lang_for_path(const char *path, const char *head, size_t headlen)
 		return LANG_XML;
 	return bang;
 }
+
+int syn_fence_lang(const char *w, u32 n) { return md_fence_lang(w, n); }

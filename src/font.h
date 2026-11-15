@@ -14,6 +14,10 @@ enum {
 	FONT_MONO_BOLD,
 	FONT_MONO_ITALIC,
 	FONT_MONO_BOLD_ITALIC,
+	FONT_UI_ITALIC, /* the Markdown preview: emphasis and headings */
+	FONT_H1,
+	FONT_H2,
+	FONT_H3,
 	FONT_COUNT
 };
 
