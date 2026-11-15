@@ -304,15 +304,21 @@ static void run_start(void)
 		return;
 	}
 	const char *root = app.root ? app.root : ".";
-	/* "prog" next to the project runs as ./prog (pmcstat searches PATH otherwise) */
+	/* a bare "prog": ./prog when the project has it, else found in PATH */
 	char progpath[1100];
 	if (!strchr(p, '/')) {
 		char t[4200];
 		snprintf(t, sizeof t, "%s/%s", root, p);
+		char *w = NULL;
 		if (access(t, X_OK) == 0)
 			snprintf(progpath, sizeof progpath, "./%s", p);
-		else
-			snprintf(progpath, sizeof progpath, "%s", p);
+		else if ((w = prof_which(p))) /* like `which prog` */
+			snprintf(progpath, sizeof progpath, "%s", w);
+		else {
+			ui_status("No program \"%s\" in the project or in PATH", p);
+			return;
+		}
+		free(w);
 	} else
 		snprintf(progpath, sizeof progpath, "%s", p);
 	const char *base = strrchr(progpath, '/');
