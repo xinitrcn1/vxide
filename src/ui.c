@@ -767,6 +767,11 @@ static const char *cmd_titles[CMD_COUNT] = {
     [CMD_GIT_DELETE_TAG] = "Git: Delete Tag...",
     [CMD_GIT_SHOW_OUTPUT] = "Git: Show Git Output",
     [CMD_SCM_OPEN_CHANGES] = "Git: Open Changes",
+    [CMD_TRANSFORM_UPPER] = "Transform to Uppercase",
+    [CMD_TRANSFORM_LOWER] = "Transform to Lowercase",
+    [CMD_TRANSFORM_TITLE] = "Transform to Title Case",
+    [CMD_TRANSFORM_SNAKE] = "Transform to Snake Case",
+    [CMD_TRANSFORM_KEBAB] = "Transform to Kebab Case",
 };
 
 const char *command_title(int cmd) { return cmd_titles[cmd] ? cmd_titles[cmd] : ""; }

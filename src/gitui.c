@@ -284,16 +284,14 @@ static void open_commit(const char *hash)
 {
 	if (!app.git)
 		return;
-	const char *argv[] = {"show", "--stat", "--patch", "--format=fuller", hash, NULL};
-	GitRun r = {0};
-	if (git_cli(git_workdir(app.git), argv, NULL, &r, NULL) == 0 && r.status == 0) {
-		char name[64];
-		snprintf(name, sizeof name, "%.8s (commit)", hash);
-		show_text_doc(name, vx_strndup(r.out ? r.out : "", r.nout));
-	} else {
+	char *t = git_show_commit(git_workdir(app.git), hash); /* libgit2, like git show --stat --patch */
+	if (!t) {
 		ui_status("Git: cannot show %.8s", hash);
+		return;
 	}
-	git_run_free(&r);
+	char name[64];
+	snprintf(name, sizeof name, "%.8s (commit)", hash);
+	show_text_doc(name, t);
 }
 
 /* ---- commands --------------------------------------------------------------------- */

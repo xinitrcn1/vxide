@@ -1,4 +1,4 @@
-#define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE /* d_type */
 #include "fstree.h"
 
 #include <dirent.h>
@@ -118,14 +118,21 @@ void fs_load(FsTree *t, u32 node)
 		const char *nm = de->d_name;
 		if (strcmp(nm, ".") == 0 || strcmp(nm, "..") == 0 || fs_excluded(nm))
 			continue;
-		char full[8192];
-		snprintf(full, sizeof full, "%s/%s", path, nm);
-		struct stat st, lst;
+		/* d_type answers without touching the inode (a seek on a slow
+		 * disk); only symlinks and unknown types need a stat */
 		u8 fl = 0;
-		if (lstat(full, &lst) == 0 && S_ISLNK(lst.st_mode))
-			fl |= FS_LINK;
-		if (stat(full, &st) == 0 && S_ISDIR(st.st_mode))
+		unsigned char ty = de->d_type;
+		if (ty == DT_DIR) {
 			fl |= FS_DIR;
+		} else if (ty == DT_LNK || ty == DT_UNKNOWN) {
+			char full[8192];
+			snprintf(full, sizeof full, "%s/%s", path, nm);
+			struct stat st;
+			if (ty == DT_LNK)
+				fl |= FS_LINK;
+			if (stat(full, &st) == 0 && S_ISDIR(st.st_mode))
+				fl |= FS_DIR;
+		}
 		VX_GROW(e, ce, ne + 1);
 		e[ne].name = vx_strdup(nm);
 		e[ne].flags = fl;
@@ -144,6 +151,53 @@ void fs_load(FsTree *t, u32 node)
 		free(e[i].name);
 	}
 	free(e);
+}
+
+/* Re-read one loaded directory in place: children that still exist keep
+ * their node (and open subtree), new ones are added, vanished ones are
+ * unlinked. Used for file-system change events. */
+void fs_reload(FsTree *t, u32 node)
+{
+	if (node >= t->n || !(t->flags[node] & FS_DIR) || !(t->flags[node] & FS_LOADED))
+		return;
+	/* remember the old children by name */
+	u32 old[4096];
+	u32 nold = 0;
+	for (u32 c = t->first[node]; c != FS_NONE && nold < 4096; c = t->next[c])
+		old[nold++] = c;
+	u32 before = t->n;
+	fs_load(t, node); /* appends fresh children */
+	for (u32 c = t->first[node], prev = FS_NONE; c != FS_NONE;) {
+		u32 next = t->next[c];
+		u32 keep = FS_NONE;
+		for (u32 k = 0; k < nold; k++)
+			if (old[k] != FS_NONE && !strcmp(fs_name(t, old[k]), fs_name(t, c)) &&
+			    (t->flags[old[k]] & FS_DIR) == (t->flags[c] & FS_DIR)) {
+				keep = old[k];
+				old[k] = FS_NONE;
+				break;
+			}
+		if (keep != FS_NONE) {
+			/* splice the old node in place of the fresh one */
+			t->next[keep] = next;
+			if (prev == FS_NONE)
+				t->first[node] = keep;
+			else
+				t->next[prev] = keep;
+			prev = keep;
+		} else {
+			prev = c;
+		}
+		c = next;
+	}
+	/* fresh nodes that were replaced are now unreachable; drop them from
+	 * the tail when possible to keep the arrays compact */
+	bool tail_unused = true;
+	for (u32 c = t->first[node]; c != FS_NONE; c = t->next[c])
+		if (c >= before)
+			tail_unused = false;
+	if (tail_unused)
+		t->n = before;
 }
 
 void fs_toggle(FsTree *t, u32 node)
@@ -217,6 +271,29 @@ static u32 lookup(FsTree *t, const char *rel, bool open)
 }
 
 u32 fs_reveal(FsTree *t, const char *rel) { return lookup(t, rel, true); }
+
+u32 fs_find(FsTree *t, const char *rel)
+{
+	if (!*rel)
+		return 0;
+	/* only already-loaded nodes: no directory reads */
+	u32 cur = 0;
+	const char *p = rel;
+	while (*p) {
+		const char *slash = strchr(p, '/');
+		size_t len = slash ? (size_t)(slash - p) : strlen(p);
+		if (!(t->flags[cur] & FS_LOADED))
+			return FS_NONE;
+		u32 c = child_named(t, cur, p, len);
+		if (c == FS_NONE)
+			return FS_NONE;
+		cur = c;
+		if (!slash)
+			break;
+		p = slash + 1;
+	}
+	return cur;
+}
 
 void fs_refresh(FsTree *t)
 {

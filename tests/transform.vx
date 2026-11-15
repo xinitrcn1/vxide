@@ -1,0 +1,26 @@
+# Command palette: case transforms (selection, then word under cursor)
+open src/t.c
+key shift+End
+key ctrl+shift+p
+type transform to upper
+key Return
+expect text HELLO WÖRLD\n
+key ctrl+shift+p
+type transform to title
+key Return
+expect text Hello Wörld\n
+key Down Home
+key ctrl+shift+p
+type transform to snake
+key Return
+expect text foo_bar parseHTTPResponse
+key End
+key ctrl+shift+p
+type transform to kebab
+key Return
+expect text foo_bar parse-http-response
+key ctrl+shift+p
+type transform to lower
+key Return
+key Backspace
+expect text foo_bar parse-http-respons\n

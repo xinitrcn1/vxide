@@ -12,6 +12,7 @@ typedef struct {
 	u32 n, cap;
 	u32 *path; /* relative paths in pool */
 	u32 *base; /* offset of the basename within the path */
+	u64 *ino;  /* inode from readdir (d_ino): disk-friendly read order */
 	Pool pool;
 } FileList;
 
@@ -71,6 +72,10 @@ typedef struct {
  * matches may span lines when the pattern mentions \n. */
 void search_text(SearchResults *r, const char *root, const FileList *fl, Matcher *m,
                  const char *include, const char *exclude, u32 limit);
+/* Same, cancellable (*cancel != 0 stops it) with *done = files visited.
+ * Files are read in inode order; results come back sorted by path. */
+void search_text_ex(SearchResults *r, const char *root, const FileList *fl, Matcher *m, const char *include,
+                    const char *exclude, u32 limit, const _Atomic int *cancel, _Atomic u32 *done);
 void search_free(SearchResults *r);
 
 /* Find in one buffer (used by the editor find widget). Returns the byte

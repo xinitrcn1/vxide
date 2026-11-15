@@ -1,6 +1,7 @@
 /* Inline blame: CLI and libgit2 paths, uncommitted lines, untracked files. */
 #define _POSIX_C_SOURCE 200809L
 #include "blame.h"
+#include "lgblame.h"
 #include "tap.h"
 
 #include <stdio.h>
@@ -55,9 +56,42 @@ int main(void)
 	sh(dir, "printf 'one\\ntwo\\n' > f.txt && git add f.txt && git commit -qm first");
 	sh(dir, "printf 'one\\ntwo\\nthree\\n' > f.txt && git commit -qam second");
 	sh(dir, "printf 'x\\n' > new.txt");
-	run(dir); /* git CLI */
-	setenv("VXIDE_BLAME_LIBGIT2", "1", 1);
-	run(dir); /* libgit2 fallback */
+	run(dir);
+	/* history with a rename and a merge, checked against `git blame` */
+	sh(dir, "printf 'l1\\nl2\\nl3\\nl4\\n' > g.txt && git add g.txt && git commit -qm g1");
+	sh(dir, "git mv g.txt h.txt && git commit -qm rename");
+	sh(dir, "git checkout -qb side && printf 'l1\\nside\\nl3\\nl4\\n' > h.txt && git commit -qam side");
+	sh(dir, "git checkout -q main && printf 'l1\\nl2\\nl3\\nmain\\n' > h.txt && git commit -qam mainchange");
+	sh(dir, "git merge -q --no-edit side");
+	{
+		git_libgit2_init();
+		git_repository *repo;
+		CHECK(git_repository_open(&repo, dir) == 0);
+		LgBlame lb;
+		CHECK(lg_blame_head(repo, "h.txt", &lb) == 0);
+		CHECK(lb.nlines == 4);
+		char cmd[600];
+		snprintf(cmd, sizeof cmd, "cd %s && git blame --root -s --abbrev=9 h.txt | cut -c1-9", dir);
+		FILE *f = popen(cmd, "r");
+		char line[64];
+		u32 l = 0;
+		bool same = true;
+		while (f && fgets(line, sizeof line, f) && l < lb.nlines) {
+			char h[16];
+			git_oid_tostr(h, 10, &lb.oid[lb.line_commit[l]]);
+			if (strncmp(h, line, 9)) {
+				fprintf(stderr, "line %u: ours %s git %.9s\n", l + 1, h, line);
+				same = false;
+			}
+			l++;
+		}
+		if (f)
+			pclose(f);
+		CHECK(same && l == 4);
+		lg_blame_free(&lb);
+		CHECK(lg_blame_head(repo, "nope.txt", &lb) == 1);
+		git_repository_free(repo);
+	}
 	char ago[48];
 	blame_ago(1000, 1000 + 3 * 86400 + 5, ago, sizeof ago);
 	CHECK_STR(ago, "3 days ago");

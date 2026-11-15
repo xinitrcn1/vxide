@@ -38,6 +38,41 @@ static void rev(const char *what, char out[41])
 	out[40] = 0;
 }
 
+static u32 count_of(const char *in, const char *what)
+{
+	char cmd[256], line[64];
+	snprintf(cmd, sizeof cmd, "cd %s && git rev-list --count %s", in, what);
+	FILE *p = popen(cmd, "r");
+	u32 n = 0;
+	if (p && fgets(line, sizeof line, p))
+		n = (u32)strtoul(line, NULL, 10);
+	if (p)
+		pclose(p);
+	return n;
+}
+
+static void sh_in(const char *in, const char *cmd)
+{
+	char buf[2048];
+	snprintf(buf, sizeof buf, "cd %s && (%s) >/dev/null 2>&1", in, cmd);
+	if (system(buf) != 0)
+		fprintf(stderr, "command failed: %s\n", cmd);
+}
+
+static void rev_in(const char *in, const char *what, char out[41])
+{
+	char cmd[256];
+	snprintf(cmd, sizeof cmd, "cd %s && git rev-parse %s", in, what);
+	FILE *p = popen(cmd, "r");
+	out[0] = 0;
+	if (p) {
+		if (fgets(out, 41, p) == NULL)
+			out[0] = 0;
+		pclose(p);
+	}
+	out[40] = 0;
+}
+
 static bool in_set(const u16 *v, u32 n, u16 x)
 {
 	for (u32 i = 0; i < n; i++)
@@ -74,7 +109,12 @@ int main(void)
 	sh("git update-ref refs/remotes/origin/main HEAD~2");
 
 	CHECK(git_graph_load(&g, dir, 1000) == 0);
-	CHECK(g.n == 12);
+	/* scope: main has no upstream and is itself the default base, so only
+	 * HEAD's history is shown (VSCodium's "auto") */
+	CHECK(g.n == count_of(dir, "HEAD") && g.n == 11);
+	CHECK_STR(g.pool.b + g.cur_ref, "main");
+	CHECK_STR(g.pool.b + g.up_ref, "");
+	CHECK_STR(g.pool.b + g.base_ref, "");
 	/* topo order: children before parents */
 	char h[41];
 	rev("HEAD", h);
@@ -87,7 +127,7 @@ int main(void)
 	CHECK(strstr(g.pool.b + g.refs[rv], "origin/main") != NULL);
 	CHECK(g.flags[rv] & GG_MERGE); /* the octopus */
 	rev("other", h);
-	CHECK(row_of(&g, h) != UINT32_MAX); /* all local branches */
+	CHECK(row_of(&g, h) == UINT32_MAX); /* an unrelated branch is not shown */
 	CHECK(g.flags[g.n - 1] & GG_ROOT);
 	CHECK_STR(g.pool.b + g.subject[g.n - 1], "c1");
 	CHECK_STR(g.pool.b + g.author[0], "Ada");
@@ -190,6 +230,80 @@ int main(void)
 	d = git_show_file_diff(dir, h, "a.txt");
 	CHECK(d && strstr(d, "new file mode") && strstr(d, "+a\n"));
 	free(d);
+
+	/* a whole commit, git show style */
+	rev(":/^c2", h);
+	d = git_show_commit(dir, h);
+	CHECK(d && !strncmp(d, "commit ", 7) && strstr(d, "Author:     Ada <ada@x>") && strstr(d, "    c2\n") &&
+	      strstr(d, "1 file changed, 2 insertions(+)") && strstr(d, "+++ b/a.txt"));
+	free(d);
+	CHECK(git_show_commit(dir, "--evil") == NULL);
+
+	/* detached HEAD: just HEAD */
+	sh("git checkout -q --detach HEAD~1");
+	CHECK(git_graph_load(&g, dir, 1000) == 0);
+	CHECK(g.n == count_of(dir, "HEAD"));
+	CHECK_STR(g.pool.b + g.cur_ref, "");
+	CHECK(g.flags[0] & GG_HEAD);
+	CHECK(!strcmp(g.pool.b + g.refs[0], "HEAD") || !strncmp(g.pool.b + g.refs[0], "HEAD,", 5));
+	git_graph_free(&g);
+	sh("git switch -q main");
+
+	/* feature branch: its upstream on a bare remote and its base (main) */
+	{
+		char repo[96], bare[96], clone[96];
+		snprintf(repo, sizeof repo, "%s.feat", dir);
+		snprintf(bare, sizeof bare, "%s.bare.git", dir);
+		snprintf(clone, sizeof clone, "%s.clone", dir);
+		char cmd[1024];
+		snprintf(cmd, sizeof cmd,
+		         "git init -q -b main %s && git init -q --bare -b main %s && cd %s && git config user.name Ada && "
+		         "git config user.email ada@x && printf '1\\n' > a && git add a && git commit -qm c1 && "
+		         "git commit -q --allow-empty -m c2 && git remote add origin %s && git push -q -u origin main && "
+		         "git switch -q -c feature main && git commit -q --allow-empty -m f1 && git push -q -u origin feature",
+		         repo, bare, repo, bare);
+		sh_in("/tmp", cmd);
+		snprintf(cmd, sizeof cmd,
+		         "git clone -q -b feature %s %s && cd %s && git config user.name Bob && git config user.email bob@x && "
+		         "git commit -q --allow-empty -m r1 && git push -q origin feature",
+		         bare, clone, clone);
+		sh_in("/tmp", cmd);
+		sh_in(repo, "git fetch -q origin && git switch -q main && git commit -q --allow-empty -m m3 && "
+		            "git branch third main~1 && git switch -q third && git commit -q --allow-empty -m t1 && "
+		            "git switch -q feature");
+		CHECK(git_graph_load(&g, repo, 1000) == 0);
+		CHECK_STR(g.pool.b + g.cur_ref, "feature");
+		CHECK_STR(g.pool.b + g.up_ref, "origin/feature");
+		CHECK_STR(g.pool.b + g.base_ref, "main"); /* reflog: "branch: Created from main" */
+		char hm[41], hr[41], hf[41], ht[41];
+		rev_in(repo, "main", hm);
+		rev_in(repo, "origin/feature", hr);
+		rev_in(repo, "feature", hf);
+		rev_in(repo, "third", ht);
+		CHECK(row_of(&g, hm) != UINT32_MAX); /* the base's newer commit */
+		CHECK(row_of(&g, hr) != UINT32_MAX); /* the remote's commit */
+		CHECK(row_of(&g, hf) != UINT32_MAX);
+		CHECK(row_of(&g, ht) == UINT32_MAX); /* an unrelated third branch is absent */
+		u32 rf = row_of(&g, hf);
+		CHECK(rf != UINT32_MAX && strstr(g.pool.b + g.refs[rf], "HEAD -> feature"));
+		u32 rr = row_of(&g, hr);
+		CHECK(rr != UINT32_MAX && strstr(g.pool.b + g.refs[rr], "origin/feature"));
+		CHECK(g.n == count_of(repo, "feature origin/feature main"));
+		git_graph_free(&g);
+		/* VSCodium's merge-base config wins over the reflog */
+		sh_in(repo, "git config branch.feature.vscode-merge-base third");
+		CHECK(git_graph_load(&g, repo, 1000) == 0);
+		CHECK_STR(g.pool.b + g.base_ref, "third");
+		CHECK(row_of(&g, ht) != UINT32_MAX && row_of(&g, hm) == UINT32_MAX);
+		git_graph_free(&g);
+		/* without config or reflog hint: the upstream remote's default branch */
+		sh_in(repo, "git config --unset branch.feature.vscode-merge-base && rm -f .git/logs/refs/heads/feature");
+		CHECK(git_graph_load(&g, repo, 1000) == 0);
+		CHECK_STR(g.pool.b + g.base_ref, "origin/main");
+		git_graph_free(&g);
+		snprintf(cmd, sizeof cmd, "rm -rf %s %s %s", repo, bare, clone);
+		system(cmd);
+	}
 
 	char cmd[300];
 	snprintf(cmd, sizeof cmd, "rm -rf %s", dir);

@@ -18,7 +18,7 @@ LDLIBS+=	${PKG_LIBS} -lm -lpthread
 B=		build
 
 # Core modules: no window or GPU, unit-tested on their own.
-CORE=		base text syntax theme fstree json lsp git gitops gitgraph blame regex search png
+CORE=		base text syntax theme fstree json lsp git gitops gitgraph lgblame blame regex search png
 # Front end: window, Vulkan, fonts, UI.
 APP=		main gpu font icons draw ui editor panes menu actions gitui
 

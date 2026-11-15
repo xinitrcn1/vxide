@@ -5,6 +5,7 @@
 #include "png.h"
 
 #include <limits.h>
+#include <locale.h>
 #include <stdio.h>
 #include <strings.h>
 #include <time.h>
@@ -378,6 +379,9 @@ static void usage(void)
 
 int main(int argc, char **argv)
 {
+	/* towupper/towlower for the case transforms need a UTF-8 ctype */
+	if (!setlocale(LC_CTYPE, "C.UTF-8"))
+		setlocale(LC_CTYPE, "");
 	const char *dir = ".";
 	const char *script = NULL;
 	int hw = 0, hh = 0;

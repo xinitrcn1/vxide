@@ -1,8 +1,16 @@
 /* Source Control Graph (VSCodium's scm.graph) and commit details.
  *
- * The graph lists commits reachable from HEAD, every local branch and
- * every remote-tracking branch (`git log --topo-order HEAD --branches
- * --remotes`), newest first, with lanes assigned by the usual algorithm:
+ * The graph follows VSCodium's scm.graph "auto" scope: commits reachable
+ * from HEAD, the current branch's upstream and its base branch, newest
+ * first (libgit2 revwalk, topological + time order). The base is, in
+ * order: git config branch.<name>.vscode-merge-base (VSCodium's key), the
+ * branch's oldest reflog entry "branch: Created from <ref>", the default
+ * branch of the upstream's remote (<remote>/HEAD, else <remote>/main or
+ * <remote>/master), then a local main/master; refs equal to the branch or
+ * its upstream are skipped. Detached HEAD shows HEAD only. Decorations
+ * list every ref (tags included) pointing at a shown commit.
+ *
+ * Lanes are assigned by the usual algorithm:
  * active lanes hold the commit they expect next; a commit takes the
  * leftmost lane expecting it and closes the others (they merge into it);
  * its first parent continues its lane; other parents join a lane already
@@ -35,10 +43,13 @@ typedef struct {
 	u16 *e_x0, *e_x1;
 	u8 *e_color, *e_half;
 	u16 lanes;           /* widest row, in lanes */
+	u32 cur_ref, up_ref, base_ref; /* refs shown: "feature", "origin/feature", "main" ("" when none) */
 	Pool pool;
 } GitGraph;
 
-/* 0 on success (an empty or unborn repository gives n = 0). */
+/* 0 on success (an empty or unborn repository gives n = 0). The
+ * repository handle is cached per work tree across calls (serialised by a
+ * mutex), so repeated loads reuse libgit2's object and pack caches. */
 int git_graph_load(GitGraph *g, const char *workdir, u32 limit);
 void git_graph_free(GitGraph *g);
 
@@ -63,5 +74,8 @@ void git_commit_info_free(GitCommitInfo *ci);
 /* Unified diff of one file in a commit (vs its first parent; the root
  * commit against the empty tree). malloc'd, NULL on error. */
 char *git_show_file_diff(const char *workdir, const char *hash, const char *path);
+/* `git show --stat --patch --format=fuller` of one commit (vs its first
+ * parent), on libgit2. malloc'd, NULL on error. */
+char *git_show_commit(const char *workdir, const char *hash);
 
 #endif

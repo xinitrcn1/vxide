@@ -34,11 +34,20 @@ typedef struct {
 } GitStatus;
 
 Git *git_open(const char *dir); /* NULL when dir is not inside a repo */
+/* scan = false: open without computing the status (see git_refresh_async). */
+Git *git_open_ex(const char *dir, bool scan);
 void git_close(Git *g);
 const char *git_workdir(Git *g); /* absolute, with trailing '/' */
 
 /* Re-read status, branch, ahead/behind. Returns 0 on success. */
 int git_refresh(Git *g);
+/* Recompute the status on a background thread (own repository handle,
+ * refreshed stat data written back to the index like `git status`). The
+ * UI thread calls git_poll each tick: true when a new table was swapped
+ * in. git_refreshing tells whether a refresh is pending or running. */
+int git_refresh_async(Git *g);
+bool git_poll(Git *g);
+bool git_refreshing(Git *g);
 const GitStatus *git_status(Git *g);
 const char *git_branch(Git *g); /* "main", or short hash when detached */
 void git_ahead_behind(Git *g, u32 *ahead, u32 *behind);

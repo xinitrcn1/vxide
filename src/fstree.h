@@ -29,6 +29,8 @@ bool fs_excluded(const char *name);
 void fs_init(FsTree *t, const char *root);
 void fs_free(FsTree *t);
 void fs_load(FsTree *t, u32 node);   /* (re)read one directory */
+void fs_reload(FsTree *t, u32 node); /* re-read keeping open subfolders */
+u32 fs_find(FsTree *t, const char *rel); /* loaded node for a path, no I/O */
 void fs_toggle(FsTree *t, u32 node); /* expand/collapse (loads on demand) */
 void fs_collapse_all(FsTree *t);
 /* Rebuild from disk, keeping which folders are open. */

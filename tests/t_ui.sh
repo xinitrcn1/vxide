@@ -19,6 +19,9 @@ grep -q 'value_9' "$tmp/src/b.c"
 # multi-cursor
 printf 'aa x\nbb x\ncc x\ndd\n' > "$tmp/src/m.c"
 VXIDE_NO_LSP=1 ./build/vxide --headless 1000x700 --script tests/multicursor.vx "$tmp"
+# command palette case transforms
+printf 'hello w\303\266rld\nfooBar parseHTTPResponse\n' > "$tmp/src/t.c"
+VXIDE_NO_LSP=1 ./build/vxide --headless 1000x700 --script tests/transform.vx "$tmp"
 # git actions in a scratch repository
 repo="$tmp/repo"
 mkdir -p "$repo"

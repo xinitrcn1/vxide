@@ -1,11 +1,10 @@
 /* Inline git blame (VSCodium's git.blame.editorDecoration): who last
- * changed each line of the live buffer. A worker thread runs
- * `git blame --incremental --contents <snapshot>` like VSCodium (the CLI
- * uses the commit-graph Bloom filters: ~0.25 s where libgit2's blame took
- * 12 s on a 99-commit, 22k-line file). Without a git binary it falls back
- * to libgit2: blame the committed file once per HEAD, then replay the
- * buffer with git_blame_buffer. Edited lines read "Not Committed Yet".
- * The UI thread only reads the published table. */
+ * changed each line of the live buffer. A worker thread with its own
+ * libgit2 repository handle runs lgblame.c (a blame on libgit2
+ * primitives that reads only the objects along the file's path) once per
+ * (path, HEAD), then maps the live buffer onto the HEAD blob with one
+ * diff per request, so edited lines read "Not Committed Yet". The UI
+ * thread only reads the published table. */
 #ifndef VX_BLAME_H
 #define VX_BLAME_H
 

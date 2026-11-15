@@ -12,6 +12,7 @@
 
 #include <git2.h>
 #include <git2/sys/errors.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -22,6 +23,16 @@ struct Git {
 	GitStatus st;
 	char branch[256];
 	u32 ahead, behind;
+	/* asynchronous refresh: a worker with its own repository handle builds
+	 * the next status table; git_poll swaps it in on the UI thread */
+	pthread_t th;
+	pthread_mutex_t mu;
+	pthread_cond_t cv;
+	bool async, want, quit, ready, busy;
+	git_repository *wrepo;
+	GitStatus wst;
+	char wbranch[256];
+	u32 wahead, wbehind;
 	/* ignore memo: open addressing, key = pool offset, val = 0/1 */
 	Pool ign_pool;
 	u32 *ign_key; /* offset + 1, 0 = empty */
@@ -57,7 +68,9 @@ static void ign_clear(Git *g)
 	g->ign_n = 0;
 }
 
-Git *git_open(const char *dir)
+Git *git_open(const char *dir) { return git_open_ex(dir, true); }
+
+Git *git_open_ex(const char *dir, bool scan)
 {
 	if (g_lib_refs++ == 0)
 		git_libgit2_init();
@@ -72,7 +85,8 @@ Git *git_open(const char *dir)
 	Git *g = vx_alloc(sizeof *g);
 	g->repo = repo;
 	g->workdir = vx_strdup(git_repository_workdir(repo));
-	git_refresh(g);
+	if (scan)
+		git_refresh(g);
 	return g;
 }
 
@@ -80,6 +94,17 @@ void git_close(Git *g)
 {
 	if (!g)
 		return;
+	if (g->async) {
+		pthread_mutex_lock(&g->mu);
+		g->quit = true;
+		pthread_cond_signal(&g->cv);
+		pthread_mutex_unlock(&g->mu);
+		pthread_join(g->th, NULL);
+		status_free(&g->wst);
+		git_repository_free(g->wrepo);
+		pthread_mutex_destroy(&g->mu);
+		pthread_cond_destroy(&g->cv);
+	}
 	status_free(&g->st);
 	pool_free(&g->ign_pool);
 	free(g->ign_key);
@@ -116,9 +141,8 @@ static int cmp_entry(const void *a, const void *b)
 	return strcmp(g_sort_pool + x[0], g_sort_pool + y[0]);
 }
 
-static void refresh_status(Git *g)
+static void refresh_status_into(git_repository *repo, GitStatus *st, bool update_index)
 {
-	GitStatus *st = &g->st;
 	st->count = 0;
 	pool_clear(&st->pool);
 
@@ -126,8 +150,19 @@ static void refresh_status(Git *g)
 	opt.show = GIT_STATUS_SHOW_INDEX_AND_WORKDIR;
 	opt.flags = GIT_STATUS_OPT_INCLUDE_UNTRACKED | GIT_STATUS_OPT_RECURSE_UNTRACKED_DIRS |
 	            GIT_STATUS_OPT_RENAMES_HEAD_TO_INDEX | GIT_STATUS_OPT_RENAMES_INDEX_TO_WORKDIR;
+	/* Write refreshed stat data back to the index (git status does the
+	 * same): files whose mtime changed but not their content are hashed
+	 * once instead of on every refresh, which matters on slow disks. */
+	if (update_index)
+		opt.flags |= GIT_STATUS_OPT_UPDATE_INDEX;
 	git_status_list *list = NULL;
-	if (git_status_list_new(&list, g->repo, &opt) < 0) {
+	int rc = git_status_list_new(&list, repo, &opt);
+	if (rc < 0 && update_index) {
+		/* index locked by another git: just read it */
+		opt.flags &= ~(unsigned)GIT_STATUS_OPT_UPDATE_INDEX;
+		rc = git_status_list_new(&list, repo, &opt);
+	}
+	if (rc < 0) {
 		set_err("status");
 		return;
 	}
@@ -167,20 +202,22 @@ static void refresh_status(Git *g)
 	free(pairs);
 }
 
-static void refresh_branch(Git *g)
+static void refresh_status(Git *g) { refresh_status_into(g->repo, &g->st, false); }
+
+static void refresh_branch_into(git_repository *repo, char *branch, size_t cap, u32 *ahead, u32 *behind)
 {
-	g->branch[0] = 0;
-	g->ahead = g->behind = 0;
+	branch[0] = 0;
+	*ahead = *behind = 0;
 	git_reference *head = NULL;
-	int r = git_repository_head(&head, g->repo);
+	int r = git_repository_head(&head, repo);
 	if (r == GIT_EUNBORNBRANCH || r == GIT_ENOTFOUND) {
 		git_reference *sym = NULL;
-		if (git_reference_lookup(&sym, g->repo, "HEAD") == 0) {
+		if (git_reference_lookup(&sym, repo, "HEAD") == 0) {
 			const char *t = git_reference_symbolic_target(sym);
 			if (t) {
 				if (strncmp(t, "refs/heads/", 11) == 0)
 					t += 11;
-				snprintf(g->branch, sizeof g->branch, "%s", t);
+				snprintf(branch, cap, "%s", t);
 			}
 			git_reference_free(sym);
 		}
@@ -190,25 +227,109 @@ static void refresh_branch(Git *g)
 		set_err("head");
 		return;
 	}
-	if (git_repository_head_detached(g->repo)) {
+	if (git_repository_head_detached(repo)) {
 		const git_oid *id = git_reference_target(head);
 		if (id)
-			git_oid_tostr(g->branch, 8, id);
+			git_oid_tostr(branch, 8, id);
 	} else {
-		snprintf(g->branch, sizeof g->branch, "%s", git_reference_shorthand(head));
+		snprintf(branch, cap, "%s", git_reference_shorthand(head));
 		git_reference *up = NULL;
 		if (git_branch_upstream(&up, head) == 0) {
 			const git_oid *a = git_reference_target(head), *b = git_reference_target(up);
 			size_t ah = 0, bh = 0;
-			if (a && b && git_graph_ahead_behind(&ah, &bh, g->repo, a, b) == 0) {
-				g->ahead = (u32)ah;
-				g->behind = (u32)bh;
+			if (a && b && git_graph_ahead_behind(&ah, &bh, repo, a, b) == 0) {
+				*ahead = (u32)ah;
+				*behind = (u32)bh;
 			}
 			git_reference_free(up);
 		}
 		git_error_clear();
 	}
 	git_reference_free(head);
+}
+
+static void refresh_branch(Git *g) { refresh_branch_into(g->repo, g->branch, sizeof g->branch, &g->ahead, &g->behind); }
+
+static void *refresh_worker(void *arg)
+{
+	Git *g = arg;
+	pthread_mutex_lock(&g->mu);
+	for (;;) {
+		while (!g->want && !g->quit)
+			pthread_cond_wait(&g->cv, &g->mu);
+		if (g->quit)
+			break;
+		g->want = false;
+		g->busy = true;
+		pthread_mutex_unlock(&g->mu);
+		GitStatus st = {0};
+		char br[256];
+		u32 ah, bh;
+		refresh_status_into(g->wrepo, &st, true);
+		refresh_branch_into(g->wrepo, br, sizeof br, &ah, &bh);
+		pthread_mutex_lock(&g->mu);
+		status_free(&g->wst);
+		g->wst = st;
+		memcpy(g->wbranch, br, sizeof br);
+		g->wahead = ah;
+		g->wbehind = bh;
+		g->ready = true;
+		g->busy = false;
+	}
+	pthread_mutex_unlock(&g->mu);
+	return NULL;
+}
+
+int git_refresh_async(Git *g)
+{
+	if (!g->async) {
+		if (git_repository_open(&g->wrepo, g->workdir) != 0)
+			return git_refresh(g);
+		pthread_mutex_init(&g->mu, NULL);
+		pthread_cond_init(&g->cv, NULL);
+		if (pthread_create(&g->th, NULL, refresh_worker, g) != 0) {
+			git_repository_free(g->wrepo);
+			g->wrepo = NULL;
+			return git_refresh(g);
+		}
+		g->async = true;
+	}
+	pthread_mutex_lock(&g->mu);
+	g->want = true;
+	pthread_cond_signal(&g->cv);
+	pthread_mutex_unlock(&g->mu);
+	return 0;
+}
+
+bool git_poll(Git *g)
+{
+	if (!g->async)
+		return false;
+	pthread_mutex_lock(&g->mu);
+	bool r = g->ready;
+	if (r) {
+		GitStatus old = g->st;
+		g->st = g->wst;
+		g->wst = old; /* freed by the worker on its next run */
+		memcpy(g->branch, g->wbranch, sizeof g->branch);
+		g->ahead = g->wahead;
+		g->behind = g->wbehind;
+		g->ready = false;
+	}
+	pthread_mutex_unlock(&g->mu);
+	if (r)
+		ign_clear(g); /* .gitignore files may have changed too */
+	return r;
+}
+
+bool git_refreshing(Git *g)
+{
+	if (!g->async)
+		return false;
+	pthread_mutex_lock(&g->mu);
+	bool b = g->busy || g->want;
+	pthread_mutex_unlock(&g->mu);
+	return b;
 }
 
 int git_refresh(Git *g)

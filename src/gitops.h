@@ -1,12 +1,18 @@
-/* Git actions through the git CLI (what VSCodium does): an async runner
- * with a FIFO queue on a worker thread for the SCM actions (stash, rebase,
- * merge, branch, fetch/pull/push, amend, ...), plus fast synchronous
- * queries (branches, stashes, tags, remotes, in-progress operation).
+/* Git actions on libgit2: an async runner with a FIFO queue on a worker
+ * thread (its own git_repository) for the SCM actions (stash, rebase,
+ * merge, branch, cherry-pick, fetch/pull/push, amend, tags, ...), plus
+ * synchronous queries (branches, stashes, tags, remotes, in-progress
+ * operation) on a second repository handle owned by the caller's thread.
  *
- * Children run from an absolute git path (no PATH search in libc), no
- * shell, stdin from /dev/null unless text is given, and the environment
- * GIT_TERMINAL_PROMPT=0 GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true LC_ALL=C
- * so nothing ever waits for a terminal or an editor. */
+ * Network operations authenticate with ssh-agent, then ~/.ssh/id_ed25519,
+ * id_ecdsa, id_rsa (no passphrase prompts, bounded retries). When libgit2
+ * cannot do a network operation (https credential helpers, auth or
+ * transport errors) it is retried once with the git CLI if one exists.
+ *
+ * The git CLI runner (git_cli) remains for that fallback and for raw
+ * gitops_run() argv that has no libgit2 mapping. Children run from an
+ * absolute git path, no shell, stdin from /dev/null unless text is given,
+ * and GIT_TERMINAL_PROMPT=0 GIT_EDITOR=true LC_ALL=C. */
 #ifndef VX_GITOPS_H
 #define VX_GITOPS_H
 
@@ -43,13 +49,18 @@ typedef struct {
 	u64 ns; /* duration */
 } GitOpResult;
 
-GitOps *gitops_start(const char *workdir); /* NULL without a git binary */
-/* Stops the worker: queued ops are dropped, a running child is killed
- * (SIGTERM, then SIGKILL after 500 ms), then the thread is joined. */
+/* libgit2 init + cache tuning (idempotent; gitops_start and the graph call it). */
+void gitops_libgit2_init(void);
+GitOps *gitops_start(const char *workdir); /* NULL when workdir is not in a repository */
+/* Stops the worker: queued ops are dropped, a running network transfer
+ * is cancelled, a running CLI child is killed (SIGTERM, then SIGKILL after
+ * 500 ms), then the thread is joined. */
 void gitops_stop(GitOps *o);
 const char *gitops_workdir(const GitOps *o);
 /* Queue `git argv...` (argv NULL terminated, without "git"); returns the
- * op id (> 0). stdin_text may be NULL. */
+ * op id (> 0). stdin_text may be NULL. "reset -q", "restore --worktree --
+ * ." and "checkout --detach <rev>" run on libgit2; anything else runs the
+ * git CLI. */
 u32 gitops_run(GitOps *o, const char *label, const char *const *argv, const char *stdin_text);
 /* True while an op runs or is queued; label of the running one. */
 bool gitops_busy(GitOps *o, char *label, size_t cap);

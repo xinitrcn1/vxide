@@ -4,6 +4,7 @@
 #include "syntax.h"
 
 #include <ctype.h>
+#include <wctype.h>
 #include <stdio.h>
 #include <time.h>
 #include <SDL3/SDL.h>
@@ -1240,6 +1241,103 @@ static void undo_redo(View *v, bool redo)
 	ed_reveal(v, b, false);
 }
 
+/* ---- case transforms (Transform to Uppercase/Lowercase/Title/Snake/Kebab) ---- */
+
+enum { TR_UPPER, TR_LOWER, TR_TITLE, TR_SNAKE, TR_KEBAB };
+
+static void put_cp(char **o, u32 *n, u32 *cap, u32 cp)
+{
+	char b[4];
+	u32 k = utf8_encode(cp, b);
+	VX_GROW(*o, *cap, *n + k + 1);
+	memcpy(*o + *n, b, k);
+	*n += k;
+}
+
+/* Transform one piece of text; returns a malloc'd string. */
+static char *transform(const char *s, u32 n, int mode, u32 *outn)
+{
+	char *o = NULL;
+	u32 on = 0, cap = 0;
+	u32 prev = 0; /* previous code point */
+	for (u32 i = 0; i < n;) {
+		u32 cp;
+		u32 k = utf8_decode(s + i, n - i, &cp);
+		i += k ? k : 1;
+		u32 r = cp;
+		switch (mode) {
+		case TR_UPPER:
+			r = (u32)towupper((wint_t)cp);
+			break;
+		case TR_LOWER:
+			r = (u32)towlower((wint_t)cp);
+			break;
+		case TR_TITLE: {
+			/* VSCodium: lower-case, then capitalise the first letter of each word */
+			bool start = !prev || !iswalnum((wint_t)prev);
+			r = start ? (u32)towupper((wint_t)cp) : (u32)towlower((wint_t)cp);
+			break;
+		}
+		case TR_SNAKE:
+		case TR_KEBAB: {
+			/* fooBar / FooBAR baz -> foo_bar / foo_bar baz; separators become _ or - */
+			u32 sep = mode == TR_SNAKE ? '_' : '-';
+			if (cp == '_' || cp == '-') {
+				r = sep;
+				break;
+			}
+			bool up = iswupper((wint_t)cp);
+			u32 nextcp = 0;
+			if (i < n)
+				utf8_decode(s + i, n - i, &nextcp);
+			bool boundary = prev && up &&
+			                (iswlower((wint_t)prev) || iswdigit((wint_t)prev) ||
+			                 (iswupper((wint_t)prev) && nextcp && iswlower((wint_t)nextcp)));
+			if (boundary)
+				put_cp(&o, &on, &cap, sep);
+			r = (u32)towlower((wint_t)cp);
+			break;
+		}
+		}
+		put_cp(&o, &on, &cap, r);
+		prev = cp;
+	}
+	VX_GROW(o, cap, on + 1);
+	o[on] = 0;
+	*outn = on;
+	return o;
+}
+
+static void transform_selections(View *v, int mode)
+{
+	Text *t = T(v);
+	u32 g = group_for(v, GK_OTHER);
+	for (u32 c = 0; c < v->nc; c++) {
+		u32 a = sel_lo(v, c), b = sel_hi(v, c);
+		bool empty = a == b;
+		if (empty)
+			word_at(t, a, &a, &b); /* the word under the cursor, like VSCodium */
+		if (a == b)
+			continue;
+		char *src = vx_alloc(b - a + 1);
+		text_copy(t, a, b - a, src);
+		u32 nn;
+		char *dst = transform(src, b - a, mode, &nn);
+		bool fwd = v->head[c] >= v->anchor[c];
+		u32 h = v->head[c];
+		edit(v, a, b - a, dst, nn, g);
+		if (empty) {
+			/* a cursor at the end of the word stays at its (new) end */
+			v->head[c] = v->anchor[c] = h == b ? a + nn : VX_MIN(h, a + nn);
+		} else {
+			v->anchor[c] = fwd ? a : a + nn;
+			v->head[c] = fwd ? a + nn : a;
+		}
+		free(src);
+		free(dst);
+	}
+}
+
 static void move_sel_next_match(View *v)
 {
 	/* Ctrl+K Ctrl+D: like Ctrl+D, but the last selection moves instead */
@@ -1277,6 +1375,11 @@ bool ed_command(View *v, int cmd)
 	case CMD_INSERT_LINE_ABOVE:
 	case CMD_UNDO:
 	case CMD_REDO:
+	case CMD_TRANSFORM_UPPER:
+	case CMD_TRANSFORM_LOWER:
+	case CMD_TRANSFORM_TITLE:
+	case CMD_TRANSFORM_SNAKE:
+	case CMD_TRANSFORM_KEBAB:
 		if (readonly_doc(v))
 			return true;
 		break;
@@ -1284,6 +1387,13 @@ bool ed_command(View *v, int cmd)
 		break;
 	}
 	switch (cmd) {
+	case CMD_TRANSFORM_UPPER:
+	case CMD_TRANSFORM_LOWER:
+	case CMD_TRANSFORM_TITLE:
+	case CMD_TRANSFORM_SNAKE:
+	case CMD_TRANSFORM_KEBAB:
+		transform_selections(v, cmd - CMD_TRANSFORM_UPPER);
+		return true;
 	case CMD_MOVE_SEL_NEXT_MATCH:
 		cursor_history_push(v);
 		move_sel_next_match(v);

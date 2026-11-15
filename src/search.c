@@ -1,8 +1,9 @@
-#define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE /* d_type, d_ino, posix_fadvise */
 #include "search.h"
 #include "fstree.h"
 
 #include <ctype.h>
+#include <stdatomic.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -19,14 +20,16 @@ static bool search_excluded(const char *name)
 	       strcmp(name, "bower_components") == 0;
 }
 
-static void fl_add(FileList *fl, const char *rel, u32 n)
+static void fl_add(FileList *fl, const char *rel, u32 n, u64 ino)
 {
 	if (fl->n == fl->cap) {
 		u32 c = fl->cap ? fl->cap * 2 : 1024;
 		fl->path = vx_realloc(fl->path, c * sizeof(u32));
 		fl->base = vx_realloc(fl->base, c * sizeof(u32));
+		fl->ino = vx_realloc(fl->ino, c * sizeof(u64));
 		fl->cap = c;
 	}
+	fl->ino[fl->n] = ino;
 	const char *slash = strrchr(rel, '/');
 	fl->base[fl->n] = slash ? (u32)(slash - rel + 1) : 0;
 	fl->path[fl->n] = pool_add(&fl->pool, rel, n);
@@ -59,22 +62,23 @@ static void walk(FileList *fl, const char *root, char *rel, u32 rl, SkipFn skip,
 			rel[l2++] = '/';
 		memcpy(rel + l2, nm, nl + 1);
 		l2 += nl;
-		char full[8192];
-		snprintf(full, sizeof full, "%s/%s", root, rel);
-		struct stat st;
-		bool dir = false;
-		if (lstat(full, &st) == 0) {
-			dir = S_ISDIR(st.st_mode); /* do not follow symlinked dirs */
-			if (!dir && !S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode)) {
-				rel[rl] = 0;
-				continue;
-			}
+		/* d_type: no inode reads (seeks on a slow disk) for the common case */
+		bool dir = de->d_type == DT_DIR;
+		if (de->d_type == DT_UNKNOWN) {
+			char full[8192];
+			snprintf(full, sizeof full, "%s/%s", root, rel);
+			struct stat st;
+			if (lstat(full, &st) == 0)
+				dir = S_ISDIR(st.st_mode); /* do not follow symlinked dirs */
+		} else if (!dir && de->d_type != DT_REG && de->d_type != DT_LNK) {
+			rel[rl] = 0; /* sockets, fifos, devices */
+			continue;
 		}
 		if (!(skip && skip(ctx, rel, dir))) {
 			if (dir)
 				walk(fl, root, rel, l2, skip, ctx, limit, depth + 1);
 			else
-				fl_add(fl, rel, l2);
+				fl_add(fl, rel, l2, (u64)de->d_ino);
 		}
 		rel[rl] = 0;
 	}
@@ -93,6 +97,7 @@ void files_free(FileList *fl)
 {
 	free(fl->path);
 	free(fl->base);
+	free(fl->ino);
 	pool_free(&fl->pool);
 	memset(fl, 0, sizeof *fl);
 }
@@ -433,8 +438,39 @@ bool glob_list_match(const char *list, const char *rel)
 
 /* ---- workspace search ------------------------------------------------------------- */
 
-void search_text(SearchResults *r, const char *root, const FileList *fl, Matcher *m, const char *include,
-                 const char *exclude, u32 limit)
+static const FileList *g_sort_fl;
+static int ino_cmp(const void *a, const void *b)
+{
+	u64 x = g_sort_fl->ino[*(const u32 *)a], y = g_sort_fl->ino[*(const u32 *)b];
+	return x < y ? -1 : x > y;
+}
+
+static const SearchResults *g_sort_r;
+static int res_cmp(const void *a, const void *b)
+{
+	u32 i = *(const u32 *)a, j = *(const u32 *)b;
+	const SearchResults *r = g_sort_r;
+	if (r->file[i] != r->file[j]) {
+		int c = strcmp(g_sort_fl->pool.b + g_sort_fl->path[r->file[i]], g_sort_fl->pool.b + g_sort_fl->path[r->file[j]]);
+		if (c)
+			return c;
+	}
+	if (r->line[i] != r->line[j])
+		return r->line[i] < r->line[j] ? -1 : 1;
+	return r->col[i] < r->col[j] ? -1 : r->col[i] > r->col[j];
+}
+
+static void permute_u32(u32 *a, const u32 *perm, u32 n)
+{
+	u32 *t = vx_alloc((n + 1) * sizeof(u32));
+	for (u32 i = 0; i < n; i++)
+		t[i] = a[perm[i]];
+	memcpy(a, t, n * sizeof(u32));
+	free(t);
+}
+
+void search_text_ex(SearchResults *r, const char *root, const FileList *fl, Matcher *m, const char *include,
+                    const char *exclude, u32 limit, const _Atomic int *cancel, _Atomic u32 *done)
 {
 	r->n = 0;
 	r->files_hit = 0;
@@ -443,32 +479,62 @@ void search_text(SearchResults *r, const char *root, const FileList *fl, Matcher
 	if (!m->nq || ((m->flags & SEARCH_REGEX) && !m->re))
 		return;
 	bool inc = include && *include, exc = exclude && *exclude;
-	for (u32 f = 0; f < fl->n && !r->truncated; f++) {
+	/* Visit files in inode order: inodes are allocated close to their data
+	 * on UFS and roughly in creation order on ZFS, so a slow disk seeks
+	 * forward instead of back and forth. */
+	u32 *order = vx_alloc((fl->n + 1) * sizeof(u32));
+	u32 no = 0;
+	for (u32 f = 0; f < fl->n; f++) {
 		const char *rel = fl->pool.b + fl->path[f];
 		if (inc && !glob_list_match(include, rel))
 			continue;
 		if (exc && glob_list_match(exclude, rel))
 			continue;
+		order[no++] = f;
+	}
+	if (fl->ino) {
+		g_sort_fl = fl;
+		qsort(order, no, sizeof(u32), ino_cmp);
+	}
+	char *buf = NULL;
+	u32 cap = 0;
+	for (u32 oi = 0; oi < no && !r->truncated; oi++) {
+		if (cancel && atomic_load(cancel))
+			break;
+		if (done)
+			atomic_store(done, oi);
+		u32 f = order[oi];
 		char path[8192];
-		snprintf(path, sizeof path, "%s/%s", root, rel);
-		int fd = open(path, O_RDONLY);
+		snprintf(path, sizeof path, "%s/%s", root, fl->pool.b + fl->path[f]);
+		int fd = open(path, O_RDONLY | O_CLOEXEC);
 		if (fd < 0)
 			continue;
-		struct stat st;
-		if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size == 0 || st.st_size > (64 << 20)) {
-			close(fd);
-			continue;
+#ifdef POSIX_FADV_SEQUENTIAL
+		posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
+		/* read() in big chunks: one sequential request per file rather than
+		 * a page fault per 4 KiB as with mmap */
+		u32 n = 0;
+		bool binary = false, too_big = false;
+		for (;;) {
+			VX_GROW(buf, cap, n + 262144);
+			ssize_t k = read(fd, buf + n, cap - n);
+			if (k <= 0)
+				break;
+			if (n < 8192 && memchr(buf + n, 0, (size_t)VX_MIN(k, 8192 - (ssize_t)n))) {
+				binary = true; /* NUL in the first 8 KiB */
+				break;
+			}
+			n += (u32)k;
+			if (n > (64u << 20)) {
+				too_big = true;
+				break;
+			}
 		}
-		u32 n = (u32)st.st_size;
-		const char *b = mmap(NULL, n, PROT_READ, MAP_PRIVATE, fd, 0);
 		close(fd);
-		if (b == MAP_FAILED)
+		if (binary || too_big || !n)
 			continue;
-		/* skip binaries: NUL in the first 8 KiB */
-		if (memchr(b, 0, VX_MIN(n, 8192u))) {
-			munmap((void *)b, n);
-			continue;
-		}
+		const char *b = buf;
 		u32 hits = r->n;
 		u32 line = 0, ls = 0, scanned = 0;
 		u32 pos = 0;
@@ -499,8 +565,31 @@ void search_text(SearchResults *r, const char *root, const FileList *fl, Matcher
 		}
 		if (r->n > hits)
 			r->files_hit++;
-		munmap((void *)b, n);
 	}
+	free(buf);
+	free(order);
+	/* present the results in path order, like VSCodium */
+	if (r->n > 1) {
+		u32 *perm = vx_alloc(r->n * sizeof(u32));
+		for (u32 i = 0; i < r->n; i++)
+			perm[i] = i;
+		g_sort_fl = fl;
+		g_sort_r = r;
+		qsort(perm, r->n, sizeof(u32), res_cmp);
+		permute_u32(r->file, perm, r->n);
+		permute_u32(r->line, perm, r->n);
+		permute_u32(r->col, perm, r->n);
+		permute_u32(r->len, perm, r->n);
+		permute_u32(r->text, perm, r->n);
+		permute_u32(r->text_col, perm, r->n);
+		free(perm);
+	}
+}
+
+void search_text(SearchResults *r, const char *root, const FileList *fl, Matcher *m, const char *include,
+                 const char *exclude, u32 limit)
+{
+	search_text_ex(r, root, fl, m, include, exclude, limit, NULL, NULL);
 }
 
 void search_free(SearchResults *r)

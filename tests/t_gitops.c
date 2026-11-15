@@ -37,6 +37,41 @@ static int wait_op(GitOps *o, u32 id, char **err_out)
 	return -99;
 }
 
+/* Wait for op id and return its stdout (malloc'd) and status. */
+static char *run_out(GitOps *o, u32 id, int *st)
+{
+	for (int i = 0; i < 20000; i++) {
+		GitOpResult r;
+		while (gitops_poll(o, &r)) {
+			if (r.id == id) {
+				char *out = vx_strdup(r.out ? r.out : "");
+				*st = r.status;
+				if (r.status != 0)
+					fprintf(stderr, "op %u failed (%d): %s\n", id, r.status, r.err ? r.err : "");
+				gitops_result_free(&r);
+				return out;
+			}
+			gitops_result_free(&r);
+		}
+		struct timespec ts = {0, 1000000};
+		nanosleep(&ts, NULL);
+	}
+	*st = -99;
+	return vx_strdup("");
+}
+
+/* A network op that must have run on libgit2 (no CLI retry note). */
+static int net_ok(GitOps *o, u32 id)
+{
+	int st;
+	char *out = run_out(o, id, &st);
+	bool cli = strstr(out, "retrying with git") != NULL;
+	if (cli)
+		fprintf(stderr, "op %u fell back to the CLI: %s\n", id, out);
+	free(out);
+	return cli ? -1 : st;
+}
+
 static int run_ok(GitOps *o, u32 id)
 {
 	char *err = NULL;
@@ -194,6 +229,57 @@ int main(void)
 	snprintf(p, sizeof p, "%s/s.txt", dir);
 	CHECK(file_has(p, "s"));
 
+	/* deleting an unmerged branch is refused with git's wording */
+	sh(dir, "git switch -q -c unmerged && printf 'z\\n' > z.txt && git add z.txt && git commit -qm z1 && git switch -q main");
+	{
+		char *err = NULL;
+		CHECK(wait_op(o, gitops_branch_delete(o, "unmerged", false), &err) != 0);
+		CHECK(err && strstr(err, "not fully merged"));
+		free(err);
+	}
+	/* a clean non-fast-forward merge makes a merge commit */
+	sh(dir, "printf 'm\\n' > mm.txt && git add mm.txt && git commit -qm m1");
+	CHECK(run_ok(o, gitops_merge(o, "unmerged")) == 0);
+	{
+		GitRun r;
+		const char *argv[] = {"log", "-1", "--format=%s %p", NULL};
+		git_cli(dir, argv, NULL, &r, NULL);
+		CHECK(!strncmp(r.out, "Merge branch 'unmerged'", 23) && strchr(strchr(r.out, ' ') + 23, ' '));
+		git_run_free(&r);
+	}
+	CHECK(run_ok(o, gitops_branch_delete(o, "unmerged", false)) == 0); /* merged now */
+	/* revert makes a commit that undoes another */
+	{
+		GitRun r;
+		const char *argv[] = {"rev-parse", "HEAD~1", NULL};
+		git_cli(dir, argv, NULL, &r, NULL);
+		r.out[40] = 0;
+		CHECK(run_ok(o, gitops_revert(o, r.out)) == 0);
+		git_run_free(&r);
+		snprintf(p, sizeof p, "%s/mm.txt", dir);
+		CHECK(!file_has(p, "m"));
+	}
+	/* argv the UI sends: unstage all, discard all, detach */
+	sh(dir, "printf 'q\\n' > s.txt && git add s.txt");
+	{
+		const char *a1[] = {"reset", "-q", NULL};
+		CHECK(run_ok(o, gitops_run(o, "Unstaging...", a1, NULL)) == 0);
+		GitRun r;
+		const char *st[] = {"status", "--porcelain", NULL};
+		git_cli(dir, st, NULL, &r, NULL);
+		CHECK(strstr(r.out, " M s.txt") != NULL);
+		git_run_free(&r);
+		const char *a2[] = {"restore", "--worktree", "--", ".", NULL};
+		CHECK(run_ok(o, gitops_run(o, "Discarding...", a2, NULL)) == 0);
+		git_cli(dir, st, NULL, &r, NULL);
+		CHECK(r.nout == 0);
+		git_run_free(&r);
+		const char *a3[] = {"checkout", "--detach", "HEAD~1", NULL};
+		CHECK(run_ok(o, gitops_run(o, "Checking out...", a3, NULL)) == 0);
+		CHECK(!strcmp(current_branch(o, &bl), ""));
+		CHECK(run_ok(o, gitops_checkout(o, "main", false)) == 0);
+	}
+
 	/* tags */
 	CHECK(run_ok(o, gitops_tag_create(o, "v1", NULL, NULL)) == 0);
 	CHECK(run_ok(o, gitops_tag_create(o, "v2", "release two", NULL)) == 0);
@@ -216,7 +302,7 @@ int main(void)
 	CHECK_STR(rl.pool.b + rl.name[0], "origin");
 	CHECK_STR(rl.pool.b + rl.hash[0], remote);
 	gitops_names_free(&rl);
-	CHECK(run_ok(o, gitops_publish(o, "origin", "main")) == 0);
+	CHECK(net_ok(o, gitops_publish(o, "origin", "main")) == 0);
 	current_branch(o, &bl);
 	i64 m = find_branch(&bl, "main");
 	CHECK(m >= 0 && !strcmp(bl.pool.b + bl.upstream[m], "origin/main"));
@@ -233,21 +319,35 @@ int main(void)
 		         remote, other, other);
 		sh("/tmp", cmd);
 	}
-	CHECK(run_ok(o, gitops_fetch(o, false, true)) == 0);
+	CHECK(net_ok(o, gitops_fetch(o, false, true)) == 0);
 	current_branch(o, &bl);
 	m = find_branch(&bl, "main");
 	CHECK(bl.ahead[m] == 1 && bl.behind[m] == 1);
-	CHECK(run_ok(o, gitops_pull(o, true)) == 0);
+	CHECK(net_ok(o, gitops_pull(o, true)) == 0);
 	current_branch(o, &bl);
 	m = find_branch(&bl, "main");
 	CHECK(bl.ahead[m] == 1 && bl.behind[m] == 0);
-	CHECK(run_ok(o, gitops_push(o, false)) == 0);
+	CHECK(net_ok(o, gitops_push(o, false)) == 0);
+	current_branch(o, &bl);
+	m = find_branch(&bl, "main");
+	CHECK(bl.ahead[m] == 0 && bl.behind[m] == 0);
+	/* force with lease: refused when the remote moved since our last fetch */
+	sh(other, "git pull -q --no-rebase origin main && printf 'w\\n' > w.txt && git add w.txt && git commit -qm remote2 && git push -q origin main");
+	sh(dir, "git commit -q --allow-empty -m local2");
+	{
+		char *err = NULL;
+		CHECK(wait_op(o, gitops_push(o, true), &err) != 0);
+		CHECK(err && strstr(err, "stale info"));
+		free(err);
+	}
+	CHECK(net_ok(o, gitops_fetch(o, false, false)) == 0);
+	CHECK(net_ok(o, gitops_push(o, true)) == 0); /* known remote state now: forced */
 	current_branch(o, &bl);
 	m = find_branch(&bl, "main");
 	CHECK(bl.ahead[m] == 0 && bl.behind[m] == 0);
 	/* remote branch checkout creates a tracking branch */
 	sh(other, "git switch -q -c topic && git commit -q --allow-empty -m t && git push -q origin topic");
-	CHECK(run_ok(o, gitops_fetch(o, true, false)) == 0);
+	CHECK(net_ok(o, gitops_fetch(o, true, false)) == 0);
 	CHECK(run_ok(o, gitops_checkout(o, "origin/topic", true)) == 0);
 	CHECK_STR(current_branch(o, &bl), "topic");
 	CHECK(!strcmp(bl.pool.b + bl.upstream[find_branch(&bl, "topic")], "origin/topic"));

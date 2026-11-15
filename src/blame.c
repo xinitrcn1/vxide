@@ -1,16 +1,13 @@
 #define _POSIX_C_SOURCE 200809L
 #include "blame.h"
+#include "lgblame.h"
 
 #include <git2.h>
-#include <fcntl.h>
 #include <pthread.h>
-#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
-extern char **environ;
 
 /* Published result (SoA): per line an index into the commit table, or
  * UINT32_MAX for uncommitted lines. */
@@ -44,11 +41,9 @@ struct Blame {
 	bool updated;
 
 	/* worker-only state */
-	char *workdir;
-	char *git_bin; /* absolute path of git, resolved once from PATH */
-	bool no_cli; /* the git binary could not be run: use libgit2 */
 	git_repository *repo;
-	git_blame *base;
+	LgBlame head_blame; /* blame of the committed file at base_head */
+	bool have;
 	char *base_path;
 	git_oid base_head;
 };
@@ -65,173 +60,6 @@ static void result_free(Result *r)
 	memset(r, 0, sizeof *r);
 }
 
-static u32 commit_index(Blame *b, Result *r, const git_oid *id, const git_signature *sig, u32 *cap)
-{
-	for (u32 i = 0; i < r->nc; i++) {
-		char hx[12];
-		git_oid_tostr(hx, sizeof hx, id);
-		if (!strcmp(hx, r->hash[i]))
-			return i;
-	}
-	if (r->nc == *cap) {
-		*cap = *cap ? *cap * 2 : 16;
-		r->author = vx_realloc(r->author, *cap * sizeof(u32));
-		r->summary = vx_realloc(r->summary, *cap * sizeof(u32));
-		r->time = vx_realloc(r->time, *cap * sizeof(i64));
-		r->hash = vx_realloc(r->hash, *cap * sizeof r->hash[0]);
-	}
-	u32 i = r->nc++;
-	git_oid_tostr(r->hash[i], sizeof r->hash[i], id);
-	const char *summary = "";
-	git_commit *c = NULL;
-	if (git_commit_lookup(&c, b->repo, id) == 0) {
-		const char *s = git_commit_summary(c);
-		if (s)
-			summary = s;
-		if (!sig)
-			sig = git_commit_author(c);
-	}
-	const char *name = sig && sig->name ? sig->name : "";
-	r->author[i] = pool_add(&r->pool, name, (u32)strlen(name));
-	r->summary[i] = pool_add(&r->pool, summary, (u32)strlen(summary));
-	r->time[i] = sig ? (i64)sig->when.time : 0;
-	git_commit_free(c);
-	return i;
-}
-
-static u32 add_commit(Result *r, u32 *cap, const char *hash, const char *author, const char *summary, i64 when)
-{
-	if (r->nc == *cap) {
-		*cap = *cap ? *cap * 2 : 16;
-		r->author = vx_realloc(r->author, *cap * sizeof(u32));
-		r->summary = vx_realloc(r->summary, *cap * sizeof(u32));
-		r->time = vx_realloc(r->time, *cap * sizeof(i64));
-		r->hash = vx_realloc(r->hash, *cap * sizeof r->hash[0]);
-	}
-	u32 i = r->nc++;
-	snprintf(r->hash[i], sizeof r->hash[i], "%.*s", 10, hash);
-	r->author[i] = pool_add(&r->pool, author, (u32)strlen(author));
-	r->summary[i] = pool_add(&r->pool, summary, (u32)strlen(summary));
-	r->time[i] = when;
-	return i;
-}
-
-/* `git blame --incremental --contents <snapshot>`: what VSCodium runs. The
- * CLI uses the commit-graph's changed-path Bloom filters, which makes it
- * far faster than libgit2's blame on long histories. Returns false when
- * the git binary cannot be run (the caller falls back to libgit2). */
-static bool compute_cli(Blame *b, const char *path, const char *text, size_t n, Result *r)
-{
-	char tmp[] = "/tmp/vxide-blame-XXXXXX";
-	int fd = mkstemp(tmp);
-	if (fd < 0)
-		return false;
-	size_t off = 0;
-	while (off < n) {
-		ssize_t w = write(fd, text + off, n - off);
-		if (w <= 0)
-			break;
-		off += (size_t)w;
-	}
-	close(fd);
-	int out[2];
-	if (pipe(out) != 0) {
-		unlink(tmp);
-		return false;
-	}
-	posix_spawn_file_actions_t fa;
-	posix_spawn_file_actions_init(&fa);
-	posix_spawn_file_actions_adddup2(&fa, out[1], 1);
-	posix_spawn_file_actions_addclose(&fa, out[0]);
-	posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
-	char *argv[] = {b->git_bin, "-C", b->workdir, "blame", "--root", "--incremental", "--contents", tmp, "--",
-	                (char *)path, NULL};
-	pid_t pid;
-	/* posix_spawn with an absolute path: no PATH search inside the
-	 * vfork'd child (which also upsets ASan's allocator on FreeBSD) */
-	int rc = posix_spawn(&pid, b->git_bin, &fa, NULL, argv, environ);
-	posix_spawn_file_actions_destroy(&fa);
-	close(out[1]);
-	if (rc != 0) {
-		close(out[0]);
-		unlink(tmp);
-		return false;
-	}
-	Pool o = {0};
-	char buf[65536];
-	ssize_t k;
-	while ((k = read(out[0], buf, sizeof buf)) > 0) {
-		VX_GROW(o.b, o.cap, o.n + (u32)k + 1);
-		memcpy(o.b + o.n, buf, (size_t)k);
-		o.n += (u32)k;
-	}
-	close(out[0]);
-	int status = 0;
-	waitpid(pid, &status, 0);
-	unlink(tmp);
-	if (!WIFEXITED(status) || WEXITSTATUS(status) == 127) {
-		pool_free(&o);
-		return false;
-	}
-	if (WEXITSTATUS(status) != 0) {
-		/* untracked file or not a repo path: nothing to show */
-		pool_free(&o);
-		return true;
-	}
-	VX_GROW(o.b, o.cap, o.n + 1);
-	o.b[o.n] = 0;
-	r->tracked = true;
-	r->line_commit = vx_alloc(r->nlines * sizeof(u32));
-	memset(r->line_commit, 0xFF, r->nlines * sizeof(u32));
-	u32 cap = 0;
-	/* entries: "<sha> <orig> <final> <count>" then headers until "filename" */
-	char *p = o.b;
-	char author[256] = "", summary[512] = "";
-	i64 when = 0;
-	while (*p) {
-		char *e = strchr(p, '\n');
-		if (e)
-			*e = 0;
-		char sha[41];
-		unsigned orig, fin, cnt;
-		if (strlen(p) >= 40 && sscanf(p, "%40s %u %u %u", sha, &orig, &fin, &cnt) == 4) {
-			bool zero = strspn(sha, "0") == 40;
-			/* find a known commit or read its headers */
-			u32 idx = UINT32_MAX;
-			for (u32 i = 0; i < r->nc && !zero; i++)
-				if (!strncmp(r->hash[i], sha, 10))
-					idx = i;
-			author[0] = summary[0] = 0;
-			when = 0;
-			char *q = e ? e + 1 : p + strlen(p);
-			while (*q) {
-				char *qe = strchr(q, '\n');
-				if (qe)
-					*qe = 0;
-				if (!strncmp(q, "author ", 7))
-					snprintf(author, sizeof author, "%s", q + 7);
-				else if (!strncmp(q, "author-time ", 12))
-					when = strtoll(q + 12, NULL, 10);
-				else if (!strncmp(q, "summary ", 8))
-					snprintf(summary, sizeof summary, "%s", q + 8);
-				bool last = !strncmp(q, "filename ", 9);
-				q = qe ? qe + 1 : q + strlen(q);
-				if (last)
-					break;
-			}
-			if (!zero && idx == UINT32_MAX)
-				idx = add_commit(r, &cap, sha, author, summary, when);
-			for (u32 l = fin - 1; l < fin - 1 + cnt && l < r->nlines; l++)
-				r->line_commit[l] = zero ? UINT32_MAX : idx;
-			p = q;
-			continue;
-		}
-		p = e ? e + 1 : p + strlen(p);
-	}
-	pool_free(&o);
-	return true;
-}
-
 static void compute(Blame *b, const char *path, const char *text, size_t n, u32 key, Result *r)
 {
 	memset(r, 0, sizeof *r);
@@ -240,48 +68,44 @@ static void compute(Blame *b, const char *path, const char *text, size_t n, u32 
 	r->nlines = 1;
 	for (size_t i = 0; i < n; i++)
 		r->nlines += text[i] == '\n';
-	if (!b->no_cli && b->git_bin) {
-		if (compute_cli(b, path, text, n, r))
-			return;
-		b->no_cli = true;
-	}
-	/* (re)blame the committed file when the path or HEAD changed */
 	git_oid head;
-	bool have_head = git_reference_name_to_id(&head, b->repo, "HEAD") == 0;
-	if (!have_head)
+	if (git_reference_name_to_id(&head, b->repo, "HEAD") != 0)
 		return; /* unborn branch: nothing to blame */
-	if (!b->base || !b->base_path || strcmp(b->base_path, path) || !git_oid_equal(&head, &b->base_head)) {
-		git_blame_free(b->base);
-		b->base = NULL;
+	/* the committed file's blame is cached per (path, HEAD) */
+	if (!b->have || !b->base_path || strcmp(b->base_path, path) || !git_oid_equal(&head, &b->base_head)) {
+		if (b->have)
+			lg_blame_free(&b->head_blame);
+		b->have = false;
 		free(b->base_path);
 		b->base_path = vx_strdup(path);
 		b->base_head = head;
-		git_blame_options opts = GIT_BLAME_OPTIONS_INIT;
-		if (git_blame_file(&b->base, b->repo, path, &opts) != 0) {
-			b->base = NULL;
+		if (lg_blame_head(b->repo, path, &b->head_blame) != 0)
 			return; /* untracked or not in HEAD */
-		}
+		b->have = true;
 	}
-	git_blame *buf = NULL;
-	if (git_blame_buffer(&buf, b->base, text, n) != 0)
+	LgBlame *hb = &b->head_blame;
+	/* the live buffer over the HEAD blob: edited lines are uncommitted */
+	u32 *map = vx_alloc(r->nlines * sizeof(u32));
+	if (lg_blame_buffer_map(b->repo, &hb->head_blob, path, text, n, map, r->nlines) != 0) {
+		free(map);
 		return;
-	r->tracked = true;
-	r->line_commit = vx_alloc(r->nlines * sizeof(u32));
-	memset(r->line_commit, 0xFF, r->nlines * sizeof(u32));
-	u32 cap = 0;
-	u32 nh = git_blame_get_hunk_count(buf);
-	for (u32 h = 0; h < nh; h++) {
-		const git_blame_hunk *hk = git_blame_get_hunk_byindex(buf, h);
-		if (!hk)
-			continue;
-		u32 idx = UINT32_MAX;
-		if (!git_oid_is_zero(&hk->final_commit_id))
-			idx = commit_index(b, r, &hk->final_commit_id, hk->final_signature, &cap);
-		size_t first = hk->final_start_line_number ? hk->final_start_line_number - 1 : 0;
-		for (size_t l = first; l < first + hk->lines_in_hunk && l < r->nlines; l++)
-			r->line_commit[l] = idx;
 	}
-	git_blame_free(buf);
+	r->tracked = true;
+	r->nc = hb->nc;
+	r->author = vx_alloc((hb->nc + 1) * sizeof(u32));
+	r->summary = vx_alloc((hb->nc + 1) * sizeof(u32));
+	r->time = vx_alloc((hb->nc + 1) * sizeof(i64));
+	r->hash = vx_alloc((hb->nc + 1) * sizeof r->hash[0]);
+	for (u32 i = 0; i < hb->nc; i++) {
+		const char *au = hb->pool.b + hb->author[i], *su = hb->pool.b + hb->summary[i];
+		r->author[i] = pool_add(&r->pool, au, (u32)strlen(au));
+		r->summary[i] = pool_add(&r->pool, su, (u32)strlen(su));
+		r->time[i] = hb->time[i];
+		git_oid_tostr(r->hash[i], sizeof r->hash[i], &hb->oid[i]);
+	}
+	r->line_commit = map;
+	for (u32 l = 0; l < r->nlines; l++)
+		map[l] = map[l] < hb->nlines ? hb->line_commit[map[l]] : UINT32_MAX;
 }
 
 static void *worker(void *arg)
@@ -314,33 +138,14 @@ static void *worker(void *arg)
 	return NULL;
 }
 
-static char *find_in_path(const char *name)
-{
-	const char *path = getenv("PATH");
-	if (!path || !*path)
-		path = "/usr/local/bin:/usr/bin:/bin";
-	char buf[4096];
-	while (*path) {
-		const char *e = strchr(path, ':');
-		size_t n = e ? (size_t)(e - path) : strlen(path);
-		snprintf(buf, sizeof buf, "%.*s/%s", (int)(n ? n : 1), n ? path : ".", name);
-		if (access(buf, X_OK) == 0)
-			return vx_strdup(buf);
-		path += n + (e ? 1 : 0);
-	}
-	return NULL;
-}
-
 Blame *blame_start(const char *workdir)
 {
 	git_libgit2_init();
 	Blame *b = vx_alloc(sizeof *b);
-	b->workdir = vx_strdup(workdir);
-	b->git_bin = find_in_path("git");
-	b->no_cli = getenv("VXIDE_BLAME_LIBGIT2") != NULL;
+	/* keep blobs in libgit2's object cache: each version is the new side of
+	 * one diff and the old side of the next */
+	git_libgit2_opts(GIT_OPT_SET_CACHE_OBJECT_LIMIT, GIT_OBJECT_BLOB, (size_t)16 << 20);
 	if (git_repository_open(&b->repo, workdir) != 0) {
-		free(b->workdir);
-		free(b->git_bin);
 		free(b);
 		git_libgit2_shutdown();
 		return NULL;
@@ -368,11 +173,10 @@ void blame_stop(Blame *b)
 	free(b->req_path);
 	free(b->req_text);
 	result_free(&b->res);
-	git_blame_free(b->base);
+	if (b->have)
+		lg_blame_free(&b->head_blame);
 	free(b->base_path);
 	git_repository_free(b->repo);
-	free(b->workdir);
-	free(b->git_bin);
 	pthread_mutex_destroy(&b->mu);
 	pthread_cond_destroy(&b->cv);
 	free(b);
