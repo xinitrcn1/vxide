@@ -78,4 +78,13 @@ if command -v cc >/dev/null 2>&1 && printf 'int main(void) { return 0; }\n' > "$
 	cc -O1 -o "$f/prog" "$f/prog.c" 2>/dev/null; then
 	VXIDE_NO_LSP=1 "$vx" --headless 1000x700 --script tests/finddis.vx "$f"
 fi
+# Markdown preview, including input that is easy to get wrong
+m="$tmp/md"
+mkdir -p "$m"
+printf '# Title\n\nSome *text* with `code` and a [link](#title).\n\n- a\n  - b\n    - c\n1. one\n\n> quote\n\n| a | b |\n|---|--:|\n| 1 | 2 |\n' > "$m/README.md"
+printf -- '-\n- \n-   \n1.\n* * *\n- - -\n>\n> > >\n' > "$m/odd.md"
+printf '%s\n' '- [ ]' '[a](' '![b](' '**x' '`y' '~~z' '<a' '&' '|a|' '|-|' '    code' '#' '####### no' 'Title' '=====' >> "$m/odd.md"
+printf '```\nunclosed fence\n' >> "$m/odd.md"
+VXIDE_NO_LSP=1 "$vx" --headless 1000x700 --script tests/md.vx "$m"
+grep -q '^- new item$' "$m/README.md" && ! grep -q ignored "$m/README.md"
 echo "ui test ok"

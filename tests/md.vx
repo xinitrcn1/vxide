@@ -1,0 +1,21 @@
+# Markdown: Edit / Preview subtabs (run by tests/t_ui.sh).
+open README.md
+key ctrl+shift+v
+wait 50
+key PageDown End Home
+key ctrl+shift+v
+expect file README.md
+expect line 1
+key ctrl+End
+type \n- new item
+key ctrl+shift+v
+wait 50
+type ignored
+key ctrl+shift+v
+expect text - new item
+key ctrl+s
+open odd.md
+key ctrl+shift+v
+wait 50
+key End
+key ctrl+shift+v
