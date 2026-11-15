@@ -363,7 +363,7 @@ static int run_script(const char *path)
 		} else if (!strcmp(s, "theme")) {
 			app.theme = !strcmp(arg, "light") ? THEME_LIGHT : THEME_DARK;
 		} else if (!strcmp(s, "expect")) {
-			/* expect status|cursor|text substrings for scripted checks */
+			/* expect text|line|file|find|problems for scripted checks */
 			View *v = active_view();
 			if (!strncmp(arg, "text ", 5) && v) {
 				const char *want = arg + 5;
@@ -379,6 +379,14 @@ static int run_script(const char *path)
 				u32 got = text_line_of(&app.docs.text[v->doc], v->head[0]) + 1;
 				if (got != want) {
 					fprintf(stderr, "vxide: expect line %u, got %u\n", want, got);
+					rc = 1;
+				}
+			} else if (!strncmp(arg, "find ", 5)) {
+				/* the find widget's counter: "2 of 3" (a prefix is enough) */
+				char got[64];
+				snprintf(got, sizeof got, "%u of %u", app.find_index, app.find_count);
+				if (strncmp(got, arg + 5, strlen(arg + 5))) {
+					fprintf(stderr, "vxide: expect find %s, got %s\n", arg + 5, got);
 					rc = 1;
 				}
 			} else if (!strncmp(arg, "problems ", 9)) {

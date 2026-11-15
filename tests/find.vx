@@ -1,0 +1,30 @@
+# Find in views that draw themselves: run by tests/t_ui.sh.
+# Diff editor: matches on the new side, Enter steps through them.
+open m.c
+key ctrl+shift+p
+type Git: Open Changes
+key Return
+wait 300
+key ctrl+f
+type needle
+expect find 1 of 3
+expect line 7
+key Return
+expect find 2 of 3
+expect line 150
+key Escape
+# Hex: not hex digits -> text; hex digits in the hex column -> bytes.
+open blob.bin
+wait 200
+key ctrl+f
+type needle
+expect find 1 of 2
+key Return
+expect find 2 of 2
+key ctrl+a
+type 00 01 02
+expect find 1 of 1
+key ctrl+a
+type 6e 65 65
+expect find 1 of 2
+key Escape

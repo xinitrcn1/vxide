@@ -66,4 +66,16 @@ p="$tmp/prof"
 mkdir -p "$p"
 cp tests/prof/massif.out.hot tests/prof/hot.c tests/prof/hot.c.gcov "$p/"
 VXIDE_NO_LSP=1 "$vx" --headless 1000x700 --script tests/prof.vx "$p"
+# find in diffs and binary views
+f="$tmp/findrepo"
+mkdir -p "$f"
+(cd "$f" && git init -q -b main && git config user.name T && git config user.email t@t &&
+	seq 1 300 | sed 's/^/int value_/; s/$/;/' > m.c && git add m.c && git commit -qm base &&
+	sed 's/^int value_150;/int value_150 = needle;/; s/^int value_7;/int needle_7;/; s/^int value_280;/int value_280; \/\/ needle/' m.c > m.tmp &&
+	mv m.tmp m.c && printf 'abc\000\001\002needle\000xyz needle\377' > blob.bin)
+VXIDE_NO_LSP=1 "$vx" --headless 1000x700 --script tests/find.vx "$f"
+if command -v cc >/dev/null 2>&1 && printf 'int main(void) { return 0; }\n' > "$f/prog.c" &&
+	cc -O1 -o "$f/prog" "$f/prog.c" 2>/dev/null; then
+	VXIDE_NO_LSP=1 "$vx" --headless 1000x700 --script tests/finddis.vx "$f"
+fi
 echo "ui test ok"

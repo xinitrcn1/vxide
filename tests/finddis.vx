@@ -1,0 +1,8 @@
+# Disassembly: the decoded rows are searched (a cc-built program).
+open prog
+wait 800
+key ctrl+f
+type ret
+wait 300
+expect find 1 of
+key Escape
