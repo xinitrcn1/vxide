@@ -161,6 +161,16 @@ static void art_book(float W)
 	line(12.0f, 7.0f, 12.0f, 20.0f, W);
 }
 
+static void art_pulse(float W)
+{
+	begin((int)(24.0f * G + 0.5f));
+	line(2.5f, 12.5f, 7.5f, 12.5f, W);
+	line(7.5f, 12.5f, 10.0f, 5.0f, W);
+	line(10.0f, 5.0f, 14.0f, 19.5f, W);
+	line(14.0f, 19.5f, 16.5f, 12.5f, W);
+	line(16.5f, 12.5f, 21.5f, 12.5f, W);
+}
+
 static void art_gear(float W)
 {
 	const float PI = 3.14159265f;
@@ -195,6 +205,8 @@ void icons_init(void)
 		if (pass) {
 			art_book(W);
 			store(ICON_BOOK_S);
+			art_pulse(W);
+			store(ICON_PULSE_S);
 		}
 	}
 	G = 1.0f;

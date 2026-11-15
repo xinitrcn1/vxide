@@ -124,7 +124,7 @@ typedef struct {
 /* ---- workbench ---------------------------------------------------------- */
 
 enum { DIFF_WORKTREE = 1, DIFF_STAGED, DIFF_COMMIT };
-enum { SIDE_EXPLORER, SIDE_SEARCH, SIDE_SCM, SIDE_SETTINGS, SIDE_MAN, SIDE_COUNT };
+enum { SIDE_EXPLORER, SIDE_SEARCH, SIDE_SCM, SIDE_SETTINGS, SIDE_MAN, SIDE_PMC, SIDE_COUNT };
 enum { PANEL_PROBLEMS, PANEL_OUTPUT, PANEL_COUNT };
 enum {
 	FOCUS_EDITOR,
@@ -410,6 +410,13 @@ void profview_tick(void);
 int profview_subtabs_height(View *v, int w);
 void profview_subtabs_draw(View *v, int x, int y, int w);
 void profview_subtab_click(View *v, int rel_x, int rel_y, int w);
+/* pmcview.c: the Profiling workspace (FreeBSD hwpmc via pmcstat) */
+void pmcview_open(void);
+void pmcview_ws_draw(int x, int y, int w, int h);
+void pmcview_ws_event(const Event *e, int x, int y, int w, int h);
+void pmcview_tick(void);
+bool pmcview_busy(void);
+void pmcview_shutdown(void);
 /* mdview.c: Markdown tabs have two parts, Edit and Preview */
 void mdview_sync(View *v);       /* nparts = 2 for Markdown documents */
 bool mdview_preview(View *v);    /* the preview is showing */
@@ -819,6 +826,7 @@ enum {
 	CMD_PROF_FLIP,
 	CMD_PROF_FIND,
 	CMD_MD_PREVIEW,
+	CMD_VIEW_PMC,
 	CMD_COUNT
 };
 

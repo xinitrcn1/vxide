@@ -17,6 +17,7 @@ enum {
 	ICON_SCM_S,
 	ICON_GEAR_S,
 	ICON_BOOK_S, /* Manpages */
+	ICON_PULSE_S, /* Profiling */
 	/* 16 px */
 	ICON_CHEVRON_RIGHT,
 	ICON_CHEVRON_DOWN,

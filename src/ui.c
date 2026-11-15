@@ -554,7 +554,10 @@ void view_set_rel(View *v, const char *rel)
 	v->diff_rel_at = pool_add(&app.strs, rel, n);
 }
 
-bool ui_workspace(void) { return app.side_view == SIDE_MAN || app.side_view == SIDE_SETTINGS; }
+bool ui_workspace(void)
+{
+	return app.side_view == SIDE_MAN || app.side_view == SIDE_SETTINGS || app.side_view == SIDE_PMC;
+}
 
 void workspace_area(int *x, int *y, int *w, int *h)
 {
@@ -1153,6 +1156,7 @@ static const char *cmd_titles[CMD_COUNT] = {
     [CMD_PROF_FLIP] = "Profile: Flip Flame Graph",
     [CMD_PROF_FIND] = "Profile: Highlight Functions in Flame Graph...",
     [CMD_MD_PREVIEW] = "Markdown: Toggle Preview",
+    [CMD_VIEW_PMC] = "View: Show Profiling (hwpmc)",
     [CMD_PASTE] = "Paste",
     [CMD_SELECT_ALL] = "Select All",
     [CMD_SELECT_LINE] = "Expand Line Selection",
@@ -2194,6 +2198,10 @@ void run_command(int cmd)
 		app.side_view = SIDE_SETTINGS;
 		app.focus = FOCUS_WORKSPACE;
 		break;
+	case CMD_VIEW_PMC:
+		app.side_view = SIDE_PMC;
+		pmcview_open();
+		break;
 	case CMD_VIEW_EXPLORER:
 	case CMD_VIEW_SEARCH:
 	case CMD_VIEW_SCM: {
@@ -2550,6 +2558,7 @@ static const struct {
     {SIDE_SCM, ICON_SCM_S, CMD_VIEW_SCM, "Git"},
     {SIDE_SEARCH, ICON_SEARCH_S, CMD_VIEW_SEARCH, "Search"},
     {SIDE_MAN, ICON_BOOK_S, CMD_VIEW_MAN, "Manpages"},
+    {SIDE_PMC, ICON_PULSE_S, CMD_VIEW_PMC, "Profiling"},
     {SIDE_SETTINGS, ICON_GEAR_S, CMD_VIEW_SETTINGS, "Settings"},
 };
 
@@ -2793,6 +2802,8 @@ void ui_event(const Event *e)
 			workspace_area(&x, &y, &w, &h);
 			if (app.side_view == SIDE_MAN)
 				man_ws_event(e, x, y, w, h);
+			else if (app.side_view == SIDE_PMC)
+				pmcview_ws_event(e, x, y, w, h);
 			else if (app.side_view == SIDE_SETTINGS)
 				settings_ws_event(e, x, y, w, h);
 			return;
@@ -2874,6 +2885,8 @@ void ui_event(const Event *e)
 			workspace_area(&x, &y, &w, &h);
 			if (app.side_view == SIDE_MAN)
 				man_ws_event(e, x, y, w, h);
+			else if (app.side_view == SIDE_PMC)
+				pmcview_ws_event(e, x, y, w, h);
 			else if (app.side_view == SIDE_SETTINGS)
 				settings_ws_event(e, x, y, w, h);
 			return;
@@ -3031,6 +3044,8 @@ void ui_event(const Event *e)
 			app.focus = FOCUS_WORKSPACE;
 		if (app.side_view == SIDE_MAN)
 			man_ws_event(e, x, y, w, h);
+		else if (app.side_view == SIDE_PMC)
+			pmcview_ws_event(e, x, y, w, h);
 		else
 			settings_ws_event(e, x, y, w, h);
 		return;
@@ -3488,12 +3503,12 @@ static void draw_top_tabs(void)
 	for (int i = 0; i < (int)VX_COUNT(top_tabs); i++) {
 		int w = top_tab_w(i);
 		/* a workspace is shown whatever the side bar does */
-		bool ws = top_tabs[i].view == SIDE_MAN || top_tabs[i].view == SIDE_SETTINGS;
+		bool ws = top_tabs[i].view == SIDE_MAN || top_tabs[i].view == SIDE_SETTINGS || top_tabs[i].view == SIDE_PMC;
 		bool active = app.side_view == top_tabs[i].view && (ws || app.side_visible);
 		bool hover = in_rect(app.hover_x, app.hover_y, x, 0, w, h);
 		static const char *const tips[] = {"Project: Explorer (Ctrl+Shift+E)", "Git: Source Control (Ctrl+Shift+G)",
 		                                   "Search (Ctrl+Shift+F)", "Manpages: read and search manual pages",
-		                                   "Settings (Ctrl+,)"};
+		                                   "Profiling: hardware counters with pmcstat (FreeBSD)", "Settings (Ctrl+,)"};
 		if (i < (int)VX_COUNT(tips))
 			ui_tip(x, 0, w, h, tips[i]);
 		if (hover && top_tabs[i].view == SIDE_MAN)
@@ -3849,6 +3864,8 @@ void ui_draw(void)
 		workspace_area(&x, &y, &w, &h);
 		if (app.side_view == SIDE_MAN)
 			man_ws_draw(x, y, w, h);
+		else if (app.side_view == SIDE_PMC)
+			pmcview_ws_draw(x, y, w, h);
 		else
 			settings_ws_draw(x, y, w, h);
 	} else {
@@ -4293,6 +4310,7 @@ void ui_tick(void)
 		/* a background disassembly finished: show it */
 		static bool bin_was_busy;
 		profview_tick();
+		pmcview_tick();
 		binview_tick(); /* a disassembly search in progress */
 		bool busy = binview_busy();
 		if (bin_was_busy && !busy)
@@ -4348,7 +4366,7 @@ u64 ui_wait_hint_ms(void)
 	for (int sv = 0; sv < LSV_COUNT; sv++)
 		if (app.lsps[sv] && !app.lsps_ready[sv])
 			return 30;
-	if (binview_busy() || projtools_busy())
+	if (binview_busy() || projtools_busy() || pmcview_busy())
 		return 20;
 	if (man_wait_hint() < 250)
 		return man_wait_hint();
@@ -4432,6 +4450,7 @@ void ui_shutdown(void)
 {
 	session_save(); /* before the tabs close */
 	projtools_shutdown();
+	pmcview_shutdown();
 	/* tabs first: closing a document still talks to the language server */
 	for (u32 gi = 0; gi < app.ngroups; gi++)
 		while (app.groups[gi].nt)
