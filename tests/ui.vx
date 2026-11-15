@@ -44,3 +44,26 @@ key ctrl+Tab
 expect file a.c
 key ctrl+s
 shot build/ui-test.png
+# regex find/replace in the editor (RE2 syntax, $1 groups)
+key ctrl+h
+key alt+r
+type int (\\w+)\\(void\\)
+key Tab
+type long ${1}_v(void)
+key ctrl+alt+Return
+key Escape
+expect text long f_v(void)
+key alt+r
+# replace in files: c.c is not open, so it is rewritten on disk
+key ctrl+shift+h
+key alt+r
+type value_(\\d)
+key Tab
+type v$1
+key ctrl+shift+j
+type *.c
+key Tab
+type b.c
+wait 400
+key ctrl+alt+Return
+wait 100

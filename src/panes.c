@@ -5,6 +5,8 @@
 #include "syntax.h"
 
 #include <stdio.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <SDL3/SDL.h>
 
 static bool in_rect(int x, int y, int rx, int ry, int rw, int rh)
@@ -33,6 +35,8 @@ static void input_delete(Input *in, u32 a, u32 b)
 
 void input_text(Input *in, const char *s, size_t n)
 {
+	if (!in->b)
+		input_set(in, "", 0); /* the first character needs a terminated buffer */
 	u32 a = VX_MIN(in->cur, in->anchor), b = VX_MAX(in->cur, in->anchor);
 	if (b > a)
 		input_delete(in, a, b);
@@ -243,6 +247,19 @@ static void badge(int right, int y, int h, const char *s, u32 bg, u32 fg)
 	int by = y + (h - bh) / 2;
 	draw_rect(bx, by, bw, bh, bg);
 	draw_text(FONT_SMALL, bx + (bw - tw) / 2, by + (bh - font_m[FONT_SMALL].line) / 2, s, strlen(s), fg);
+}
+
+static void toggle_box(int bx, int by, const char *label, bool on, bool underline)
+{
+	if (on) {
+		draw_rect(bx, by, PX(20), PX(20), (COL(C_FOCUS_BORDER) & 0xFFFFFF00u) | 0x50u);
+		draw_frame(bx, by, PX(20), PX(20), COL(C_FOCUS_BORDER));
+	}
+	int tw = font_width(FONT_SMALL_BOLD, label, strlen(label));
+	draw_text(FONT_SMALL_BOLD, bx + (PX(20) - tw) / 2, by + (PX(20) - font_m[FONT_SMALL].line) / 2, label,
+	          strlen(label), COL(C_FG));
+	if (underline)
+		draw_rect(bx + PX(3), by + PX(16), PX(14), PX(1), COL(C_FG));
 }
 
 /* ---- explorer ---------------------------------------------------------------- */
@@ -538,25 +555,39 @@ bool explorer_event(const Event *e, int x, int y, int w, int h)
 static u64 search_due;
 static u32 search_last_hash = 1;
 
-static u32 hash_input(const Input *in, int flags)
+static u32 hash_bytes(u32 h, const Input *in)
 {
-	u32 h = 2166136261u ^ (u32)flags;
 	for (u32 i = 0; i < in->n; i++)
 		h = (h ^ (u8)in->b[i]) * 16777619u;
+	return (h ^ 0xFF) * 16777619u;
+}
+
+static u32 search_hash(void)
+{
+	u32 h = 2166136261u ^ (u32)app.search_flags;
+	h = hash_bytes(h, &app.search_in);
+	if (app.search_show_details) {
+		h = hash_bytes(h, &app.search_inc_in);
+		h = hash_bytes(h, &app.search_exc_in);
+	}
 	return h;
 }
 
+static const char *box_text(Input *in) { return in->b ? in->b : ""; }
+
 void search_run(void)
 {
-	extern void ui_ensure_files(void);
 	ui_ensure_files();
-	search_text(&app.results, app.root, &app.files, app.search_in.b ? app.search_in.b : "", app.search_in.n,
-	            app.search_flags, 20000);
+	matcher_free(&app.search_m);
+	matcher_init(&app.search_m, box_text(&app.search_in), app.search_in.n, app.search_flags);
+	const char *inc = app.search_show_details ? box_text(&app.search_inc_in) : NULL;
+	const char *exc = app.search_show_details ? box_text(&app.search_exc_in) : NULL;
+	search_text(&app.results, app.root, &app.files, &app.search_m, inc, exc, 20000);
 	free(app.search_collapsed);
 	app.search_collapsed = vx_alloc(app.files.n + 1);
 	app.search_scroll = 0;
 	app.search_sel = 0;
-	search_last_hash = hash_input(&app.search_in, app.search_flags);
+	search_last_hash = search_hash();
 	app.dirty = true;
 }
 
@@ -564,14 +595,16 @@ void search_tick(void)
 {
 	if (search_due && vx_now_ns() >= search_due) {
 		search_due = 0;
-		if (hash_input(&app.search_in, app.search_flags) != search_last_hash)
+		if (search_hash() != search_last_hash)
 			search_run();
 	}
 }
 
-/* Flattened rows: file headers then matches. row -> (file, match) */
+static void search_changed(void) { search_due = vx_now_ns() + 300000000ull; }
+
+/* Flattened rows: file headers then matches. */
 static u32 srow_n;
-static u32 *srow_res; /* result index, or UINT32_MAX - file for headers */
+static u32 *srow_res; /* result index, or 0x80000000 | file for headers */
 static u32 srow_cap;
 
 static void search_rows(void)
@@ -592,38 +625,117 @@ static void search_rows(void)
 	}
 }
 
-static int search_list_y(int y) { return y + PX(35) + PX(30) + PX(26); }
+/* Layout of the top part (inputs) and where the list starts. */
+typedef struct {
+	int find_y, repl_y, inc_y, exc_y, msg_y, list_y;
+	int ix, iw;
+} SLayout;
+
+static SLayout search_layout(int x, int y, int w)
+{
+	SLayout L;
+	L.ix = x + PX(24);
+	L.iw = w - PX(24) - PX(12);
+	int cy = y + PX(35);
+	L.find_y = cy;
+	cy += PX(26) + PX(4);
+	L.repl_y = cy;
+	if (app.search_show_replace)
+		cy += PX(26) + PX(4);
+	L.inc_y = L.exc_y = cy;
+	cy += PX(18); /* "..." row */
+	if (app.search_show_details) {
+		L.inc_y = cy + PX(18);
+		cy = L.inc_y + PX(26) + PX(4);
+		L.exc_y = cy + PX(18);
+		cy = L.exc_y + PX(26) + PX(4);
+	}
+	L.msg_y = cy;
+	L.list_y = cy + PX(24);
+	return L;
+}
+
+static Input *search_box_input(int b)
+{
+	return b == 1 ? &app.search_repl_in : b == 2 ? &app.search_inc_in : b == 3 ? &app.search_exc_in : &app.search_in;
+}
+
+/* Replacement text for result i, using its preview line (the pattern is
+ * re-run there; line-mode matches are within the line). */
+static char *result_replacement(u32 i, u32 *len)
+{
+	const SearchResults *r = &app.results;
+	const char *t = r->pool.b + r->text[i];
+	u32 n = (u32)strlen(t), col = r->text_col[i];
+	char *out = NULL;
+	u32 cap = 0;
+	*len = 0;
+	u32 a, b;
+	const char *repl = box_text(&app.search_repl_in);
+	if ((app.search_flags & SEARCH_REGEX) && col <= n && matcher_next(&app.search_m, t, n, col, &a, &b) && a == col) {
+		matcher_expand(&app.search_m, repl, app.search_repl_in.n, t, &out, len, &cap);
+	} else {
+		out = vx_strndup(repl, app.search_repl_in.n);
+		*len = app.search_repl_in.n;
+	}
+	return out;
+}
 
 void search_draw(int x, int y, int w, int h)
 {
-	int cy = view_title(x, y, w, "SEARCH");
-	int ix = x + PX(12), iw = w - PX(24);
-	input_draw(&app.search_in, ix, cy, iw, PX(26), "Search", app.focus == FOCUS_SEARCH_INPUT);
-	/* toggles */
-	const char *tg[2] = {"Aa", "ab"};
-	int fl[2] = {SEARCH_CASE, SEARCH_WORD};
-	for (int k = 0; k < 2; k++) {
-		int bx = ix + iw - PX(48) + k * PX(22);
-		if (app.search_flags & fl[k]) {
-			draw_rect(bx, cy + PX(3), PX(20), PX(20), (COL(C_FOCUS_BORDER) & 0xFFFFFF00u) | 0x50u);
-			draw_frame(bx, cy + PX(3), PX(20), PX(20), COL(C_FOCUS_BORDER));
-		}
-		draw_text(FONT_SMALL_BOLD, bx + PX(3), cy + PX(3) + (PX(20) - font_m[FONT_SMALL].line) / 2, tg[k], 2, COL(C_FG));
-		if (k == 1)
-			draw_rect(bx + PX(3), cy + PX(19), PX(14), PX(1), COL(C_FG));
+	view_title(x, y, w, "SEARCH");
+	SLayout L = search_layout(x, y, w);
+	/* title actions: refresh, clear, collapse */
+	if (in_rect(app.hover_x, app.hover_y, x, y, w, h)) {
+		draw_icon(ICON_REFRESH, x + w - PX(76), y + PX(10), COL(C_SIDEBAR_FG));
+		draw_icon(ICON_CLOSE, x + w - PX(52), y + PX(10), COL(C_SIDEBAR_FG));
+		draw_icon(ICON_COLLAPSE, x + w - PX(28), y + PX(10), COL(C_SIDEBAR_FG));
 	}
-	cy += PX(30);
+	/* replace toggle chevron to the left of the boxes */
+	int th = app.search_show_replace ? PX(56) : PX(26);
+	draw_icon(app.search_show_replace ? ICON_CHEVRON_DOWN : ICON_CHEVRON_RIGHT, x + PX(5), L.find_y + (th - PX(16)) / 2,
+	          COL(C_SIDEBAR_FG));
+	bool sf = app.focus == FOCUS_SEARCH_INPUT;
+	input_draw(&app.search_in, L.ix, L.find_y, L.iw, PX(26), "Search", sf && app.search_box == 0);
+	bool bad = app.search_m.err[0] != 0;
+	if (bad)
+		draw_frame(L.ix, L.find_y, L.iw, PX(26), COL(C_ERROR));
+	int bx = L.ix + L.iw - PX(70);
+	toggle_box(bx, L.find_y + PX(3), "Aa", app.search_flags & SEARCH_CASE, false);
+	toggle_box(bx + PX(22), L.find_y + PX(3), "ab", app.search_flags & SEARCH_WORD, true);
+	toggle_box(bx + PX(44), L.find_y + PX(3), ".*", app.search_flags & SEARCH_REGEX, false);
+	if (app.search_show_replace) {
+		input_draw(&app.search_repl_in, L.ix, L.repl_y, L.iw - PX(26), PX(26), "Replace", sf && app.search_box == 1);
+		/* replace all button */
+		int rbx = L.ix + L.iw - PX(22);
+		bool on = app.results.n && app.search_repl_in.b;
+		draw_text(FONT_SMALL_BOLD, rbx, L.repl_y + (PX(26) - font_m[FONT_SMALL].line) / 2, "AB", 2,
+		          on ? COL(C_SIDEBAR_FG) : COL(C_FG_DIM));
+	}
+	/* "..." toggle for include / exclude */
+	draw_text(FONT_UI_BOLD, x + w - PX(30), L.inc_y - (app.search_show_details ? PX(36) : 0) - PX(4) +
+	          (app.search_show_details ? 0 : 0), "\xE2\x80\xA6", 3, COL(C_SIDEBAR_FG));
+	if (app.search_show_details) {
+		draw_text(FONT_SMALL, L.ix, L.inc_y - PX(16), "files to include", 16, COL(C_SIDEBAR_FG));
+		input_draw(&app.search_inc_in, L.ix, L.inc_y, L.iw, PX(26), "e.g. *.c, src/**/include", sf && app.search_box == 2);
+		draw_text(FONT_SMALL, L.ix, L.exc_y - PX(16), "files to exclude", 16, COL(C_SIDEBAR_FG));
+		input_draw(&app.search_exc_in, L.ix, L.exc_y, L.iw, PX(26), "e.g. *.o, build/**", sf && app.search_box == 3);
+	}
 	const SearchResults *r = &app.results;
-	char msg[128];
-	if (app.search_in.n && r->n)
+	char msg[200];
+	u32 mc = COL(C_DESCRIPTION_FG);
+	if (bad) {
+		snprintf(msg, sizeof msg, "%s", app.search_m.err);
+		mc = COL(C_ERROR);
+	} else if (app.search_in.n && r->n)
 		snprintf(msg, sizeof msg, "%u result%s in %u file%s%s", r->n, r->n == 1 ? "" : "s", r->files_hit,
-		         r->files_hit == 1 ? "" : "s", r->truncated ? " (truncated)" : "");
-	else if (app.search_in.n && hash_input(&app.search_in, app.search_flags) == search_last_hash)
-		snprintf(msg, sizeof msg, "No results found.");
+		         r->files_hit == 1 ? "" : "s", r->truncated ? " - more results exist, refine your search" : "");
+	else if (app.search_in.n && search_hash() == search_last_hash)
+		snprintf(msg, sizeof msg, "No results found. Review your settings for configured exclusions.");
 	else
 		msg[0] = 0;
-	draw_text(FONT_UI, x + PX(20), cy + (PX(26) - font_m[FONT_UI].line) / 2, msg, strlen(msg), COL(C_DESCRIPTION_FG));
-	cy += PX(26);
+	draw_text_fit(FONT_UI, x + PX(20), L.msg_y + (PX(24) - font_m[FONT_UI].line) / 2, msg, strlen(msg), w - PX(28), mc);
+	int cy = L.list_y;
 	search_rows();
 	int rh = app.row_h;
 	int list_h = y + h - cy;
@@ -631,6 +743,7 @@ void search_draw(int x, int y, int w, int h)
 	app.search_scroll = VX_CLAMP(app.search_scroll, 0, maxs);
 	draw_clip(x, cy, w, list_h);
 	bool focused = app.focus == FOCUS_SIDEBAR;
+	bool replacing = app.search_show_replace && app.search_repl_in.b;
 	for (u32 i = (u32)(app.search_scroll / rh); i < srow_n; i++) {
 		int ry = cy + (int)i * rh - app.search_scroll;
 		if (ry > y + h)
@@ -639,6 +752,14 @@ void search_draw(int x, int y, int w, int h)
 		list_row_bg(x, ry, w, rh, i == app.search_sel && focused, focused, hover);
 		int ty = ry + (rh - font_m[FONT_UI].line) / 2;
 		u32 v = srow_res[i];
+		int right = x + w - PX(12);
+		if (hover) {
+			/* actions: replace (when replacing), dismiss */
+			draw_icon(ICON_CLOSE, right - PX(16), ry + (rh - PX(16)) / 2, COL(C_SIDEBAR_FG));
+			if (replacing)
+				draw_text(FONT_SMALL_BOLD, right - PX(40), ty + PX(1), "AB", 2, COL(C_SIDEBAR_FG));
+			right -= replacing ? PX(46) : PX(22);
+		}
 		if (v & 0x80000000u) {
 			u32 f = v & 0x7FFFFFFFu;
 			const char *p = app.files.pool.b + app.files.path[f];
@@ -650,23 +771,38 @@ void search_draw(int x, int y, int w, int h)
 			u32 cnt = 0;
 			for (u32 k = 0; k < r->n; k++)
 				cnt += r->file[k] == f;
-			char b[16];
-			snprintf(b, sizeof b, "%u", cnt);
-			int bw = VX_MAX(PX(18), font_width(FONT_SMALL, b, strlen(b)) + PX(10));
+			char bnum[16];
+			snprintf(bnum, sizeof bnum, "%u", cnt);
+			int bw = VX_MAX(PX(18), font_width(FONT_SMALL, bnum, strlen(bnum)) + PX(10));
 			if (app.files.base[f] > 1)
-				draw_text_fit(FONT_UI, tx + PX(6), ty, p, app.files.base[f] - 1, x + w - PX(16) - bw - tx - PX(6),
-				              COL(C_DESCRIPTION_FG));
-			badge(x + w - PX(12), ry, rh, b, COL(C_BADGE_BG), COL(C_BADGE_FG));
-		} else {
-			const char *t = r->pool.b + r->text[v];
-			size_t n = strlen(t);
-			u32 mc = r->text_col[v];
-			int tx = x + PX(40);
-			int a = tx + font_width(FONT_UI, t, VX_MIN(mc, (u32)n));
-			int b = a + font_width(FONT_UI, t + VX_MIN(mc, (u32)n), VX_MIN(r->len[v], (u32)n - VX_MIN(mc, (u32)n)));
-			draw_rect(a, ry + PX(2), b - a, rh - PX(4), COL(C_FIND_MATCH_OTHER));
-			draw_text_fit(FONT_UI, tx, ty, t, n, x + w - tx - PX(8), COL(C_SIDEBAR_FG));
+				draw_text_fit(FONT_UI, tx + PX(6), ty, p, app.files.base[f] - 1, right - bw - tx - PX(12), COL(C_DESCRIPTION_FG));
+			badge(right, ry, rh, bnum, COL(C_BADGE_BG), COL(C_BADGE_FG));
+			continue;
 		}
+		const char *t = r->pool.b + r->text[v];
+		u32 n = (u32)strlen(t);
+		u32 mc0 = VX_MIN(r->text_col[v], n);
+		u32 ml = VX_MIN(r->len[v], n - mc0);
+		int tx = x + PX(40);
+		int maxx = right - PX(4);
+		tx = draw_text_fit(FONT_UI, tx, ty, t, mc0, maxx - tx, COL(C_SIDEBAR_FG));
+		int ma = tx;
+		tx = draw_text_fit(FONT_UI, tx, ty, t + mc0, ml, VX_MAX(maxx - tx, 0), COL(C_SIDEBAR_FG));
+		if (replacing) {
+			/* preview: old text struck out (removed), new text inserted */
+			draw_rect(ma, ry + PX(2), tx - ma, rh - PX(4), COL(C_DIFF_REMOVED));
+			draw_rect(ma, ty + font_m[FONT_UI].line / 2, tx - ma, PX(1), COL(C_SIDEBAR_FG));
+			u32 rl;
+			char *rp = result_replacement(v, &rl);
+			int rx = tx;
+			tx = draw_text_fit(FONT_UI, tx, ty, rp, rl, VX_MAX(maxx - tx, 0), COL(C_SIDEBAR_FG));
+			draw_rect(rx, ry + PX(2), tx - rx, rh - PX(4), COL(C_DIFF_INSERTED));
+			free(rp);
+		} else {
+			draw_rect(ma, ry + PX(2), tx - ma, rh - PX(4), COL(C_FIND_MATCH_OTHER));
+		}
+		if (tx < maxx)
+			draw_text_fit(FONT_UI, tx, ty, t + mc0 + ml, n - mc0 - ml, maxx - tx, COL(C_SIDEBAR_FG));
 	}
 	draw_noclip();
 }
@@ -685,30 +821,254 @@ static void search_open_row(u32 i, bool preview)
 	View *vw = active_view();
 	if (vw) {
 		vw->anchor[0] = vw->head[0];
-		vw->head[0] = vw->anchor[0] + r->len[v];
+		vw->head[0] = VX_MIN(vw->anchor[0] + r->len[v], app.docs.text[vw->doc].len);
 	}
+}
+
+/* Drop results (dismiss): one result, or a whole file. */
+static void search_dismiss(u32 file, u32 result)
+{
+	SearchResults *r = &app.results;
+	u32 k = 0;
+	for (u32 i = 0; i < r->n; i++) {
+		bool drop = result != UINT32_MAX ? i == result : r->file[i] == file;
+		if (drop)
+			continue;
+		r->file[k] = r->file[i];
+		r->line[k] = r->line[i];
+		r->col[k] = r->col[i];
+		r->len[k] = r->len[i];
+		r->text[k] = r->text[i];
+		r->text_col[k] = r->text_col[i];
+		k++;
+	}
+	r->n = k;
+	app.dirty = true;
+}
+
+static int write_atomic(const char *path, const char *data, size_t n)
+{
+	char tmp[8300];
+	snprintf(tmp, sizeof tmp, "%s.vxide~XXXXXX", path);
+	int fd = mkstemp(tmp);
+	if (fd < 0)
+		return -1;
+	struct stat st;
+	if (stat(path, &st) == 0)
+		fchmod(fd, st.st_mode & 07777);
+	size_t off = 0;
+	while (off < n) {
+		ssize_t w = write(fd, data + off, n - off);
+		if (w <= 0) {
+			close(fd);
+			unlink(tmp);
+			return -1;
+		}
+		off += (size_t)w;
+	}
+	if (close(fd) != 0 || rename(tmp, path) != 0) {
+		unlink(tmp);
+		return -1;
+	}
+	return 0;
+}
+
+/* Replace in one file: every match, or only the one at (line, col). The
+ * pattern is re-run on the current text so stale results cannot corrupt
+ * the file. Open documents are edited (one undo step) and saved when they
+ * were clean; other files are rewritten atomically. Returns replacements. */
+static u32 replace_in_file(u32 f, u32 only_line, u32 only_col)
+{
+	char abs[8192];
+	snprintf(abs, sizeof abs, "%s/%s", app.root, app.files.pool.b + app.files.path[f]);
+	u32 d = doc_find(abs);
+	size_t n = 0;
+	char *own = NULL;
+	const char *hay;
+	if (d != UINT32_MAX) {
+		hay = text_flat(&app.docs.text[d]);
+		n = app.docs.text[d].len;
+	} else {
+		own = vx_read_file(abs, &n);
+		if (!own)
+			return 0;
+		hay = own;
+	}
+	Matcher *m = &app.search_m;
+	const char *repl = box_text(&app.search_repl_in);
+	u32 cnt = 0, line = 0, ls = 0, scanned = 0;
+	/* collect edits */
+	u32 *ea = NULL, *eb = NULL, *eo = NULL, *el = NULL, ecap = 0;
+	Pool reps = {0};
+	u32 pos = 0, a, b;
+	while (pos <= n && matcher_next(m, hay, (u32)n, pos, &a, &b)) {
+		if (a == b) {
+			pos = a + 1;
+			continue;
+		}
+		for (u32 k = scanned; k < a; k++)
+			if (hay[k] == '\n') {
+				line++;
+				ls = k + 1;
+			}
+		scanned = a;
+		pos = b;
+		if (only_line != UINT32_MAX && (line != only_line || a - ls != only_col))
+			continue;
+		char *out = NULL;
+		u32 len = 0, cap = 0;
+		matcher_expand(m, repl, app.search_repl_in.n, hay, &out, &len, &cap);
+		VX_GROW(ea, ecap, cnt + 1);
+		eb = vx_realloc(eb, ecap * sizeof(u32));
+		eo = vx_realloc(eo, ecap * sizeof(u32));
+		el = vx_realloc(el, ecap * sizeof(u32));
+		ea[cnt] = a;
+		eb[cnt] = b;
+		eo[cnt] = pool_add(&reps, out ? out : "", len);
+		el[cnt] = len;
+		cnt++;
+		free(out);
+	}
+	if (cnt && d != UINT32_MAX) {
+		bool was_clean = !text_dirty(&app.docs.text[d]);
+		u32 g = ed_new_group();
+		for (u32 k = cnt; k-- > 0;)
+			doc_replace(d, ea[k], eb[k] - ea[k], reps.b + eo[k], el[k], g);
+		if (was_clean)
+			doc_save(d);
+	} else if (cnt) {
+		/* build the new content */
+		size_t nn = n;
+		for (u32 k = 0; k < cnt; k++)
+			nn = nn - (eb[k] - ea[k]) + el[k];
+		char *buf = vx_alloc(nn + 1);
+		size_t o = 0, prev = 0;
+		for (u32 k = 0; k < cnt; k++) {
+			memcpy(buf + o, hay + prev, ea[k] - prev);
+			o += ea[k] - prev;
+			memcpy(buf + o, reps.b + eo[k], el[k]);
+			o += el[k];
+			prev = eb[k];
+		}
+		memcpy(buf + o, hay + prev, n - prev);
+		if (write_atomic(abs, buf, nn) != 0) {
+			ui_status("Could not write %s", app.files.pool.b + app.files.path[f]);
+			cnt = 0;
+		}
+		free(buf);
+	}
+	free(ea);
+	free(eb);
+	free(eo);
+	free(el);
+	pool_free(&reps);
+	free(own);
+	return cnt;
+}
+
+void search_replace(u32 file, u32 result)
+{
+	if (!app.search_m.nq || app.search_m.err[0])
+		return;
+	SearchResults *r = &app.results;
+	u32 total = 0, files = 0;
+	if (result != UINT32_MAX) {
+		total = replace_in_file(r->file[result], r->line[result], r->col[result]);
+		files = total ? 1 : 0;
+	} else {
+		u32 prev = UINT32_MAX;
+		for (u32 i = 0; i < r->n; i++) {
+			if (r->file[i] == prev || (file != UINT32_MAX && r->file[i] != file))
+				continue;
+			prev = r->file[i];
+			u32 c = replace_in_file(r->file[i], UINT32_MAX, 0);
+			total += c;
+			files += c ? 1 : 0;
+		}
+	}
+	ui_status("Replaced %u occurrence%s across %u file%s with '%s'", total, total == 1 ? "" : "s", files,
+	          files == 1 ? "" : "s", box_text(&app.search_repl_in));
+	app.git_ns = 0;
+	search_run();
+}
+
+void search_step_result(int dir)
+{
+	search_rows();
+	if (!srow_n)
+		return;
+	u32 i = app.search_sel;
+	for (u32 k = 0; k < srow_n; k++) {
+		i = dir > 0 ? (i + 1) % srow_n : (i + srow_n - 1) % srow_n;
+		if (!(srow_res[i] & 0x80000000u))
+			break;
+	}
+	app.search_sel = i;
+	if (!(srow_res[i] & 0x80000000u))
+		search_open_row(i, true);
 }
 
 bool search_event(const Event *e, int x, int y, int w, int h)
 {
-	int iy = y + PX(35);
-	int cy = search_list_y(y);
+	SLayout L = search_layout(x, y, w);
+	int cy = L.list_y;
 	int rh = app.row_h;
 	if (e->type == EV_WHEEL) {
 		app.search_scroll -= (int)(e->wy * rh * 3);
 		return true;
 	}
 	if (e->type == EV_MDOWN) {
-		if (e->y >= iy && e->y < iy + PX(26)) {
-			int ix = x + PX(12), iw = w - PX(24);
-			int bx = ix + iw - PX(48);
-			if (e->x >= bx && e->x < bx + PX(44)) {
-				app.search_flags ^= e->x < bx + PX(22) ? SEARCH_CASE : SEARCH_WORD;
+		if (e->y < y + PX(35)) {
+			if (e->x >= x + w - PX(80) && e->x < x + w - PX(56))
 				search_run();
-			} else {
-				input_click(&app.search_in, FONT_UI, ix + PX(6), e->x);
+			else if (e->x >= x + w - PX(56) && e->x < x + w - PX(32)) {
+				input_set(&app.search_in, "", 0);
+				input_set(&app.search_repl_in, "", 0);
+				search_run();
+			} else if (e->x >= x + w - PX(32)) {
+				for (u32 f = 0; f < app.files.n; f++)
+					app.search_collapsed[f] = 1;
 			}
+			return true;
+		}
+		if (e->x < L.ix && e->y >= L.find_y && e->y < L.find_y + (app.search_show_replace ? PX(56) : PX(26))) {
+			app.search_show_replace = !app.search_show_replace;
+			return true;
+		}
+		struct {
+			int y, box;
+		} boxes[4] = {{L.find_y, 0}, {L.repl_y, 1}, {L.inc_y, 2}, {L.exc_y, 3}};
+		for (int k = 0; k < 4; k++) {
+			if (k == 1 && !app.search_show_replace)
+				continue;
+			if (k >= 2 && !app.search_show_details)
+				continue;
+			if (e->y < boxes[k].y || e->y >= boxes[k].y + PX(26) || e->x < L.ix)
+				continue;
+			if (k == 0) {
+				int bx = L.ix + L.iw - PX(70);
+				if (e->x >= bx && e->x < bx + PX(66)) {
+					int which = (e->x - bx) / PX(22);
+					app.search_flags ^= which == 0 ? SEARCH_CASE : which == 1 ? SEARCH_WORD : SEARCH_REGEX;
+					search_run();
+					app.focus = FOCUS_SEARCH_INPUT;
+					return true;
+				}
+			}
+			if (k == 1 && e->x >= L.ix + L.iw - PX(24)) {
+				search_replace(UINT32_MAX, UINT32_MAX);
+				return true;
+			}
+			app.search_box = k;
 			app.focus = FOCUS_SEARCH_INPUT;
+			input_click(search_box_input(k), FONT_UI, L.ix + PX(6), e->x);
+			return true;
+		}
+		/* "..." */
+		int dots_y = L.inc_y - (app.search_show_details ? PX(36) : 0) - PX(4);
+		if (e->x >= x + w - PX(34) && e->y >= dots_y && e->y < dots_y + PX(18)) {
+			app.search_show_details = !app.search_show_details;
+			search_changed();
 			return true;
 		}
 		if (e->y >= cy) {
@@ -717,35 +1077,73 @@ bool search_event(const Event *e, int x, int y, int w, int h)
 			if (i < srow_n) {
 				app.search_sel = i;
 				app.focus = FOCUS_SIDEBAR;
+				u32 v = srow_res[i];
+				int right = x + w - PX(12);
+				bool replacing = app.search_show_replace && app.search_repl_in.b;
+				if (e->x >= right - PX(18)) {
+					search_dismiss(v & 0x80000000u ? v & 0x7FFFFFFFu : UINT32_MAX,
+					               v & 0x80000000u ? UINT32_MAX : v);
+					return true;
+				}
+				if (replacing && e->x >= right - PX(42)) {
+					if (v & 0x80000000u)
+						search_replace(v & 0x7FFFFFFFu, UINT32_MAX);
+					else
+						search_replace(UINT32_MAX, v);
+					return true;
+				}
 				search_open_row(i, e->clicks < 2);
-				if (!(srow_res[i] & 0x80000000u))
+				if (!(v & 0x80000000u))
 					app.focus = e->clicks >= 2 ? FOCUS_EDITOR : FOCUS_SIDEBAR;
 			}
 		}
 		return true;
 	}
 	if (app.focus == FOCUS_SEARCH_INPUT) {
+		Input *in = search_box_input(app.search_box);
 		if (e->type == EV_TEXT) {
-			input_text(&app.search_in, e->text, strlen(e->text));
-			search_due = vx_now_ns() + 300000000ull;
+			input_text(in, e->text, strlen(e->text));
+			if (app.search_box != 1)
+				search_changed();
+			app.dirty = true;
 			return true;
 		}
 		if (e->type == EV_KEY) {
+			int mods = e->mods & (MOD_CTRL | MOD_SHIFT | MOD_ALT);
+			if ((e->key == SDLK_RETURN || e->key == SDLK_KP_ENTER) && mods == (MOD_CTRL | MOD_ALT)) {
+				search_replace(UINT32_MAX, UINT32_MAX);
+				return true;
+			}
 			if (e->key == SDLK_RETURN || e->key == SDLK_KP_ENTER) {
 				search_run();
 				return true;
 			}
-			if (e->key == SDLK_DOWN) {
+			if (e->key == SDLK_TAB) {
+				/* cycle the visible boxes */
+				int order[4], no = 0;
+				order[no++] = 0;
+				if (app.search_show_replace)
+					order[no++] = 1;
+				if (app.search_show_details) {
+					order[no++] = 2;
+					order[no++] = 3;
+				}
+				int at = 0;
+				for (int k = 0; k < no; k++)
+					if (order[k] == app.search_box)
+						at = k;
+				app.search_box = order[(at + ((e->mods & MOD_SHIFT) ? no - 1 : 1)) % no];
+				return true;
+			}
+			if (e->key == SDLK_DOWN && app.search_box == 0 && !app.search_show_replace) {
 				app.focus = FOCUS_SIDEBAR;
 				return true;
 			}
-			if (e->key == SDLK_C && e->mods == MOD_ALT) {
-				app.search_flags ^= SEARCH_CASE;
-				search_run();
-				return true;
-			}
-			if (e->key == SDLK_W && e->mods == MOD_ALT) {
-				app.search_flags ^= SEARCH_WORD;
+			int toggle = mods == MOD_ALT ? (e->key == SDLK_C ? SEARCH_CASE : e->key == SDLK_W ? SEARCH_WORD
+			                                : e->key == SDLK_R ? SEARCH_REGEX : 0)
+			                             : 0;
+			if (toggle) {
+				app.search_flags ^= toggle;
 				search_run();
 				return true;
 			}
@@ -753,9 +1151,10 @@ bool search_event(const Event *e, int x, int y, int w, int h)
 				app.focus = FOCUS_EDITOR;
 				return true;
 			}
-			bool r = input_key(&app.search_in, e);
-			if (r)
-				search_due = vx_now_ns() + 300000000ull;
+			bool r = input_key(in, e);
+			if (r && app.search_box != 1)
+				search_changed();
+			app.dirty = true;
 			return r;
 		}
 		return false;
@@ -785,6 +1184,23 @@ bool search_event(const Event *e, int x, int y, int w, int h)
 				search_open_row(app.search_sel, true);
 			app.focus = FOCUS_SIDEBAR;
 			break;
+		case SDLK_DELETE:
+			if (app.search_sel < srow_n) {
+				u32 v = srow_res[app.search_sel];
+				search_dismiss(v & 0x80000000u ? v & 0x7FFFFFFFu : UINT32_MAX, v & 0x80000000u ? UINT32_MAX : v);
+			}
+			break;
+		case SDLK_1:
+			if ((e->mods & (MOD_CTRL | MOD_SHIFT)) == (MOD_CTRL | MOD_SHIFT) && app.search_sel < srow_n &&
+			    app.search_show_replace) {
+				u32 v = srow_res[app.search_sel];
+				if (v & 0x80000000u)
+					search_replace(v & 0x7FFFFFFFu, UINT32_MAX);
+				else
+					search_replace(UINT32_MAX, v);
+				break;
+			}
+			return false;
 		default:
 			return false;
 		}
@@ -812,6 +1228,7 @@ void scm_refresh(void)
 	if (app.git) {
 		git_refresh(app.git);
 		app.git_ns = vx_now_ns();
+		app.blame_gen++;
 		for (u32 d = 0; d < app.docs.n; d++)
 			app.docs.gm_for[d] = UINT32_MAX;
 	}

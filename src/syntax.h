@@ -23,6 +23,18 @@ enum {
 	TK_OPERATOR,  /* keyword.operator                      #D4D4D4 / #000000     */
 	TK_LABEL,     /* entity.name.label                     #C8C8C8 / #000000     */
 	TK_INVALID,   /* invalid.illegal                       #F44747 / #CD3131     */
+	TK_HEADING,   /* markup.heading (bold)                 #569CD6 / #800000     */
+	TK_BOLD,      /* markup.bold (bold)                    #569CD6 / #000080     */
+	TK_ITALIC,    /* markup.italic (italic)                #C586C0 / #800080     */
+	TK_STRIKE,    /* markup.strikethrough (strike)         fg                    */
+	TK_RAW,       /* markup.inline.raw                     #CE9178 / #800000     */
+	TK_LINK,      /* markup.underline.link (underline)     fg                    */
+	TK_LIST,      /* punctuation.definition.list.begin     #6796E6 / #0451A5     */
+	TK_QUOTE,     /* punctuation.definition.quote.begin    #6A9955 / #0451A5     */
+	TK_TAG,       /* entity.name.tag                       #569CD6 / #800000     */
+	TK_TAGPUNCT,  /* punctuation.definition.tag            #808080 / #800000     */
+	TK_ATTR,      /* entity.other.attribute-name           #9CDCFE / #E50000     */
+	TK_REGEX,     /* string.regexp                         #D16969 / #811F3F     */
 	TK_COUNT
 };
 
@@ -32,6 +44,10 @@ enum {
 	LANG_ASM_GAS,   /* x86 AT&T / GNU as (.s .S .asm with % regs)    */
 	LANG_ASM_INTEL, /* x86 Intel / NASM / YASM (.asm .nasm .inc)     */
 	LANG_LISP,      /* Common Lisp / Scheme / Emacs Lisp / Clojure   */
+	LANG_SH,        /* sh / bash / zsh / ksh                         */
+	LANG_MARKDOWN,  /* Markdown (CommonMark + GFM bits)              */
+	LANG_TROFF,     /* roff: man, mdoc, ms, me, mm                   */
+	LANG_PERL,      /* Perl 5 (+ POD)                                */
 	LANG_COUNT
 };
 
@@ -50,6 +66,10 @@ typedef struct {
 int syn_lang_for_path(const char *path, const char *head, size_t headlen);
 const char *syn_lang_name(int lang);  /* "C", "x86 Assembly (AT&T)", ... */
 const char *syn_lang_lsp_id(int lang); /* LSP languageId: "c", "asm", "lisp" or NULL */
+
+/* Lexer states fit in 20 bits for every language (Markdown keeps an
+ * embedded fenced-code state in its own state word). */
+#define SYN_STATE_BITS 20
 
 /* Lex one line (without its '\n'). `state` is the lexer state at the start
  * of the line (0 at the start of the file); returns the state at its end.

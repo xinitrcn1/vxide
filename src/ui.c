@@ -567,6 +567,10 @@ static const Binding bindings[] = {
     {C, SDLK_F, W_ANY, CMD_FIND, 0},
     {C, SDLK_H, W_ANY, CMD_REPLACE, 0},
     {0, SDLK_F3, W_ANY, CMD_FIND_NEXT, 0},
+    {C | S, SDLK_H, W_ANY, CMD_REPLACE_IN_FILES, 0},
+    {0, SDLK_F4, W_ANY, CMD_SEARCH_NEXT_RESULT, 0},
+    {S, SDLK_F4, W_ANY, CMD_SEARCH_PREV_RESULT, 0},
+    {C | S, SDLK_J, W_ANY, CMD_SEARCH_TOGGLE_DETAILS, 0},
     {S, SDLK_F3, W_ANY, CMD_FIND_PREV, 0},
     {C, SDLK_Z, W_EDITOR, CMD_UNDO, 0},
     {C, SDLK_Y, W_EDITOR, CMD_REDO, 0},
@@ -637,6 +641,11 @@ static const char *cmd_titles[CMD_COUNT] = {
     [CMD_REPLACE] = "Replace",
     [CMD_FIND_NEXT] = "Find Next",
     [CMD_FIND_PREV] = "Find Previous",
+    [CMD_REPLACE_IN_FILES] = "Search: Replace in Files",
+    [CMD_SEARCH_REPLACE_ALL] = "Search: Replace All",
+    [CMD_SEARCH_NEXT_RESULT] = "Search: Go to Next Search Result",
+    [CMD_SEARCH_PREV_RESULT] = "Search: Go to Previous Search Result",
+    [CMD_SEARCH_TOGGLE_DETAILS] = "Search: Toggle Search Details",
     [CMD_UNDO] = "Undo",
     [CMD_REDO] = "Redo",
     [CMD_CUT] = "Cut",
@@ -674,6 +683,7 @@ static const char *cmd_titles[CMD_COUNT] = {
     [CMD_GIT_STAGE_FILE] = "Git: Stage Changes (active file)",
     [CMD_GIT_UNSTAGE_FILE] = "Git: Unstage Changes (active file)",
     [CMD_GIT_DISCARD_FILE] = "Git: Discard Changes (active file)",
+    [CMD_GIT_TOGGLE_BLAME] = "Git: Toggle Git Blame Editor Decoration",
     [CMD_REFRESH_EXPLORER] = "File: Refresh Explorer",
     [CMD_COLLAPSE_FOLDERS] = "File: Collapse Folders in Explorer",
     [CMD_REVEAL_IN_EXPLORER] = "File: Reveal Active File in Explorer View",
@@ -1388,6 +1398,27 @@ void run_command(int cmd)
 		}
 		break;
 	}
+	case CMD_REPLACE_IN_FILES:
+		app.search_show_replace = true;
+		run_command(CMD_VIEW_SEARCH);
+		break;
+	case CMD_SEARCH_REPLACE_ALL:
+		search_replace(UINT32_MAX, UINT32_MAX);
+		break;
+	case CMD_SEARCH_NEXT_RESULT:
+	case CMD_SEARCH_PREV_RESULT:
+		search_step_result(cmd == CMD_SEARCH_NEXT_RESULT ? 1 : -1);
+		break;
+	case CMD_SEARCH_TOGGLE_DETAILS:
+		app.search_show_details = !app.search_show_details;
+		if (app.search_show_details) {
+			app.side_view = SIDE_SEARCH;
+			app.side_visible = true;
+			app.focus = FOCUS_SEARCH_INPUT;
+			app.search_box = 2;
+		}
+		ui_layout();
+		break;
 	case CMD_TOGGLE_SIDEBAR:
 		app.side_visible = !app.side_visible;
 		if (!app.side_visible && app.focus == FOCUS_SIDEBAR)
@@ -1406,6 +1437,8 @@ void run_command(int cmd)
 		app.side_view = view;
 		app.side_visible = true;
 		app.focus = view == SIDE_SEARCH ? FOCUS_SEARCH_INPUT : view == SIDE_SCM ? FOCUS_SCM_INPUT : FOCUS_SIDEBAR;
+		if (view == SIDE_SEARCH)
+			app.search_box = 0;
 		if (view == SIDE_SEARCH && v && v->head[0] != v->anchor[0]) {
 			/* seed with the selection like VSCodium */
 			u32 a = VX_MIN(v->head[0], v->anchor[0]), b = VX_MAX(v->head[0], v->anchor[0]);
@@ -1562,6 +1595,9 @@ void run_command(int cmd)
 			scm_refresh();
 		}
 		break;
+	case CMD_GIT_TOGGLE_BLAME:
+		app.blame_on = !app.blame_on;
+		break;
 	case CMD_REFRESH_EXPLORER:
 		fs_refresh(&app.tree);
 		app.files_ok = false;
@@ -1710,8 +1746,14 @@ void ui_event(const Event *e)
 			(void)in;
 			if (!v)
 				return;
+			bool in_repl = app.find_flags & 0x100;
 			if (e->key == SDLK_RETURN || e->key == SDLK_KP_ENTER) {
-				ed_find_next(v, e->mods & MOD_SHIFT);
+				if ((e->mods & (MOD_CTRL | MOD_ALT)) == (MOD_CTRL | MOD_ALT))
+					ed_replace_all(v);
+				else if (in_repl)
+					ed_replace_one(v);
+				else
+					ed_find_next(v, e->mods & MOD_SHIFT);
 				return;
 			}
 			if (e->key == SDLK_TAB && app.find_replace) {
@@ -1719,19 +1761,15 @@ void ui_event(const Event *e)
 				app.find_flags ^= 0x100;
 				return;
 			}
-			if (e->key == SDLK_C && e->mods == MOD_ALT) {
-				app.find_flags ^= SEARCH_CASE;
+			int toggle = e->mods == MOD_ALT ? (e->key == SDLK_C ? SEARCH_CASE : e->key == SDLK_W ? SEARCH_WORD
+			                                   : e->key == SDLK_R ? SEARCH_REGEX : 0)
+			                                : 0;
+			if (toggle) {
+				app.find_flags ^= toggle;
 				ed_find_update(v);
 				return;
 			}
-			if (e->key == SDLK_W && e->mods == MOD_ALT) {
-				app.find_flags ^= SEARCH_WORD;
-				ed_find_update(v);
-				return;
-			}
-			Input *box = (app.find_flags & 0x100) ? &app.repl_in : &app.find_in;
-			if ((app.find_flags & 0x100) && e->key == SDLK_RETURN)
-				return;
+			Input *box = in_repl ? &app.repl_in : &app.find_in;
 			u32 before = app.find_in.n;
 			input_key(box, e);
 			if (box == &app.find_in && app.find_in.n != before)
@@ -1958,7 +1996,8 @@ static const IconRule icon_rules[] = {
     {".txt", "\xE2\x89\xA1", 0x6D8086FF}, {".cpp", "C", 0xA074C4FF}, {".hpp", "h", 0xA074C4FF},
     {".glsl", "G", 0x519ABAFF},  {".vert", "G", 0x519ABAFF},  {".frag", "G", 0x519ABAFF},
     {".comp", "G", 0x519ABAFF},  {".yml", "y", 0xA074C4FF},   {".yaml", "y", 0xA074C4FF},
-    {".toml", "t", 0x6D8086FF},  {".png", "\xE2\x96\xA3", 0xA074C4FF}, {".mk", "M", 0xE37933FF},
+    {".toml", "t", 0x6D8086FF},  {".pl", "pl", 0x519ABAFF},  {".pm", "pm", 0x519ABAFF},
+    {".bash", ">", 0x4D5A5EFF},  {".zsh", ">", 0x4D5A5EFF},  {".markdown", "M", 0x519ABAFF},  {".png", "\xE2\x96\xA3", 0xA074C4FF}, {".mk", "M", 0xE37933FF},
 };
 
 int file_icon_draw(const char *name, int x, int y, int h)
@@ -2535,6 +2574,9 @@ void ui_draw(void)
 
 /* ---- LSP / git / timers ------------------------------------------------- */
 
+static u32 doc_by_path(const char *p);
+u32 doc_find(const char *p) { return doc_by_path(p); }
+
 static u32 doc_by_path(const char *p)
 {
 	for (u32 d = 0; d < app.docs.n; d++)
@@ -2671,12 +2713,51 @@ static void lsp_tick(void)
 	}
 }
 
+/* Repo-relative path of a document inside the work tree, or NULL. */
+const char *doc_repo_rel(u32 d)
+{
+	if (!app.git || !app.docs.path[d])
+		return NULL;
+	const char *wd = git_workdir(app.git);
+	size_t wl = strlen(wd);
+	return strncmp(app.docs.path[d], wd, wl) == 0 ? app.docs.path[d] + wl : NULL;
+}
+
+u32 blame_key_of(u32 d) { return app.docs.text[d].version * 2654435761u ^ app.blame_gen; }
+
+static void blame_tick(void)
+{
+	if (!app.blame)
+		return;
+	if (blame_take_update(app.blame))
+		app.dirty = true;
+	View *v = active_view();
+	if (!app.blame_on || !v)
+		return;
+	u32 d = v->doc;
+	const char *rel = doc_repo_rel(d);
+	if (!rel)
+		return;
+	u32 key = blame_key_of(d);
+	if (app.blame_asked && app.blame_doc == d && app.blame_key == key)
+		return;
+	/* debounce while typing */
+	if (vx_now_ns() - app.docs.lsp_changed_ns[d] < 200000000ull)
+		return;
+	Text *t = &app.docs.text[d];
+	blame_request(app.blame, rel, text_flat(t), t->len, key);
+	app.blame_asked = true;
+	app.blame_doc = d;
+	app.blame_key = key;
+}
+
 static void git_tick(void)
 {
 	u64 now = vx_now_ns();
 	if (app.git && now - app.git_ns > 3000000000ull) {
 		git_refresh(app.git);
 		app.git_ns = now;
+		app.blame_gen++;
 		app.dirty = true;
 		for (u32 d = 0; d < app.docs.n; d++)
 			app.docs.gm_for[d] = UINT32_MAX; /* index may have changed */
@@ -2712,6 +2793,7 @@ void ui_tick(void)
 	app.now = vx_now_ns();
 	lsp_tick();
 	git_tick();
+	blame_tick();
 	if (app.now - app.tree_scan_ns > 5000000000ull) {
 		/* pick up files created outside the editor */
 		if (app.tree_scan_ns) {
@@ -2774,6 +2856,8 @@ bool ui_init(const char *root, int w, int h, int scale, bool headless)
 	if (app.git) {
 		git_refresh(app.git);
 		app.git_ns = vx_now_ns();
+		app.blame_on = !getenv("VXIDE_NO_BLAME");
+		app.blame = blame_start(git_workdir(app.git));
 	}
 	app.tree_scan_ns = vx_now_ns();
 	if (!getenv("VXIDE_NO_LSP"))
@@ -2785,15 +2869,22 @@ bool ui_init(const char *root, int w, int h, int scale, bool headless)
 
 void ui_shutdown(void)
 {
-	if (app.lsp)
-		lsp_stop(app.lsp);
-	if (app.git)
-		git_close(app.git);
+	/* tabs first: closing a document still talks to the language server */
 	for (u32 gi = 0; gi < app.ngroups; gi++)
 		while (app.groups[gi].nt)
 			close_tab(gi, app.groups[gi].nt - 1);
+	if (app.lsp)
+		lsp_stop(app.lsp);
+	app.lsp = NULL;
+	blame_stop(app.blame);
+	app.blame = NULL;
+	if (app.git)
+		git_close(app.git);
+	app.git = NULL;
 	fs_free(&app.tree);
 	files_free(&app.files);
 	search_free(&app.results);
+	matcher_free(&app.find_m);
+	matcher_free(&app.search_m);
 	font_shutdown();
 }

@@ -7,6 +7,7 @@
 #include "fstree.h"
 #include "search.h"
 #include "git.h"
+#include "blame.h"
 #include "lsp.h"
 #include "theme.h"
 #include "draw.h"
@@ -167,7 +168,10 @@ typedef struct {
 	bool files_ok;
 
 	/* search view */
-	Input search_in;
+	Input search_in, search_repl_in, search_inc_in, search_exc_in;
+	int search_box; /* focused box: 0 search, 1 replace, 2 include, 3 exclude */
+	bool search_show_replace, search_show_details;
+	Matcher search_m;
 	int search_flags;
 	SearchResults results;
 	i32 search_scroll;
@@ -176,6 +180,11 @@ typedef struct {
 
 	/* source control */
 	Git *git;
+	Blame *blame;
+	bool blame_on; /* git.blame.editorDecoration.enabled */
+	u32 blame_gen;  /* bumps on every git refresh (HEAD may move) */
+	u32 blame_doc, blame_key;
+	bool blame_asked;
 	Input commit_in;
 	i32 scm_scroll;
 	u32 scm_sel;
@@ -213,6 +222,10 @@ typedef struct {
 	u32 find_count, find_index;
 	u32 find_version; /* text version the count is for */
 	u32 find_doc;
+	u32 find_hash;    /* query + flags the matches are for */
+	Matcher find_m;
+	u32 *fm_a, *fm_b; /* all matches in the document (sorted) */
+	u32 fm_n, fm_cap;
 
 	/* quick input */
 	int quick;
@@ -270,6 +283,7 @@ void ui_clipboard_set(const char *s, size_t n);
 
 /* documents */
 u32 doc_open(const char *abs_path); /* returns doc index or UINT32_MAX */
+u32 doc_find(const char *abs_path);  /* open document for a path, or UINT32_MAX */
 u32 doc_new_untitled(void);
 void doc_release(u32 d);
 bool doc_save(u32 d);
@@ -293,6 +307,7 @@ void ed_find_update(View *v);
 void ed_find_next(View *v, bool back);
 void ed_replace_one(View *v);
 void ed_replace_all(View *v);
+u32 ed_new_group(void);
 void ed_completion_trigger(View *v, bool explicit_);
 void ed_completion_accept(View *v);
 void ed_completion_filter(View *v);
@@ -303,6 +318,8 @@ u32 ed_line_col_to_off(Text *t, u32 line, u32 col);
 void ed_lex_until(u32 d, u32 line);
 int ed_gutter_w(View *v);
 void ed_insert_text(View *v, const char *s, size_t n, u8 kind);
+u32 blame_key_of(u32 d);
+const char *doc_repo_rel(u32 d);
 bool ed_command(View *v, int cmd);
 
 /* panes.c */
@@ -313,6 +330,8 @@ void search_draw(int x, int y, int w, int h);
 bool search_event(const Event *e, int x, int y, int w, int h);
 void search_run(void);
 void search_tick(void);
+void search_replace(u32 file, u32 result); /* UINT32_MAX = all */
+void search_step_result(int dir);
 void ui_ensure_files(void);
 void scm_draw(int x, int y, int w, int h);
 bool scm_event(const Event *e, int x, int y, int w, int h);
@@ -358,6 +377,11 @@ enum {
 	CMD_REPLACE,
 	CMD_FIND_NEXT,
 	CMD_FIND_PREV,
+	CMD_REPLACE_IN_FILES,
+	CMD_SEARCH_REPLACE_ALL,
+	CMD_SEARCH_NEXT_RESULT,
+	CMD_SEARCH_PREV_RESULT,
+	CMD_SEARCH_TOGGLE_DETAILS,
 	CMD_UNDO,
 	CMD_REDO,
 	CMD_CUT,
@@ -395,6 +419,7 @@ enum {
 	CMD_GIT_STAGE_FILE,
 	CMD_GIT_UNSTAGE_FILE,
 	CMD_GIT_DISCARD_FILE,
+	CMD_GIT_TOGGLE_BLAME,
 	CMD_REFRESH_EXPLORER,
 	CMD_COLLAPSE_FOLDERS,
 	CMD_REVEAL_IN_EXPLORER,

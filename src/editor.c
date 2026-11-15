@@ -5,6 +5,7 @@
 
 #include <ctype.h>
 #include <stdio.h>
+#include <time.h>
 #include <SDL3/SDL.h>
 
 #define TAB 4
@@ -625,10 +626,54 @@ static void indent_lines(View *v, bool out)
 		}
 }
 
+/* Wrap each touched line in open/close (Markdown's <!-- -->), or unwrap
+ * when every non-blank line already is. */
+static void toggle_block_comment(View *v, const char *open, const char *close)
+{
+	Text *t = T(v);
+	static u32 l0[MAX_CURSORS], l1[MAX_CURSORS];
+	u32 n = touched_lines(v, l0, l1);
+	u32 ol = (u32)strlen(open), cl = (u32)strlen(close);
+	bool all = true;
+	for (u32 r = 0; r < n; r++)
+		for (u32 l = l0[r]; l <= l1[r]; l++) {
+			u32 ie = line_indent_end(t, l), le = text_line_start(t, l) + text_line_len(t, l);
+			if (ie == le)
+				continue;
+			char a[16], b[16];
+			if (le - ie < ol + cl) {
+				all = false;
+				continue;
+			}
+			text_copy(t, ie, ol, a);
+			text_copy(t, le - cl, cl, b);
+			if (memcmp(a, open, ol) || memcmp(b, close, cl))
+				all = false;
+		}
+	u32 g = group_for(v, GK_OTHER);
+	for (u32 r = n; r-- > 0;)
+		for (u32 l = l1[r] + 1; l-- > l0[r];) {
+			u32 ie = line_indent_end(t, l), le = text_line_start(t, l) + text_line_len(t, l);
+			if (ie == le)
+				continue;
+			if (all) {
+				edit(v, le - cl, cl, "", 0, g);
+				edit(v, ie, ol, "", 0, g);
+			} else {
+				edit(v, le, 0, close, cl, g);
+				edit(v, ie, 0, open, ol, g);
+			}
+		}
+}
+
 static void toggle_comment(View *v)
 {
 	Text *t = T(v);
 	const char *pre = syn_line_comment(app.docs.lang[v->doc]);
+	if (!pre && app.docs.lang[v->doc] != LANG_NONE) {
+		toggle_block_comment(v, "<!-- ", " -->");
+		return;
+	}
 	if (!pre)
 		pre = "#";
 	u32 pl = (u32)strlen(pre);
@@ -1217,10 +1262,16 @@ bool ed_command(View *v, int cmd)
 		if (a == b)
 			word_at(t, a, &a, &b);
 		if (b > a && b - a < 200) {
-			char buf[200];
+			char buf[200], esc[400];
 			text_copy(t, a, b - a, buf);
+			u32 en = 0;
+			for (u32 i = 0; i < b - a; i++) {
+				if ((app.find_flags & SEARCH_REGEX) && strchr("\\^$.|?*+()[]{}", buf[i]))
+					esc[en++] = '\\';
+				esc[en++] = buf[i];
+			}
 			if (!memchr(buf, '\n', b - a))
-				input_set(&app.find_in, buf, b - a);
+				input_set(&app.find_in, esc, en);
 		}
 		app.find_in.anchor = 0;
 		app.find_in.cur = app.find_in.n;
@@ -1365,113 +1416,169 @@ bool ed_key(View *v, const Event *e)
 
 /* ---- find --------------------------------------------------------------- */
 
-static int find_flags(void) { return app.find_flags & (SEARCH_CASE | SEARCH_WORD); }
+static int find_flags(void) { return app.find_flags & (SEARCH_CASE | SEARCH_WORD | SEARCH_REGEX); }
+
+u32 ed_new_group(void) { return next_group++; }
+
+static u32 query_hash(void)
+{
+	u32 h = 2166136261u ^ (u32)find_flags();
+	for (u32 i = 0; i < app.find_in.n; i++)
+		h = (h ^ (u8)app.find_in.b[i]) * 16777619u;
+	return h;
+}
+
+/* Recompute every match of the query in the document (VSCodium keeps up
+ * to 19999 find decorations). */
+static void find_matches(View *v)
+{
+	Text *t = T(v);
+	u32 h = query_hash();
+	if (app.find_doc == v->doc && app.find_version == t->version && app.find_hash == h)
+		return;
+	app.find_doc = v->doc;
+	app.find_version = t->version;
+	app.find_hash = h;
+	app.fm_n = 0;
+	matcher_free(&app.find_m);
+	if (!matcher_init(&app.find_m, app.find_in.b ? app.find_in.b : "", app.find_in.n, find_flags()))
+		return;
+	const char *hay = text_flat(t);
+	u32 pos = 0, a, b;
+	while (app.fm_n < 19999 && pos <= t->len && matcher_next(&app.find_m, hay, t->len, pos, &a, &b)) {
+		VX_GROW(app.fm_a, app.fm_cap, app.fm_n + 1);
+		app.fm_b = vx_realloc(app.fm_b, app.fm_cap * sizeof(u32));
+		app.fm_a[app.fm_n] = a;
+		app.fm_b[app.fm_n] = b;
+		app.fm_n++;
+		pos = b > a ? b : next_char(t, a);
+		if (b == a && a >= t->len)
+			break;
+	}
+	app.find_count = app.fm_n;
+}
+
+/* First match with start >= off. */
+static u32 match_at_or_after(u32 off)
+{
+	u32 lo = 0, hi = app.fm_n;
+	while (lo < hi) {
+		u32 mid = (lo + hi) / 2;
+		if (app.fm_a[mid] < off)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
+static void select_match(View *v, u32 k)
+{
+	v->nc = 1;
+	v->anchor[0] = app.fm_a[k];
+	v->head[0] = app.fm_b[k];
+	app.find_index = k + 1;
+	ed_reveal(v, app.fm_a[k], true);
+}
 
 void ed_find_update(View *v)
 {
-	Text *t = T(v);
-	app.find_count = 0;
 	app.find_index = 0;
-	app.find_version = t->version;
-	app.find_doc = v->doc;
-	if (!app.find_in.n)
+	find_matches(v);
+	if (!app.fm_n)
 		return;
-	const char *hay = text_flat(t);
-	u32 pos = 0, idx = 0;
-	u32 cur = sel_lo(v, 0);
-	bool found_cur = false;
-	while (pos < t->len && app.find_count < 19999) {
-		u32 m = find_in(hay + pos, t->len - pos, app.find_in.b, app.find_in.n, find_flags(), 0, false);
-		if (m == UINT32_MAX)
-			break;
-		m += pos;
-		app.find_count++;
-		if (!found_cur && m >= cur) {
-			idx = app.find_count;
-			found_cur = true;
-			/* incremental: select the match at/after the cursor */
-			v->nc = 1;
-			v->anchor[0] = m;
-			v->head[0] = m + app.find_in.n;
-			ed_reveal(v, m, true);
-		}
-		pos = m + app.find_in.n;
-	}
-	app.find_index = idx;
+	/* incremental: the first match at or after the selection start */
+	u32 k = match_at_or_after(sel_lo(v, 0));
+	select_match(v, k < app.fm_n ? k : 0);
 	app.dirty = true;
 }
 
 void ed_find_next(View *v, bool back)
 {
-	Text *t = T(v);
-	if (!app.find_in.n)
-		return;
-	const char *hay = text_flat(t);
-	u32 from = back ? sel_lo(v, 0) : sel_hi(v, 0);
-	u32 m = find_in(hay, t->len, app.find_in.b, app.find_in.n, find_flags(), from, back);
-	if (m == UINT32_MAX) {
-		app.find_count = 0;
+	find_matches(v);
+	if (!app.fm_n) {
 		app.find_index = 0;
 		return;
 	}
-	v->nc = 1;
-	v->anchor[0] = m;
-	v->head[0] = m + app.find_in.n;
-	ed_reveal(v, m, true);
-	/* index of this match */
-	u32 pos = 0, k = 0;
-	app.find_count = 0;
-	while (pos < t->len) {
-		u32 x = find_in(hay + pos, t->len - pos, app.find_in.b, app.find_in.n, find_flags(), 0, false);
-		if (x == UINT32_MAX)
-			break;
-		x += pos;
-		app.find_count++;
-		if (x == m)
-			k = app.find_count;
-		pos = x + app.find_in.n;
+	u32 lo = sel_lo(v, 0), hi = sel_hi(v, 0);
+	u32 k;
+	if (!back) {
+		k = match_at_or_after(hi > lo ? hi : lo + 1);
+		/* an empty match at the cursor itself counts once */
+		if (k < app.fm_n && app.fm_a[k] == lo && hi == lo && app.fm_b[k] == lo)
+			k++;
+		if (k >= app.fm_n)
+			k = 0;
+	} else {
+		k = match_at_or_after(lo);
+		k = k == 0 ? app.fm_n - 1 : k - 1;
 	}
-	app.find_index = k;
+	select_match(v, k);
+}
+
+/* Replacement for match k (regex: expanded with its captures). */
+static char *replacement_for(View *v, u32 k, u32 *len)
+{
+	Text *t = T(v);
+	char *out = NULL;
+	u32 cap = 0;
+	*len = 0;
+	const char *repl = app.repl_in.b ? app.repl_in.b : "";
+	u32 a, b;
+	if ((find_flags() & SEARCH_REGEX) &&
+	    matcher_next(&app.find_m, text_flat(t), t->len, app.fm_a[k], &a, &b) && a == app.fm_a[k]) {
+		matcher_expand(&app.find_m, repl, app.repl_in.n, text_flat(t), &out, len, &cap);
+	} else {
+		out = vx_strndup(repl, app.repl_in.n);
+		*len = app.repl_in.n;
+	}
+	return out;
 }
 
 void ed_replace_one(View *v)
 {
-	Text *t = T(v);
-	u32 a = sel_lo(v, 0), b = sel_hi(v, 0);
-	if (b - a == app.find_in.n && app.find_in.n) {
-		char *buf = vx_alloc(b - a + 1);
-		text_copy(t, a, b - a, buf);
-		bool same = (find_flags() & SEARCH_CASE) ? memcmp(buf, app.find_in.b, b - a) == 0
-		                                         : find_in(buf, b - a, app.find_in.b, app.find_in.n, 0, 0, false) == 0;
-		free(buf);
-		if (same) {
-			edit(v, a, b - a, app.repl_in.b ? app.repl_in.b : "", app.repl_in.n, group_for(v, GK_OTHER));
-			ed_set_cursor(v, a + app.repl_in.n, false);
-		}
+	find_matches(v);
+	u32 lo = sel_lo(v, 0), hi = sel_hi(v, 0);
+	u32 k = match_at_or_after(lo);
+	if (k < app.fm_n && app.fm_a[k] == lo && app.fm_b[k] == hi) {
+		u32 len;
+		char *r = replacement_for(v, k, &len);
+		edit(v, lo, hi - lo, r, len, group_for(v, GK_OTHER));
+		free(r);
+		ed_set_cursor(v, lo + len, false);
 	}
 	ed_find_next(v, false);
 }
 
 void ed_replace_all(View *v)
 {
-	Text *t = T(v);
-	if (!app.find_in.n)
+	find_matches(v);
+	u32 n = app.fm_n;
+	if (!n)
 		return;
-	u32 g = group_for(v, GK_OTHER);
-	u32 pos = 0, n = 0;
-	for (;;) {
-		const char *hay = text_flat(t);
-		if (pos >= t->len)
-			break;
-		u32 m = find_in(hay + pos, t->len - pos, app.find_in.b, app.find_in.n, find_flags(), 0, false);
-		if (m == UINT32_MAX)
-			break;
-		m += pos;
-		edit(v, m, app.find_in.n, app.repl_in.b ? app.repl_in.b : "", app.repl_in.n, g);
-		pos = m + app.repl_in.n;
-		n++;
+	/* expand every replacement against the original text, then apply
+	 * the edits from the end so earlier offsets stay valid */
+	u32 *off = vx_alloc((n + 1) * sizeof(u32)), *ln = vx_alloc((n + 1) * sizeof(u32));
+	u32 *ma = vx_alloc(n * sizeof(u32)), *mb = vx_alloc(n * sizeof(u32));
+	memcpy(ma, app.fm_a, n * sizeof(u32));
+	memcpy(mb, app.fm_b, n * sizeof(u32));
+	Pool reps = {0};
+	for (u32 k = 0; k < n; k++) {
+		u32 len;
+		char *r = replacement_for(v, k, &len);
+		off[k] = pool_add(&reps, r, len);
+		ln[k] = len;
+		free(r);
 	}
-	ui_status("Replaced %u occurrences", n);
+	u32 g = group_for(v, GK_OTHER);
+	for (u32 k = n; k-- > 0;)
+		edit(v, ma[k], mb[k] - ma[k], reps.b + off[k], ln[k], g);
+	ui_status("Replaced %u occurrence%s", n, n == 1 ? "" : "s");
+	pool_free(&reps);
+	free(off);
+	free(ln);
+	free(ma);
+	free(mb);
 	ed_find_update(v);
 }
 
@@ -1695,6 +1802,8 @@ static u32 hit_offset(View *v, int mx, int my, int x, int y)
 	return off_at_x(t, l, tx);
 }
 
+static bool find_widget_click(View *v, const Event *e);
+
 static int drag_mode; /* 1 chars, 2 words, 3 lines, 4 scrollbar, 5 minimap */
 static u32 drag_a, drag_b;
 static int drag_grab;
@@ -1717,6 +1826,8 @@ void ed_mouse(View *v, const Event *e, int x, int y, int w, int h)
 		app.dirty = true;
 		return;
 	}
+	if (e->type == EV_MDOWN && e->button == 1 && find_widget_click(v, e))
+		return;
 	if (e->type == EV_MDOWN && e->button == 1) {
 		app.compl_open = false;
 		app.hover_open = false;
@@ -1954,6 +2065,139 @@ static int line_indent_cols(Text *t, u32 l, bool *blank)
 	return col;
 }
 
+/* ---- find widget ------------------------------------------------------------ */
+
+static int fw_x, fw_y, fw_w, fw_h; /* last drawn rect, for clicks */
+
+static void fw_layout(int x, int y, int w, int *fx, int *fy, int *fwid, int *fh, int *ix, int *iw)
+{
+	*fwid = VX_MIN(PX(440), w - PX(40));
+	*fh = app.find_replace ? PX(66) : PX(33);
+	*fx = x + w - *fwid - SCROLL_W - PX(14);
+	*fy = y;
+	*ix = *fx + PX(24);
+	*iw = *fwid - PX(24) - PX(140);
+}
+
+static void toggle_box(int bx, int by, const char *label, bool on, bool underline)
+{
+	if (on) {
+		draw_rect(bx, by, PX(20), PX(19), (COL(C_FOCUS_BORDER) & 0xFFFFFF00u) | 0x50u);
+		draw_frame(bx, by, PX(20), PX(19), COL(C_FOCUS_BORDER));
+	}
+	int tw = font_width(FONT_SMALL_BOLD, label, strlen(label));
+	draw_text(FONT_SMALL_BOLD, bx + (PX(20) - tw) / 2, by + (PX(19) - font_m[FONT_SMALL].line) / 2, label,
+	          strlen(label), COL(C_FG));
+	if (underline)
+		draw_rect(bx + PX(3), by + PX(15), PX(14), PX(1), COL(C_FG));
+}
+
+static void find_widget_draw(int x, int y, int w)
+{
+	int fx, fy, fwid, fh, ix, iw;
+	fw_layout(x, y, w, &fx, &fy, &fwid, &fh, &ix, &iw);
+	fw_x = fx;
+	fw_y = fy;
+	fw_w = fwid;
+	fw_h = fh;
+	draw_rect(fx - PX(1), fy, fwid + PX(2), fh + PX(3), COL(C_WIDGET_SHADOW));
+	draw_rect(fx, fy, fwid, fh, COL(C_WIDGET_BG));
+	draw_rect(fx, fy, PX(3), fh, COL(C_WIDGET_BORDER));
+	draw_icon(app.find_replace ? ICON_CHEVRON_DOWN : ICON_CHEVRON_RIGHT, fx + PX(5), fy + PX(8), COL(C_FG));
+	bool find_focus = app.focus == FOCUS_FIND && !(app.find_flags & 0x100);
+	bool bad = app.find_m.err[0] != 0;
+	input_draw(&app.find_in, ix, fy + PX(4), iw, PX(25), "Find", find_focus);
+	if (bad)
+		draw_frame(ix, fy + PX(4), iw, PX(25), COL(C_ERROR));
+	/* toggles inside the box: Aa, ab, .* */
+	int bx = ix + iw - PX(68);
+	toggle_box(bx, fy + PX(7), "Aa", app.find_flags & SEARCH_CASE, false);
+	toggle_box(bx + PX(22), fy + PX(7), "ab", app.find_flags & SEARCH_WORD, true);
+	toggle_box(bx + PX(44), fy + PX(7), ".*", app.find_flags & SEARCH_REGEX, false);
+	char msg[64];
+	if (!app.find_in.n || !app.find_count)
+		snprintf(msg, sizeof msg, "No results");
+	else if (app.find_index)
+		snprintf(msg, sizeof msg, "%u of %u", app.find_index, app.find_count);
+	else
+		snprintf(msg, sizeof msg, "? of %u", app.find_count);
+	u32 mc = (app.find_in.n && !app.find_count) ? COL(C_ERROR) : COL(C_FG);
+	draw_text_fit(FONT_UI, ix + iw + PX(6), fy + (PX(33) - font_m[FONT_UI].line) / 2, msg, strlen(msg), PX(66), mc);
+	draw_icon(ICON_ARROW_UP, fx + fwid - PX(66), fy + PX(8), COL(C_FG));
+	draw_icon(ICON_ARROW_DOWN, fx + fwid - PX(46), fy + PX(8), COL(C_FG));
+	draw_icon(ICON_CLOSE, fx + fwid - PX(24), fy + PX(8), COL(C_FG));
+	if (app.find_replace) {
+		bool rf = app.focus == FOCUS_FIND && (app.find_flags & 0x100);
+		input_draw(&app.repl_in, ix, fy + PX(36), iw, PX(25), "Replace", rf);
+		/* replace / replace all buttons */
+		const char *b1 = "\xE2\x86\xB5", *b2 = "All";
+		int by = fy + PX(39);
+		draw_frame(ix + iw + PX(6), by, PX(24), PX(19), COL(C_WIDGET_BORDER));
+		draw_text(FONT_UI, ix + iw + PX(12), by + (PX(19) - font_m[FONT_UI].line) / 2, b1, strlen(b1), COL(C_FG));
+		draw_frame(ix + iw + PX(34), by, PX(30), PX(19), COL(C_WIDGET_BORDER));
+		draw_text(FONT_SMALL, ix + iw + PX(39), by + (PX(19) - font_m[FONT_SMALL].line) / 2, b2, 3, COL(C_FG));
+	}
+	if (bad) {
+		/* validation message under the input, like VSCodium */
+		int ey = fy + fh + PX(2);
+		int ew = font_width(FONT_UI, app.find_m.err, strlen(app.find_m.err)) + PX(12);
+		ew = VX_MIN(ew, fwid);
+		draw_rect(ix, ey, ew, PX(24), (COL(C_ERROR) & 0xFFFFFF00u) | 0x33u);
+		draw_frame(ix, ey, ew, PX(24), COL(C_ERROR));
+		draw_text_fit(FONT_UI, ix + PX(6), ey + (PX(24) - font_m[FONT_UI].line) / 2, app.find_m.err,
+		              strlen(app.find_m.err), ew - PX(12), COL(C_FG));
+	}
+}
+
+/* Click inside the find widget; true when handled. */
+static bool find_widget_click(View *v, const Event *e)
+{
+	if (!app.find_open || e->x < fw_x || e->x >= fw_x + fw_w || e->y < fw_y || e->y >= fw_y + fw_h)
+		return false;
+	int ix = fw_x + PX(24), iw = fw_w - PX(24) - PX(140);
+	int mx = e->x, my = e->y - fw_y;
+	bool row2 = my >= PX(33);
+	if (mx < ix) {
+		app.find_replace = !app.find_replace;
+		return true;
+	}
+	if (!row2) {
+		int bx = ix + iw - PX(68);
+		if (mx >= bx && mx < bx + PX(66)) {
+			int which = (mx - bx) / PX(22);
+			app.find_flags ^= which == 0 ? SEARCH_CASE : which == 1 ? SEARCH_WORD : SEARCH_REGEX;
+			ed_find_update(v);
+			app.focus = FOCUS_FIND;
+			return true;
+		}
+		if (mx < ix + iw) {
+			app.focus = FOCUS_FIND;
+			app.find_flags &= ~0x100;
+			input_click(&app.find_in, FONT_UI, ix + PX(6), mx);
+			return true;
+		}
+		if (mx >= fw_x + fw_w - PX(70) && mx < fw_x + fw_w - PX(50))
+			ed_find_next(v, true);
+		else if (mx >= fw_x + fw_w - PX(50) && mx < fw_x + fw_w - PX(28))
+			ed_find_next(v, false);
+		else if (mx >= fw_x + fw_w - PX(28)) {
+			app.find_open = false;
+			app.focus = FOCUS_EDITOR;
+		}
+		return true;
+	}
+	if (mx < ix + iw) {
+		app.focus = FOCUS_FIND;
+		app.find_flags |= 0x100;
+		input_click(&app.repl_in, FONT_UI, ix + PX(6), mx);
+	} else if (mx < ix + iw + PX(32)) {
+		ed_replace_one(v);
+	} else if (mx < ix + iw + PX(66)) {
+		ed_replace_all(v);
+	}
+	return true;
+}
+
 void ed_draw(Group *g, View *v, int x, int y, int w, int h, bool focused)
 {
 	(void)g;
@@ -2007,8 +2251,8 @@ void ed_draw(Group *g, View *v, int x, int y, int w, int h, bool focused)
 	}
 	u32 ba = 0, bb = 0;
 	bool brackets = !any_sel && match_bracket(t, v->head[0], &ba, &bb);
-	if (app.find_open && (app.find_version != t->version || app.find_doc != v->doc))
-		ed_find_update(v);
+	if (app.find_open)
+		find_matches(v);
 
 	draw_clip(x, y, w - mm - SCROLL_W, h);
 	/* backgrounds: current line, selections, matches */
@@ -2023,19 +2267,22 @@ void ed_draw(Group *g, View *v, int x, int y, int w, int h, bool focused)
 		u32 n;
 		const char *s = text_line(t, l, &n);
 		u32 ls = text_line_start(t, l);
-		if (app.find_open && app.find_in.n) {
-			u32 pos = 0;
-			while (pos + app.find_in.n <= n) {
-				u32 m = find_in(s + pos, n - pos, app.find_in.b, app.find_in.n, find_flags(), 0, false);
-				if (m == UINT32_MAX)
-					break;
-				m += pos;
-				bool cur = v->nc == 1 && ls + m == sel_lo(v, 0) && sel_hi(v, 0) - sel_lo(v, 0) == app.find_in.n;
-				int a = tx + x_of(t, l, ls + m), b = tx + x_of(t, l, ls + m + app.find_in.n);
-				draw_rect(a, ly, b - a, lh, cur ? COL(C_FIND_MATCH) : COL(C_FIND_MATCH_OTHER));
-				pos = m + app.find_in.n;
-				s = text_line(t, l, &n); /* x_of may have reused scratch */
+		if (app.find_open && app.fm_n) {
+			u32 le = ls + n;
+			for (u32 k = match_at_or_after(ls > 4096 ? ls - 4096 : 0); k < app.fm_n && app.fm_a[k] <= le; k++) {
+				u32 ma = app.fm_a[k], mb = app.fm_b[k];
+				if (mb < ls || (mb == ls && ma < ls))
+					continue;
+				u32 sa = VX_MAX(ma, ls), sb = VX_MIN(mb, le);
+				bool cur = v->nc == 1 && ma == sel_lo(v, 0) && mb == sel_hi(v, 0);
+				int xa = tx + x_of(t, l, sa), xb = tx + x_of(t, l, sb);
+				if (mb > le)
+					xb += app.char_w / 2; /* the match continues on the next line */
+				if (xb == xa)
+					xb = xa + PX(2); /* empty match: a thin mark */
+				draw_rect(xa, ly, xb - xa, lh, cur ? COL(C_FIND_MATCH) : COL(C_FIND_MATCH_OTHER));
 			}
+			s = text_line(t, l, &n);
 		}
 		if (occ_n && !app.find_open) {
 			u32 pos = 0;
@@ -2132,14 +2379,55 @@ void ed_draw(Group *g, View *v, int x, int y, int w, int h, bool focused)
 			u32 k = 1;
 			if (c >= 0x80)
 				k = utf8_decode(buf + i, nn - i, &cp);
-			u32 gid = font_glyph(FONT_MONO, cp);
+			u8 cls = line_cls[i];
+			u8 st = tk_style[cls];
+			int font = (st & TS_BOLD) ? ((st & TS_ITALIC) ? FONT_MONO_BOLD_ITALIC : FONT_MONO_BOLD)
+			                          : ((st & TS_ITALIC) ? FONT_MONO_ITALIC : FONT_MONO);
+			u32 gid = font_glyph(font, cp);
 			int gx = tx + px;
 			if (gx > text_x + text_w)
 				break;
-			if (c != ' ' && gx + font_glyphs.adv[gid] > text_x - app.char_w)
-				draw_glyph(gid, gx, ly, TOK(line_cls[i]));
-			px += font_glyphs.adv[gid];
+			int adv = app.char_w;
+			if (cp >= 0x80)
+				adv = font_glyphs.adv[font_glyph(FONT_MONO, cp)];
+			if (gx + adv > text_x - app.char_w) {
+				u32 col = TOK(cls);
+				if (c != ' ')
+					draw_glyph(gid, gx, ly, col);
+				if (st & TS_UNDERLINE)
+					draw_rect(gx, ly + font_m[FONT_MONO].ascent + PX(2), adv, PX(1), col);
+				if (st & TS_STRIKE)
+					draw_rect(gx, ly + lh / 2, adv, PX(1), col);
+			}
+			px += adv;
 			i += k;
+		}
+	}
+
+	/* inline git blame after the end of each cursor line */
+	if (app.blame && app.blame_on) {
+		const char *rel = doc_repo_rel(d);
+		u32 key = blame_key_of(d);
+		u32 shown = UINT32_MAX;
+		for (u32 c = 0; rel && c < v->nc; c++) {
+			u32 l = text_line_of(t, v->head[c]);
+			if (l < first || l >= last || l == shown)
+				continue;
+			shown = l;
+			BlameLine bl;
+			if (!blame_line(app.blame, rel, key, l, &bl))
+				continue;
+			char msg[600];
+			if (bl.uncommitted) {
+				snprintf(msg, sizeof msg, "Not Committed Yet");
+			} else {
+				char ago[48];
+				blame_ago(bl.time, (i64)time(NULL), ago, sizeof ago);
+				snprintf(msg, sizeof msg, "%s, %s (%s)", bl.summary, bl.author, ago);
+			}
+			int ly = y0 + (int)(l - first) * lh;
+			int bx = tx + x_of(t, l, text_line_start(t, l) + text_line_len(t, l)) + app.char_w * 3;
+			draw_text_fit(FONT_MONO, bx, ly, msg, strlen(msg), VX_MAX(text_x + text_w - bx, 0), COL(C_CODELENS));
 		}
 	}
 
@@ -2303,55 +2591,8 @@ void ed_draw(Group *g, View *v, int x, int y, int w, int h, bool focused)
 	}
 
 	/* find widget */
-	if (app.find_open && g == &app.groups[app.active_group]) {
-		int fw = VX_MIN(PX(420), w - PX(40));
-		int fh = app.find_replace ? PX(66) : PX(33);
-		int fx = x + w - fw - SCROLL_W - PX(14);
-		int fy = y;
-		draw_rect(fx - PX(1), fy, fw + PX(2), fh + PX(3), COL(C_WIDGET_SHADOW));
-		draw_rect(fx, fy, fw, fh, COL(C_WIDGET_BG));
-		draw_rect(fx, fy, PX(3), fh, COL(C_WIDGET_BORDER));
-		draw_icon(app.find_replace ? ICON_CHEVRON_DOWN : ICON_CHEVRON_RIGHT, fx + PX(5), fy + PX(8), COL(C_FG));
-		int ix = fx + PX(24);
-		int iw = fw - PX(24) - PX(140);
-		bool find_focus = app.focus == FOCUS_FIND && !(app.find_flags & 0x100);
-		input_draw(&app.find_in, ix, fy + PX(4), iw, PX(25), "Find", find_focus);
-		/* toggles inside the box: Aa, ab */
-		int bx = ix + iw - PX(48);
-		const char *tg[2] = {"Aa", "ab"};
-		int fl[2] = {SEARCH_CASE, SEARCH_WORD};
-		for (int k = 0; k < 2; k++) {
-			bool on = app.find_flags & fl[k];
-			if (on) {
-				draw_rect(bx + k * PX(22), fy + PX(7), PX(20), PX(19), (COL(C_FOCUS_BORDER) & 0xFFFFFF00u) | 0x50u);
-				draw_frame(bx + k * PX(22), fy + PX(7), PX(20), PX(19), COL(C_FOCUS_BORDER));
-			}
-			draw_text(FONT_SMALL_BOLD, bx + k * PX(22) + PX(3), fy + PX(7) + (PX(19) - font_m[FONT_SMALL].line) / 2,
-			          tg[k], 2, COL(C_FG));
-			if (k == 1)
-				draw_rect(bx + k * PX(22) + PX(3), fy + PX(22), PX(14), PX(1), COL(C_FG));
-		}
-		char msg[64];
-		if (!app.find_in.n)
-			snprintf(msg, sizeof msg, "No results");
-		else if (!app.find_count)
-			snprintf(msg, sizeof msg, "No results");
-		else if (app.find_index)
-			snprintf(msg, sizeof msg, "%u of %u", app.find_index, app.find_count);
-		else
-			snprintf(msg, sizeof msg, "? of %u", app.find_count);
-		int mxp = ix + iw + PX(6);
-		u32 mc = (app.find_in.n && !app.find_count) ? COL(C_ERROR) : COL(C_FG);
-		draw_text_fit(FONT_UI, mxp, fy + (PX(33) - font_m[FONT_UI].line) / 2, msg, strlen(msg), PX(66), mc);
-		draw_icon(ICON_ARROW_UP, fx + fw - PX(66), fy + PX(8), COL(C_FG));
-		draw_icon(ICON_ARROW_DOWN, fx + fw - PX(46), fy + PX(8), COL(C_FG));
-		draw_icon(ICON_CLOSE, fx + fw - PX(24), fy + PX(8), COL(C_FG));
-		if (app.find_replace) {
-			bool rf = app.focus == FOCUS_FIND && (app.find_flags & 0x100);
-			input_draw(&app.repl_in, ix, fy + PX(36), iw, PX(25), "Replace", rf);
-			draw_text(FONT_SMALL, ix + iw + PX(8), fy + PX(36) + (PX(25) - font_m[FONT_SMALL].line) / 2, "\xE2\x86\xB5 / Ctrl+Alt+\xE2\x86\xB5", 15, COL(C_DESCRIPTION_FG));
-		}
-	}
+	if (app.find_open && g == &app.groups[app.active_group])
+		find_widget_draw(x, y, w);
 }
 
 /* ---- popups (drawn last, over everything) ------------------------------------------ */

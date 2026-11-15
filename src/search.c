@@ -220,24 +220,242 @@ static void res_add(SearchResults *r, u32 file, u32 line, u32 col, u32 len, cons
 	r->text_col[i] = col - s;
 }
 
-void search_text(SearchResults *r, const char *root, const FileList *fl, const char *q,
-                 size_t nq, int flags, u32 limit)
+/* ---- matcher ------------------------------------------------------------------ */
+
+bool matcher_init(Matcher *m, const char *q, size_t nq, int flags)
+{
+	memset(m, 0, sizeof *m);
+	m->flags = flags;
+	m->q = vx_strndup(q, nq);
+	m->nq = (u32)nq;
+	if (!nq)
+		return false;
+	if (flags & SEARCH_REGEX) {
+		const char *pat = q;
+		size_t np = nq;
+		char *wrapped = NULL;
+		if (flags & SEARCH_WORD) {
+			wrapped = vx_alloc(nq + 16);
+			np = (size_t)snprintf(wrapped, nq + 16, "\\b(?:%.*s)\\b", (int)nq, q);
+			pat = wrapped;
+		}
+		m->re = re_compile(pat, np, (flags & SEARCH_CASE) ? 0 : RE_ICASE, m->err, sizeof m->err);
+		free(wrapped);
+		if (!m->re)
+			return false;
+	}
+	return true;
+}
+
+void matcher_free(Matcher *m)
+{
+	free(m->q);
+	re_free(m->re);
+	memset(m, 0, sizeof *m);
+}
+
+bool matcher_next(Matcher *m, const char *hay, u32 n, u32 from, u32 *a, u32 *b)
+{
+	if (!m->nq || from > n)
+		return false;
+	if (m->flags & SEARCH_REGEX) {
+		if (!m->re || !re_search(m->re, hay, n, from, m->caps))
+			return false;
+		*a = m->caps[0];
+		*b = m->caps[1];
+		return true;
+	}
+	if (m->nq > n - from)
+		return false;
+	u32 x = find_in(hay + from, n - from, m->q, m->nq, m->flags, 0, false);
+	if (x == UINT32_MAX)
+		return false;
+	/* find_in scans from 0 without wrapping when from = 0 */
+	*a = from + x;
+	*b = *a + m->nq;
+	m->caps[0] = *a;
+	m->caps[1] = *b;
+	return true;
+}
+
+void matcher_expand(Matcher *m, const char *repl, size_t nr, const char *hay, char **out, u32 *len, u32 *cap)
+{
+	if (m->re) {
+		re_expand(m->re, repl, nr, hay, m->caps, out, len, cap);
+		return;
+	}
+	VX_GROW(*out, *cap, *len + (u32)nr + 1);
+	memcpy(*out + *len, repl, nr);
+	*len += (u32)nr;
+	(*out)[*len] = 0;
+}
+
+/* ---- globs ---------------------------------------------------------------------- */
+
+/* Glob with *, **, ?, [...], {a,b}; '/' separates path segments. */
+bool glob_match(const char *p, size_t np, const char *s, size_t ns)
+{
+	size_t pi = 0, si = 0;
+	while (pi < np) {
+		char c = p[pi];
+		if (c == '*') {
+			bool dbl = pi + 1 < np && p[pi + 1] == '*';
+			if (dbl) {
+				/* "**" (optionally followed by '/') crosses segments */
+				size_t rest = pi + 2;
+				if (rest < np && p[rest] == '/')
+					rest++;
+				for (size_t k = si; k <= ns; k++)
+					if ((k == si || s[k - 1] == '/' || rest >= np) && glob_match(p + rest, np - rest, s + k, ns - k))
+						return true;
+				return false;
+			}
+			for (size_t k = si; k <= ns; k++) {
+				if (glob_match(p + pi + 1, np - pi - 1, s + k, ns - k))
+					return true;
+				if (k < ns && s[k] == '/')
+					break;
+			}
+			return false;
+		}
+		if (c == '{') {
+			/* alternatives: try each with the rest of the pattern */
+			size_t depth = 0, end = pi;
+			for (; end < np; end++) {
+				if (p[end] == '{')
+					depth++;
+				else if (p[end] == '}' && --depth == 0)
+					break;
+			}
+			if (end >= np)
+				return false;
+			size_t st = pi + 1;
+			for (size_t k = pi + 1; k <= end; k++) {
+				if (k == end || (p[k] == ',' )) {
+					size_t alen = k - st, rlen = np - end - 1;
+					char *tmp = vx_alloc(alen + rlen + 1);
+					memcpy(tmp, p + st, alen);
+					memcpy(tmp + alen, p + end + 1, rlen);
+					bool ok = glob_match(tmp, alen + rlen, s + si, ns - si);
+					free(tmp);
+					if (ok)
+						return true;
+					st = k + 1;
+				}
+			}
+			return false;
+		}
+		if (si >= ns)
+			return false;
+		if (c == '?') {
+			if (s[si] == '/')
+				return false;
+			pi++;
+			si++;
+			continue;
+		}
+		if (c == '[') {
+			size_t k = pi + 1;
+			bool neg = k < np && (p[k] == '!' || p[k] == '^');
+			if (neg)
+				k++;
+			bool in = false;
+			for (; k < np && p[k] != ']'; k++) {
+				if (k + 2 < np && p[k + 1] == '-' && p[k + 2] != ']') {
+					if (s[si] >= p[k] && s[si] <= p[k + 2])
+						in = true;
+					k += 2;
+				} else if (p[k] == s[si]) {
+					in = true;
+				}
+			}
+			if (k >= np || in == neg || s[si] == '/')
+				return false;
+			pi = k + 1;
+			si++;
+			continue;
+		}
+		if (c != s[si])
+			return false;
+		pi++;
+		si++;
+	}
+	return si == ns;
+}
+
+bool glob_list_match(const char *list, const char *rel)
+{
+	if (!list)
+		return false;
+	size_t ns = strlen(rel);
+	const char *p = list;
+	while (*p) {
+		/* split on commas outside braces */
+		const char *e = p;
+		int depth = 0;
+		while (*e && !(*e == ',' && depth == 0)) {
+			if (*e == '{')
+				depth++;
+			else if (*e == '}')
+				depth--;
+			e++;
+		}
+		const char *a = p, *b = e;
+		while (a < b && (*a == ' ' || *a == '\t'))
+			a++;
+		while (b > a && (b[-1] == ' ' || b[-1] == '\t'))
+			b--;
+		if (b > a) {
+			char pat[1024];
+			size_t n;
+			if (b - a >= 2 && a[0] == '.' && a[1] == '/')
+				n = (size_t)snprintf(pat, sizeof pat, "%.*s", (int)(b - a - 2), a + 2);
+			else if (a[0] == '/')
+				n = (size_t)snprintf(pat, sizeof pat, "%.*s", (int)(b - a - 1), a + 1);
+			else if (b - a >= 3 && !strncmp(a, "**/", 3))
+				n = (size_t)snprintf(pat, sizeof pat, "%.*s", (int)(b - a), a);
+			else
+				n = (size_t)snprintf(pat, sizeof pat, "**/%.*s", (int)(b - a), a);
+			n = VX_MIN(n, sizeof pat - 4);
+			while (n && pat[n - 1] == '/')
+				n--;
+			if (glob_match(pat, n, rel, ns))
+				return true;
+			/* a folder pattern covers its contents */
+			memcpy(pat + n, "/**", 4);
+			if (glob_match(pat, n + 3, rel, ns))
+				return true;
+		}
+		p = *e ? e + 1 : e;
+	}
+	return false;
+}
+
+/* ---- workspace search ------------------------------------------------------------- */
+
+void search_text(SearchResults *r, const char *root, const FileList *fl, Matcher *m, const char *include,
+                 const char *exclude, u32 limit)
 {
 	r->n = 0;
 	r->files_hit = 0;
 	r->truncated = false;
 	pool_clear(&r->pool);
-	if (!nq)
+	if (!m->nq || ((m->flags & SEARCH_REGEX) && !m->re))
 		return;
+	bool inc = include && *include, exc = exclude && *exclude;
 	for (u32 f = 0; f < fl->n && !r->truncated; f++) {
+		const char *rel = fl->pool.b + fl->path[f];
+		if (inc && !glob_list_match(include, rel))
+			continue;
+		if (exc && glob_list_match(exclude, rel))
+			continue;
 		char path[8192];
-		snprintf(path, sizeof path, "%s/%s", root, fl->pool.b + fl->path[f]);
+		snprintf(path, sizeof path, "%s/%s", root, rel);
 		int fd = open(path, O_RDONLY);
 		if (fd < 0)
 			continue;
 		struct stat st;
-		if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size == 0 ||
-		    st.st_size > (64 << 20)) {
+		if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size == 0 || st.st_size > (64 << 20)) {
 			close(fd);
 			continue;
 		}
@@ -246,36 +464,38 @@ void search_text(SearchResults *r, const char *root, const FileList *fl, const c
 		close(fd);
 		if (b == MAP_FAILED)
 			continue;
-		/* Skip binaries: NUL in the first 8 KiB. */
+		/* skip binaries: NUL in the first 8 KiB */
 		if (memchr(b, 0, VX_MIN(n, 8192u))) {
 			munmap((void *)b, n);
 			continue;
 		}
 		u32 hits = r->n;
-		u32 line = 0, ls = 0;
+		u32 line = 0, ls = 0, scanned = 0;
 		u32 pos = 0;
-		while (pos + nq <= n) {
-			u32 m = find_in(b + pos, n - pos, q, (u32)nq, flags, 0, false);
-			if (m == UINT32_MAX)
-				break;
-			/* find_in wraps; reject wrapped results */
-			m += pos;
-			if (m < pos)
-				break;
-			for (u32 k = ls; k < m; k++)
+		u32 ma, mb;
+		while (pos <= n && matcher_next(m, b, n, pos, &ma, &mb)) {
+			if (mb == ma) {
+				/* ripgrep-style: empty matches are not results */
+				pos = ma + 1;
+				while (pos < n && utf8_cont((u8)b[pos]))
+					pos++;
+				continue;
+			}
+			for (u32 k = scanned; k < ma; k++)
 				if (b[k] == '\n') {
 					line++;
 					ls = k + 1;
 				}
+			scanned = ma;
 			u32 le = ls;
 			while (le < n && b[le] != '\n')
 				le++;
-			res_add(r, f, line, m - ls, (u32)nq, b + ls, le - ls);
+			res_add(r, f, line, ma - ls, mb - ma, b + ls, le - ls);
 			if (r->n >= limit) {
 				r->truncated = true;
 				break;
 			}
-			pos = m + (u32)nq;
+			pos = mb;
 		}
 		if (r->n > hits)
 			r->files_hit++;

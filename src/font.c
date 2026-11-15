@@ -32,6 +32,8 @@ static const char *font_files[FONT_COUNT][MAX_FACES] = {
     {"NotoSans-Bold.ttf", "DejaVuSans-Bold.ttf", "NotoSansSymbols2-Regular.ttf", NULL},
     {"DejaVuSansMono.ttf", "DejaVuSans.ttf", "NotoSansSymbols2-Regular.ttf", NULL},
     {"DejaVuSansMono-Bold.ttf", "DejaVuSans-Bold.ttf", "NotoSansSymbols2-Regular.ttf", NULL},
+    {"DejaVuSansMono-Oblique.ttf", "DejaVuSans-Oblique.ttf", "DejaVuSansMono.ttf", NULL},
+    {"DejaVuSansMono-BoldOblique.ttf", "DejaVuSans-BoldOblique.ttf", "DejaVuSansMono-Bold.ttf", NULL},
 };
 
 static const char *font_dirs[] = {

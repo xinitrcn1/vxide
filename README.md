@@ -37,8 +37,10 @@ DejaVu Sans Mono for code, with DejaVu Sans as the fallback.
   highlight, minimap, a scrollbar with an overview ruler (git changes,
   errors, cursor), and preview tabs.
 - **Highlighting**: hand-written lexers for C23, x86 assembly (AT&T/GAS and
-  Intel/NASM, detected from the file head) and Lisp (CL, Scheme, Elisp,
-  Clojure). They were checked against VSCodium's own `c.tmLanguage.json`
+  Intel/NASM, detected from the file head), Lisp (CL, Scheme, Elisp,
+  Clojure), shell (sh/bash/zsh, heredocs), Markdown (with fenced code
+  highlighted in its own language), troff/man/mdoc and Perl (POD, `s{}{}`,
+  regexes, heredocs). Languages are also detected from shebangs. They were checked against VSCodium's own `c.tmLanguage.json`
   scopes and the Dark+/Light+ rules. When clangd is running, its semantic
   tokens are overlaid the way the clangd extension does it (readonly
   variables as constants, macros, parameters, ...).
@@ -46,6 +48,31 @@ DejaVu Sans Mono for code, with DejaVu Sans as the fallback.
   colours, F8), completion, hover, go to definition (F12 / Ctrl+click,
   with back/forward), semantic tokens. Positions use UTF-8 (UTF-16 is the
   fallback). Set `VXIDE_CLANGD=clangd23` to use another server.
+- **Search**: the editor find widget and the Search view share one
+  matcher: literal, case, whole word, and regex (Alt+C / Alt+W / Alt+R). The
+  Search view has replace with a struck-out/inserted preview, Replace All
+  (Ctrl+Alt+Enter), per-file and per-match replace and dismiss,
+  files to include/exclude globs (Ctrl+Shift+J), and F4/Shift+F4 to step
+  through results. Files that are open are edited in their buffers (one
+  undo step); other files are rewritten atomically.
+- **Regex engine** (`src/regex.c`): built in, modelled after RE2 and
+  linear time. The pattern compiles to byte-level instructions, with
+  UTF-8 classes as byte-range sequences. A lazy DFA finds the earliest
+  match end, and a Pike VM then finds the leftmost-first match and its
+  groups on that line. RE2 syntax: classes, `[[:alpha:]]`, `\d \w \s`
+  (ASCII), `\b`, lazy quantifiers, `{n,m}` up to 1000, named groups,
+  `(?i)`, `\Q..\E`, `\x{..}`. Lookaround and backreferences are
+  rejected with RE2's messages. `^`/`$` match per line, and matches cross
+  line ends only when the pattern contains `\n` (as in VSCodium).
+  Replacements take `$1`, `${1}`, `$name`, `$&`, `$$`, `\n`, `\t` and
+  the case operators `\u \l \U \L \E`. On this host the DFA scans
+  about 540 MB/s; `(a+)+b` over 100k characters takes 0.3 ms.
+- **Git blame** on the cursor line, on by default (VSCodium's
+  `git.blame.editorDecoration`): `summary, author (3 days ago)`, or
+  "Not Committed Yet" for edited lines. A worker thread runs
+  `git blame --incremental --contents <buffer snapshot>`; libgit2 is the
+  fallback without a git binary (much slower on long histories). Toggle it
+  with "Git: Toggle Git Blame Editor Decoration".
 - **Git**: branch and ahead/behind in the status bar, explorer
   decorations (M/U/A/D colours, folder dots, ignored files greyed out),
   quick-diff gutter against the index, and a Source Control view with
@@ -72,7 +99,9 @@ DejaVu Sans Mono for code, with DejaVu Sans as the fallback.
 | Ctrl+B, Ctrl+J | Toggle side bar, toggle panel |
 | Ctrl+Shift+E / F / G | Explorer / Search / Source Control |
 | Ctrl+Shift+M, Ctrl+Shift+U | Problems, Output |
-| Ctrl+F, Ctrl+H, F3, Shift+F3 | Find, replace, next, previous (Alt+C case, Alt+W word) |
+| Ctrl+F, Ctrl+H, F3, Shift+F3 | Find, replace, next, previous (Alt+C case, Alt+W word, Alt+R regex) |
+| Enter / Ctrl+Alt+Enter in replace | Replace one / replace all |
+| Ctrl+Shift+H, Ctrl+Shift+J, F4/Shift+F4 | Replace in files, include/exclude globs, next/previous result |
 | Ctrl+D, Ctrl+Shift+L | Add next occurrence, select all occurrences |
 | Shift+Alt+Up/Down, Alt+click | Add cursor above/below, add cursor |
 | Alt+Up/Down, Ctrl+Shift+Alt+Up/Down | Move line, copy line |
@@ -99,6 +128,8 @@ one quad buffer.
 | `src/draw.c` | Quad list with CPU clipping (atlas origins move with the cut) |
 | `src/text.c` | mmap piece table, line-start index, undo log (SoA) |
 | `src/syntax.c` | Line lexers with a per-line state, cached per document |
+| `src/regex.c` | RE2-style regex: byte program, lazy DFA, Pike VM, replacement expansion |
+| `src/blame.c` | Inline blame worker thread (git CLI, libgit2 fallback) |
 | `src/lsp.c`, `src/json.c` | LSP client over pipes (non-blocking), jsmn-style token table |
 | `src/git.c` | libgit2: status table, index ops, commit, quick diff |
 | `src/fstree.c`, `src/search.c` | Explorer tree, file walk, fuzzy match, text search |
@@ -117,7 +148,8 @@ supplies `VK_EXT_headless_surface`).
 
 Environment variables: `VXIDE_NO_LSP`, `VXIDE_CLANGD`, `VXIDE_THEME=light`,
 `VXIDE_GPU=<name substring>`, `VXIDE_VALIDATE` (Khronos validation layer),
-`VXIDE_LOG` (copy the Output log to stderr).
+`VXIDE_LOG` (copy the Output log to stderr), `VXIDE_NO_BLAME`,
+`VXIDE_BLAME_LIBGIT2` (force the libgit2 blame).
 
 ## Not done yet
 

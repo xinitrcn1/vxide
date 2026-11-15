@@ -1,4 +1,5 @@
-/* Syntax highlighting lexers: C23, x86 assembly (AT&T and Intel), Lisp.
+/* Syntax highlighting lexers: C23, x86 assembly (AT&T and Intel), Lisp,
+ * shell, Perl, troff and Markdown (which embeds the others in fences).
  *
  * Each lexer is a pure function of (state at line start, line bytes) that
  * writes token spans and returns the state at the end of the line. Keyword
@@ -393,8 +394,11 @@ static const char lisp_const[] = "t nil true false #t #f #true #false";
 
 static atomic_int syn_ready;
 
+static void syn_build2(void);
+
 static void syn_build(void)
 {
+	syn_build2();
 	kw_add(&kw_c, "goto", 4, KC_GOTO); /* before the list, which skips duplicates */
 	kw_list(&kw_c, c_control, TK_CONTROL);
 	kw_list(&kw_c, c_storage, TK_STORAGE);
@@ -1547,6 +1551,1824 @@ static u32 lex_lisp(u32 state, const char *s, u32 n, SynSpans *o)
 }
 
 /* ================================================================== */
+/* Shared helpers for the script/markup lexers                         */
+
+static inline bool is_word(u8 c) { return is_alpha(c) || is_digit(c) || c == '_'; }
+static inline bool in_set(const char *set, u8 c) { return c && strchr(set, c) != NULL; }
+
+/* 15-bit hash of a heredoc delimiter (fits the 20-bit state budget). */
+static u32 hash15(const char *s, u32 n)
+{
+	u32 h = kw_hash(s, n);
+	return (h ^ (h >> 15) ^ (h >> 30)) & 0x7FFFu;
+}
+
+static KwSet kw_sh, kw_pl, kw_mdoc;
+
+/* ================================================================== */
+/* Shell (sh, bash, zsh, ksh)                                          */
+/*
+ * Follows VSCodium's shell-unix-bash grammar under Dark+: command names
+ * (entity.name.function.call / support.function.builtin) are functions,
+ * unquoted arguments are string.unquoted.argument (string colour), options
+ * are constant.other.option, $1/$@/$name are variables and $? $$ $# ...
+ * are variable.language.
+ *
+ * State: bits 0-2 mode, bit 3 `<<-` (strip leading tabs), bit 4 quoted
+ * delimiter, bits 5-19 hash15 of the heredoc delimiter. */
+enum { SH_NORMAL, SH_SQ, SH_DQ, SH_DSQ, SH_HEREDOC };
+#define SH_STRIP 0x08u
+#define SH_RAWHD 0x10u
+
+enum { SHK_CTRL = 1, SHK_CTRL_CMD, SHK_END, SHK_LOOP, SHK_IN, SHK_FUNCTION, SHK_DECL };
+
+static const char sh_ctrl_cmd[] = "if then else elif do while until time ! { coproc";
+static const char sh_end[] = "fi done esac }";
+static const char sh_loop[] = "for select case";
+static const char sh_ctrl[] = "return continue break";
+static const char sh_decl[] = "export declare typeset local readonly";
+
+typedef struct {
+	const char *s;
+	u32 n;
+	SynSpans *o;
+	u32 hd;   /* heredoc state to enter after this line, 0 = none */
+	u32 open; /* SH_SQ/SH_DQ/SH_DSQ when the line ends in a string */
+} Sh;
+
+static u32 sh_seg(Sh *c, u32 i, u8 stop, int depth);
+
+static inline bool sh_meta(u8 ch)
+{
+	return is_space(ch) || ch == ';' || ch == '&' || ch == '|' || ch == '<' || ch == '>' || ch == '(' ||
+	       ch == ')' || ch == '`' || ch == '\'' || ch == '"' || ch == '$' || ch == '\\';
+}
+
+/* $... at i; returns the end. Only plain variable forms. */
+static u32 sh_var(Sh *c, u32 i)
+{
+	const char *s = c->s;
+	u32 n = c->n, j = i + 1;
+	if (j >= n) {
+		emit(c->o, i, 1, TK_STRING);
+		return n;
+	}
+	u8 ch = (u8)s[j];
+	if (ch == '{') {
+		int d = 0;
+		u32 k = j;
+		for (; k < n; k++) {
+			if (s[k] == '{')
+				d++;
+			else if (s[k] == '}' && --d == 0) {
+				k++;
+				break;
+			}
+		}
+		emit(c->o, i, k - i, TK_VARIABLE);
+		return k;
+	}
+	if (ch == '@' || is_digit(ch)) {
+		emit(c->o, i, 2, TK_VARIABLE);
+		return i + 2;
+	}
+	if (in_set("-*#?$!_", ch)) {
+		emit(c->o, i, 2, TK_LANGCONST);
+		return i + 2;
+	}
+	if (is_alpha(ch) || ch == '_') {
+		while (j < n && is_word((u8)s[j]))
+			j++;
+		emit(c->o, i, j - i, TK_VARIABLE);
+		return j;
+	}
+	emit(c->o, i, 1, TK_STRING);
+	return i + 1;
+}
+
+/* Arithmetic $(( )) / (( )) body starting at i; returns after "))". */
+static u32 sh_arith(Sh *c, u32 i)
+{
+	const char *s = c->s;
+	u32 n = c->n;
+	int d = 0;
+	while (i < n) {
+		u8 ch = (u8)s[i];
+		if (ch == ')' && d == 0) {
+			u32 e = (i + 1 < n && s[i + 1] == ')') ? i + 2 : i + 1;
+			return e;
+		}
+		if (ch == '(') {
+			d++;
+			i++;
+		} else if (ch == ')') {
+			d--;
+			i++;
+		} else if (ch == '$') {
+			i = sh_var(c, i);
+		} else if (is_digit(ch)) {
+			u32 j = i;
+			while (j < n && (is_word((u8)s[j]) || s[j] == '#'))
+				j++;
+			emit(c->o, i, j - i, TK_NUMBER);
+			i = j;
+		} else if (is_alpha(ch) || ch == '_') {
+			u32 j = i;
+			while (j < n && is_word((u8)s[j]))
+				j++;
+			emit(c->o, i, j - i, TK_VARIABLE);
+			i = j;
+		} else if (in_set("+-*/%<>=!&|^~?:,", ch)) {
+			emit(c->o, i, 1, TK_OPERATOR);
+			i++;
+		} else {
+			i++;
+		}
+	}
+	return n;
+}
+
+/* "..." body from i (after the quote). *closed tells if it ended. */
+static u32 sh_dq(Sh *c, u32 i, int depth, bool *closed)
+{
+	const char *s = c->s;
+	u32 n = c->n;
+	*closed = false;
+	while (i < n) {
+		u8 ch = (u8)s[i];
+		if (ch == '"') {
+			emit(c->o, i, 1, TK_STRING);
+			*closed = true;
+			return i + 1;
+		}
+		if (ch == '\\') {
+			if (i + 1 >= n) {
+				emit(c->o, i, 1, TK_ESCAPE);
+				return n;
+			}
+			u8 e = (u8)s[i + 1];
+			emit(c->o, i, 2, (e == '$' || e == '`' || e == '"' || e == '\\') ? TK_ESCAPE : TK_STRING);
+			i += 2;
+			continue;
+		}
+		if (ch == '$' && i + 1 < n && s[i + 1] == '(' && depth < 8) {
+			if (i + 2 < n && s[i + 2] == '(') {
+				emit(c->o, i, 3, TK_STRING);
+				i = sh_arith(c, i + 3);
+				continue;
+			}
+			emit(c->o, i, 2, TK_STRING);
+			i = sh_seg(c, i + 2, ')', depth + 1);
+			if (i < n) {
+				emit(c->o, i, 1, TK_STRING);
+				i++;
+			}
+			continue;
+		}
+		if (ch == '$' && i + 1 < n && !is_space((u8)s[i + 1]) && s[i + 1] != '"') {
+			i = sh_var(c, i);
+			continue;
+		}
+		if (ch == '`' && depth < 8) {
+			emit(c->o, i, 1, TK_STRING);
+			i = sh_seg(c, i + 1, '`', depth + 1);
+			if (i < n) {
+				emit(c->o, i, 1, TK_STRING);
+				i++;
+			}
+			continue;
+		}
+		emit(c->o, i, 1, TK_STRING);
+		i++;
+	}
+	return n;
+}
+
+static u32 sh_sq(Sh *c, u32 i, bool dollar, bool *closed)
+{
+	const char *s = c->s;
+	u32 n = c->n;
+	*closed = false;
+	while (i < n) {
+		if (dollar && s[i] == '\\' && i + 1 < n) {
+			emit(c->o, i, 2, TK_ESCAPE);
+			i += 2;
+			continue;
+		}
+		if (s[i] == '\'') {
+			emit(c->o, i, 1, TK_STRING);
+			*closed = true;
+			return i + 1;
+		}
+		emit(c->o, i, 1, TK_STRING);
+		i++;
+	}
+	return n;
+}
+
+static bool sh_is_number(const char *w, u32 n)
+{
+	u32 i = 0;
+	if (i < n && w[i] == '-')
+		i++;
+	if (i >= n)
+		return false;
+	if (n - i > 2 && w[i] == '0' && (w[i + 1] | 32) == 'x') {
+		for (u32 k = i + 2; k < n; k++)
+			if (!is_xdigit((u8)w[k]))
+				return false;
+		return true;
+	}
+	bool dig = false;
+	for (; i < n; i++) {
+		if (is_digit((u8)w[i]))
+			dig = true;
+		else if (w[i] != '.')
+			return false;
+	}
+	return dig;
+}
+
+/* Heredoc operator at i ("<<" not "<<<"); records the pending state. */
+static u32 sh_heredoc_op(Sh *c, u32 i)
+{
+	const char *s = c->s;
+	u32 n = c->n, k = i + 2;
+	u32 flags = 0;
+	if (k < n && s[k] == '-') {
+		flags |= SH_STRIP;
+		k++;
+	}
+	emit(c->o, i, k - i, TK_OPERATOR);
+	k = skip_ws(s, n, k);
+	u32 a, b;
+	if (k < n && (s[k] == '\'' || s[k] == '"')) {
+		u8 q = (u8)s[k];
+		a = k + 1;
+		b = a;
+		while (b < n && (u8)s[b] != q)
+			b++;
+		flags |= SH_RAWHD;
+		k = b < n ? b + 1 : n;
+	} else {
+		if (k < n && s[k] == '\\') {
+			flags |= SH_RAWHD;
+			k++;
+		}
+		a = k;
+		while (k < n && !sh_meta((u8)s[k]))
+			k++;
+		b = k;
+	}
+	if (b > a && !c->hd)
+		c->hd = SH_HEREDOC | flags | (hash15(s + a, b - a) << 5);
+	return k;
+}
+
+static u32 sh_seg(Sh *c, u32 i, u8 stop, int depth)
+{
+	const char *s = c->s;
+	u32 n = c->n;
+	bool cmd = true;    /* at a command position             */
+	bool fn_next = false; /* the word after `function`        */
+	bool plain_next = false; /* for/select/case subject word     */
+	bool want_in = false;
+	bool decl = false;  /* export/local ...: NAME= assignments */
+	bool test = false;  /* inside [ ] / [[ ]]                   */
+	bool in_assign = false; /* inside NAME=value: quotes keep cmd  */
+	int par = 0;
+	while (i < n) {
+		u8 ch = (u8)s[i];
+		if (stop && ch == stop && (stop != ')' || par == 0))
+			return i;
+		if (is_space(ch)) {
+			i++;
+			in_assign = false;
+			continue;
+		}
+		if (ch == '#' && (i == 0 || in_set(" \t;&|(", (u8)s[i - 1]))) {
+			emit(c->o, i, n - i, TK_COMMENT);
+			return n;
+		}
+		if (ch == '\\') {
+			if (i + 1 >= n) {
+				emit(c->o, i, 1, TK_ESCAPE);
+				return n;
+			}
+			emit(c->o, i, 2, TK_ESCAPE);
+			i += 2;
+			cmd = false;
+			continue;
+		}
+		if (ch == ';' || ch == '&' || ch == '|') {
+			u32 k = i + 1;
+			if (k < n && (s[k] == ch || (ch == '|' && s[k] == '&') || (ch == '&' && s[k] == '>') ||
+			              (ch == ';' && s[k] == '&')))
+				k++;
+			if (ch == '&' && k == i + 2 && s[i + 1] == '>') {
+				emit(c->o, i, 2, TK_OPERATOR);
+				i = k;
+				continue;
+			}
+			emit(c->o, i, k - i, TK_OPERATOR);
+			i = k;
+			cmd = true;
+			decl = test = false;
+			continue;
+		}
+		if (ch == '<' || ch == '>') {
+			if (ch == '<' && i + 1 < n && s[i + 1] == '<') {
+				if (i + 2 < n && s[i + 2] == '<') {
+					emit(c->o, i, 3, TK_OPERATOR);
+					i += 3;
+				} else {
+					i = sh_heredoc_op(c, i);
+				}
+				continue;
+			}
+			if (test) { /* < > compare inside [[ ]] */
+				emit(c->o, i, 1, TK_OPERATOR);
+				i++;
+				continue;
+			}
+			u32 k = i + 1;
+			while (k < n && (s[k] == '>' || s[k] == '&' || s[k] == '|') && k < i + 3)
+				k++;
+			while (k < n && is_digit((u8)s[k]) && s[k - 1] == '&')
+				k++;
+			if (k < n && s[k] == '-' && s[k - 1] == '&')
+				k++;
+			emit(c->o, i, k - i, TK_OPERATOR);
+			i = k;
+			continue;
+		}
+		if (ch == '(') {
+			if (i + 1 < n && s[i + 1] == '(' && cmd) {
+				i = sh_arith(c, i + 2);
+				cmd = false;
+				continue;
+			}
+			par++;
+			i++;
+			cmd = true;
+			continue;
+		}
+		if (ch == ')') {
+			if (par > 0)
+				par--;
+			i++;
+			cmd = true; /* case pattern) command */
+			continue;
+		}
+		if (ch == '`') {
+			if (depth >= 8) {
+				i++;
+				continue;
+			}
+			i = sh_seg(c, i + 1, '`', depth + 1);
+			if (i < n)
+				i++;
+			if (!in_assign)
+				cmd = false;
+			continue;
+		}
+		if (ch == '\'') {
+			bool closed;
+			emit(c->o, i, 1, TK_STRING);
+			i = sh_sq(c, i + 1, false, &closed);
+			if (!closed)
+				c->open = SH_SQ;
+			if (!in_assign)
+				cmd = false;
+			continue;
+		}
+		if (ch == '"') {
+			bool closed;
+			emit(c->o, i, 1, TK_STRING);
+			i = sh_dq(c, i + 1, depth, &closed);
+			if (!closed)
+				c->open = SH_DQ;
+			if (!in_assign)
+				cmd = false;
+			continue;
+		}
+		if (ch == '$') {
+			u8 nx = i + 1 < n ? (u8)s[i + 1] : 0;
+			if (nx == '\'') {
+				bool closed;
+				emit(c->o, i, 2, TK_STRING);
+				i = sh_sq(c, i + 2, true, &closed);
+				if (!closed)
+					c->open = SH_DSQ;
+			} else if (nx == '"') {
+				bool closed;
+				emit(c->o, i, 2, TK_STRING);
+				i = sh_dq(c, i + 2, depth, &closed);
+				if (!closed)
+					c->open = SH_DQ;
+			} else if (nx == '(' && i + 2 < n && s[i + 2] == '(') {
+				i = sh_arith(c, i + 3);
+			} else if (nx == '(' && depth < 8) {
+				i = sh_seg(c, i + 2, ')', depth + 1);
+				if (i < n)
+					i++;
+			} else {
+				i = sh_var(c, i);
+			}
+			if (!in_assign)
+				cmd = false;
+			continue;
+		}
+		/* a word */
+		u32 j = i;
+		while (j < n && !sh_meta((u8)s[j]))
+			j++;
+		const char *w = s + i;
+		u32 wl = j - i;
+		if (wl == 0) {
+			i++;
+			continue;
+		}
+		/* N> redirection (2>&1) */
+		if (j < n && (s[j] == '>' || s[j] == '<') && sh_is_number(w, wl) && (i == 0 || is_space((u8)s[i - 1]))) {
+			emit(c->o, i, wl, TK_OPERATOR);
+			i = j;
+			continue;
+		}
+		bool word_start = i == 0 || sh_meta((u8)s[i - 1]) || s[i - 1] == '{';
+		int k = word_start ? kw_find(&kw_sh, w, wl) : -1;
+		/* NAME= / NAME+= / NAME[i]= assignment */
+		u32 eq = 0;
+		if ((cmd || decl) && word_start && (is_alpha((u8)w[0]) || w[0] == '_')) {
+			u32 q = 0;
+			while (q < wl && is_word((u8)w[q]))
+				q++;
+			if (q < wl && w[q] == '[') {
+				while (q < wl && w[q] != ']')
+					q++;
+				if (q < wl)
+					q++;
+			}
+			if (q < wl && w[q] == '+' && q + 1 < wl && w[q + 1] == '=')
+				eq = q;
+			else if (q < wl && w[q] == '=')
+				eq = q;
+		}
+		if (eq) {
+			u32 ol = w[eq] == '+' ? 2 : 1;
+			emit(c->o, i, eq, TK_VARIABLE);
+			emit(c->o, i + eq, ol, TK_OPERATOR);
+			u32 v = i + eq + ol;
+			if (j > v && sh_is_number(s + v, j - v))
+				emit(c->o, v, j - v, TK_NUMBER);
+			else if (j > v)
+				emit(c->o, v, j - v, TK_STRING);
+			i = j;
+			in_assign = true;
+			continue; /* stays at a command position */
+		}
+		if (cmd && k > 0 && !(want_in && k != SHK_IN)) {
+			switch (k) {
+			case SHK_CTRL_CMD:
+				emit(c->o, i, wl, w[0] == '{' || w[0] == '!' ? TK_TEXT : TK_CONTROL);
+				cmd = true;
+				break;
+			case SHK_END:
+				emit(c->o, i, wl, w[0] == '}' ? TK_TEXT : TK_CONTROL);
+				cmd = false;
+				break;
+			case SHK_LOOP:
+				emit(c->o, i, wl, TK_CONTROL);
+				plain_next = true;
+				want_in = true;
+				cmd = false;
+				break;
+			case SHK_FUNCTION:
+				emit(c->o, i, wl, TK_STORAGE);
+				fn_next = true;
+				cmd = false;
+				break;
+			case SHK_DECL:
+				emit(c->o, i, wl, TK_STORAGE);
+				decl = true;
+				cmd = false;
+				break;
+			default:
+				emit(c->o, i, wl, TK_CONTROL);
+				cmd = false;
+				break;
+			}
+			i = j;
+			continue;
+		}
+		if (want_in && k == SHK_IN) {
+			emit(c->o, i, wl, TK_CONTROL);
+			want_in = false;
+			plain_next = false;
+			i = j;
+			continue;
+		}
+		if (cmd) {
+			/* name() function definition */
+			u32 p = skip_ws(s, n, j);
+			u32 q = p + 1 < n ? skip_ws(s, n, p + 1) : n;
+			if (p < n && s[p] == '(' && q < n && s[q] == ')') {
+				emit(c->o, i, wl, TK_FUNCTION);
+				i = q + 1;
+				cmd = true;
+				continue;
+			}
+			if ((wl == 1 && w[0] == '[') || (wl == 2 && w[0] == '[' && w[1] == '[')) {
+				test = true;
+				cmd = false;
+				i = j;
+				continue;
+			}
+			emit(c->o, i, wl, TK_FUNCTION);
+			cmd = false;
+			i = j;
+			continue;
+		}
+		if (fn_next) {
+			emit(c->o, i, wl, TK_FUNCTION);
+			fn_next = false;
+		} else if (plain_next) {
+			plain_next = false;
+			if (!want_in)
+				emit(c->o, i, wl, TK_STRING);
+		} else if (test && ((wl == 1 && w[0] == ']') || (wl == 2 && w[0] == ']' && w[1] == ']'))) {
+			test = false;
+		} else if (w[0] == '-' && wl > 1 && !is_digit((u8)w[1])) {
+			emit(c->o, i, wl, test ? TK_OPERATOR : TK_LANGCONST);
+		} else if (word_start && sh_is_number(w, wl) &&
+		           (j >= n || is_space((u8)s[j]) || s[j] == ';' || s[j] == ')' || s[j] == '}')) {
+			emit(c->o, i, wl, TK_NUMBER);
+		} else if (word_start && (word_is(w, wl, "true") || word_is(w, wl, "false")) &&
+		           (j >= n || sh_meta((u8)s[j]))) {
+			emit(c->o, i, wl, TK_LANGCONST);
+		} else if (test && (word_is(w, wl, "==") || word_is(w, wl, "!=") || word_is(w, wl, "=~") ||
+		                    word_is(w, wl, "=") || word_is(w, wl, "!"))) {
+			emit(c->o, i, wl, TK_OPERATOR);
+		} else {
+			/* '*' is variable.language.special.wildcard */
+			for (u32 q = 0; q < wl; q++)
+				emit(c->o, i + q, 1, w[q] == '*' ? TK_LANGCONST : TK_STRING);
+		}
+		i = j;
+	}
+	return n;
+}
+
+static u32 lex_sh(u32 state, const char *s, u32 n, SynSpans *o)
+{
+	Sh c = {s, n, o, 0, 0};
+	u32 i = 0;
+	u32 mode = state & 7u;
+	if (mode == SH_HEREDOC) {
+		u32 k = 0;
+		if (state & SH_STRIP)
+			while (k < n && s[k] == '\t')
+				k++;
+		u32 e = n;
+		while (e > k && (s[e - 1] == ' ' || s[e - 1] == '\r'))
+			e--;
+		if (e > k && hash15(s + k, e - k) == ((state >> 5) & 0x7FFFu))
+			return SH_NORMAL; /* the delimiter line */
+		emit(o, 0, n, TK_STRING);
+		return state;
+	}
+	if (mode == SH_SQ || mode == SH_DSQ) {
+		bool closed;
+		i = sh_sq(&c, 0, mode == SH_DSQ, &closed);
+		if (!closed)
+			return mode;
+	} else if (mode == SH_DQ) {
+		bool closed;
+		i = sh_dq(&c, 0, 0, &closed);
+		if (!closed)
+			return mode;
+	}
+	sh_seg(&c, i, 0, 0);
+	if (c.hd)
+		return c.hd;
+	return c.open;
+}
+
+/* ================================================================== */
+/* Perl                                                                */
+/*
+ * Classes follow VSCodium's perl.tmLanguage under Dark+: keyword.control
+ * (if, return, use, ...), storage.modifier (my our local), support.function
+ * (print, push, eq, ...), string.regexp for m// s/// tr/// qr// and /.../,
+ * variable.other.* for sigiled names, POD as comment. Numbers have no scope
+ * in that grammar; they are coloured as numbers here anyway.
+ *
+ * State (20 bits):
+ *   bits 0-2  mode: NORMAL, POD, STR (an open quote-like), HEREDOC, END
+ *             (after __END__/__DATA__), ENDPOD (POD after __END__)
+ *   STR:      bits 3-4 kind (string, regex, first part of s/tr, gap before
+ *             the second part of a bracketed s{}{}), bit 5 interpolating,
+ *             bits 6-12 closing delimiter, bits 13-17 bracket depth
+ *   HEREDOC:  bit 3 interpolating, bit 4 `<<~`, bits 5-19 hash15 of the
+ *             terminator */
+enum { PL_NORMAL, PL_POD, PL_STR, PL_HEREDOC, PL_END, PL_ENDPOD };
+enum { PK_STR, PK_REGEX, PK_SUBST1, PK_GAP };
+enum { PLK_CTRL = 1, PLK_STORAGE, PLK_FUNC, PLK_OP, PLK_CONST, PLK_SUB, PLK_PACKAGE, PLK_BLOCK };
+
+static const char pl_ctrl[] =
+	"continue default die do else elsif exit for foreach given goto if last next redo return select "
+	"unless until wait when while switch case require use eval no";
+static const char pl_storage[] = "my our local state";
+static const char pl_func[] =
+	"ARGV DATA ENV SIG STDERR STDIN STDOUT atan2 bind binmode bless caller chdir chmod chomp chop chown "
+	"chr chroot close closedir cmp connect cos crypt dbmclose dbmopen defined delete dump each endgrent "
+	"endhostent endnetent endprotoent endpwent endservent eof eq exec exists exp fcntl fileno flock "
+	"fork formline ge getc getgrent getgrgid getgrnam gethostbyaddr gethostbyname gethostent getlogin "
+	"getnetbyaddr getnetbyname getnetent getpeername getpgrp getppid getpriority getprotobyname "
+	"getprotobynumber getprotoent getpwent getpwnam getpwuid getservbyname getservbyport getservent "
+	"getsockname getsockopt glob gmtime grep gt hex import index int ioctl join keys kill lc lcfirst le "
+	"length link listen localtime log lstat lt map mkdir msgctl msgget msgrcv msgsnd ne oct open "
+	"opendir ord pack pipe pop pos print printf push quotemeta rand read readdir readlink recv ref "
+	"rename reset reverse rewinddir rindex rmdir say scalar seek seekdir semctl semget semop send "
+	"setgrent sethostent setnetent setpgrp setpriority setprotoent setpwent setservent setsockopt shift "
+	"shmctl shmget shmread shmwrite shutdown sin sleep socket socketpair sort splice split sprintf sqrt "
+	"srand stat study substr symlink syscall sysopen sysread system syswrite tell telldir tie tied time "
+	"times truncate uc ucfirst umask undef unlink unpack unshift untie utime values vec waitpid "
+	"wantarray warn write";
+static const char pl_op[] = "and or xor as not";
+static const char pl_const[] = "__FILE__ __LINE__ __PACKAGE__ __SUB__";
+static const char pl_block[] = "BEGIN END INIT CHECK UNITCHECK AUTOLOAD DESTROY";
+
+#define PL_STR_STATE(kind, interp, close, depth) \
+	(PL_STR | ((u32)(kind) << 3) | ((interp) ? 0x20u : 0u) | (((u32)(close) & 0x7Fu) << 6) | (((u32)(depth) & 31u) << 13))
+
+typedef struct {
+	const char *s;
+	u32 n;
+	SynSpans *o;
+	u32 hd; /* pending heredoc state */
+} Pl;
+
+static u8 pl_open_of(u8 close)
+{
+	switch (close) {
+	case ')': return '(';
+	case ']': return '[';
+	case '}': return '{';
+	case '>': return '<';
+	default: return 0;
+	}
+}
+
+static u8 pl_close_of(u8 open)
+{
+	switch (open) {
+	case '(': return ')';
+	case '[': return ']';
+	case '{': return '}';
+	case '<': return '>';
+	default: return open;
+	}
+}
+
+/* Variable starting at a sigil inside interpolated text; returns end or i. */
+static u32 pl_interp_var(Pl *c, u32 i, u32 end, bool regex)
+{
+	const char *s = c->s;
+	u8 sig = (u8)s[i];
+	u32 j = i + 1;
+	if (j >= end)
+		return i;
+	u8 ch = (u8)s[j];
+	if (sig == '$' && regex && (ch == ')' || ch == '|'))
+		return i; /* anchor */
+	if (ch == '{') {
+		u32 k = j + 1;
+		while (k < end && s[k] != '}')
+			k++;
+		if (k < end) {
+			emit(c->o, i, k + 1 - i, TK_VARIABLE);
+			return k + 1;
+		}
+		return i;
+	}
+	if (is_alpha(ch) || ch == '_' || (ch == ':' && j + 1 < end && s[j + 1] == ':')) {
+		while (j < end && (is_word((u8)s[j]) || (s[j] == ':' && j + 1 < end && s[j + 1] == ':' && ++j)))
+			j++;
+		emit(c->o, i, j - i, TK_VARIABLE);
+		return j;
+	}
+	if (sig == '$' && (is_digit(ch) || ch == '&' || (!regex && in_set("_!@/\\,;.0", ch)))) {
+		emit(c->o, i, 2, TK_VARIABLE);
+		return i + 2;
+	}
+	return i;
+}
+
+/* Body of a quoted construct from i; returns position after it and the
+ * state to carry when the line ends inside it (0 when closed). */
+static u32 pl_quoted(Pl *c, u32 i, u32 kind, bool interp, u8 close, u32 depth, u32 *carry)
+{
+	const char *s = c->s;
+	u32 n = c->n;
+	u8 open = pl_open_of(close);
+	u32 cls = kind == PK_STR ? TK_STRING : TK_REGEX;
+	bool regex = kind != PK_STR;
+	*carry = 0;
+	for (;;) {
+		while (i < n) {
+			u8 ch = (u8)s[i];
+			if (ch == '\\' && i + 1 < n) {
+				bool esc = interp || (u8)s[i + 1] == close || s[i + 1] == '\\';
+				emit(c->o, i, 2, esc ? TK_ESCAPE : cls);
+				i += 2;
+				continue;
+			}
+			if (open && ch == open) {
+				depth++;
+			} else if (ch == close) {
+				if (depth == 0)
+					break;
+				depth--;
+			} else if (interp && (ch == '$' || ch == '@') && close != ch) {
+				u32 e = pl_interp_var(c, i, n, regex);
+				if (e > i) {
+					i = e;
+					continue;
+				}
+			}
+			emit(c->o, i, 1, cls);
+			i++;
+		}
+		if (i >= n) {
+			*carry = PL_STR_STATE(kind, interp, close, depth);
+			return n;
+		}
+		emit(c->o, i, 1, cls); /* closing delimiter */
+		i++;
+		if (kind == PK_SUBST1) {
+			if (open) {
+				/* s{...}{...}: a new delimiter follows */
+				i = skip_ws(s, n, i);
+				if (i >= n) {
+					*carry = PL_STR_STATE(PK_GAP, interp, 0, 0);
+					return n;
+				}
+				u8 o2 = (u8)s[i];
+				emit(c->o, i, 1, cls);
+				close = pl_close_of(o2);
+				open = pl_open_of(close);
+				i++;
+			}
+			kind = PK_REGEX;
+			depth = 0;
+			continue;
+		}
+		break;
+	}
+	if (kind == PK_REGEX) {
+		u32 j = i;
+		while (j < n && is_alpha((u8)s[j]))
+			j++;
+		emit(c->o, i, j - i, TK_CONTROL); /* keyword.control.regexp-option */
+		i = j;
+	}
+	return i;
+}
+
+/* Heredoc after "<<" at i; returns the end of the marker. */
+static u32 pl_heredoc_op(Pl *c, u32 i)
+{
+	const char *s = c->s;
+	u32 n = c->n, k = i + 2;
+	bool indent = false, interp = true;
+	if (k < n && s[k] == '~') {
+		indent = true;
+		k++;
+	}
+	u32 a, b;
+	if (k < n && (s[k] == '"' || s[k] == '\'')) {
+		u8 q = (u8)s[k];
+		interp = q == '"';
+		a = k + 1;
+		b = a;
+		while (b < n && (u8)s[b] != q)
+			b++;
+		k = b < n ? b + 1 : n;
+	} else {
+		a = k;
+		while (k < n && is_word((u8)s[k]))
+			k++;
+		b = k;
+	}
+	emit(c->o, i, k - i, TK_STRING);
+	if (b > a && !c->hd)
+		c->hd = PL_HEREDOC | (interp ? 0x08u : 0u) | (indent ? 0x10u : 0u) | (hash15(s + a, b - a) << 5);
+	return k;
+}
+
+static bool pl_quote_op(const char *w, u32 wl, u32 *kind, bool *interp, bool *two)
+{
+	*two = false;
+	if (word_is(w, wl, "q") || word_is(w, wl, "qw")) {
+		*kind = PK_STR;
+		*interp = false;
+	} else if (word_is(w, wl, "qq") || word_is(w, wl, "qx")) {
+		*kind = PK_STR;
+		*interp = true;
+	} else if (word_is(w, wl, "m") || word_is(w, wl, "qr")) {
+		*kind = PK_REGEX;
+		*interp = true;
+	} else if (word_is(w, wl, "s")) {
+		*kind = PK_SUBST1;
+		*interp = true;
+		*two = true;
+	} else if (word_is(w, wl, "tr") || word_is(w, wl, "y")) {
+		*kind = PK_SUBST1;
+		*interp = false;
+		*two = true;
+	} else {
+		return false;
+	}
+	return true;
+}
+
+static u32 pl_number(const char *s, u32 n, u32 i)
+{
+	u32 j = i;
+	if (s[j] == '0' && j + 1 < n && ((s[j + 1] | 32) == 'x' || (s[j + 1] | 32) == 'b')) {
+		j += 2;
+		while (j < n && (is_xdigit((u8)s[j]) || s[j] == '_'))
+			j++;
+		return j;
+	}
+	while (j < n && (is_digit((u8)s[j]) || s[j] == '_'))
+		j++;
+	if (j + 1 < n && s[j] == '.' && is_digit((u8)s[j + 1])) {
+		j++;
+		while (j < n && (is_digit((u8)s[j]) || s[j] == '_'))
+			j++;
+	}
+	if (j < n && (s[j] | 32) == 'e') {
+		u32 k = j + 1;
+		if (k < n && (s[k] == '+' || s[k] == '-'))
+			k++;
+		if (k < n && is_digit((u8)s[k])) {
+			j = k;
+			while (j < n && is_digit((u8)s[j]))
+				j++;
+		}
+	}
+	return j;
+}
+
+static bool pl_end_marker(const char *s, u32 n)
+{
+	u32 l = n >= 8 && memcmp(s, "__DATA__", 8) == 0 ? 8 : n >= 7 && memcmp(s, "__END__", 7) == 0 ? 7 : 0;
+	return l && skip_ws(s, n, l) == n;
+}
+
+static u32 lex_perl(u32 state, const char *s, u32 n, SynSpans *o)
+{
+	Pl c = {s, n, o, 0};
+	u32 mode = state & 7u;
+	u32 i = 0;
+	bool pod_line = n > 1 && s[0] == '=' && is_alpha((u8)s[1]);
+	if (mode == PL_POD || mode == PL_ENDPOD) {
+		emit(o, 0, n, TK_COMMENT);
+		if (n >= 4 && memcmp(s, "=cut", 4) == 0 && (n == 4 || !is_word((u8)s[4])))
+			return mode == PL_POD ? PL_NORMAL : PL_END;
+		return mode;
+	}
+	if (mode == PL_END) {
+		if (pod_line) {
+			emit(o, 0, n, TK_COMMENT);
+			return PL_ENDPOD;
+		}
+		return PL_END;
+	}
+	if (mode == PL_HEREDOC) {
+		u32 k = 0;
+		if (state & 0x10u)
+			while (k < n && (s[k] == ' ' || s[k] == '\t'))
+				k++;
+		u32 e = n;
+		while (e > k && s[e - 1] == '\r')
+			e--;
+		if (e > k && hash15(s + k, e - k) == ((state >> 5) & 0x7FFFu)) {
+			emit(o, k, e - k, TK_STRING);
+			return PL_NORMAL;
+		}
+		if (state & 0x08u) {
+			u32 j = 0;
+			while (j < n) {
+				if ((s[j] == '$' || s[j] == '@') && !(j && s[j - 1] == '\\')) {
+					u32 e2 = pl_interp_var(&c, j, n, false);
+					if (e2 > j) {
+						j = e2;
+						continue;
+					}
+				}
+				if (s[j] == '\\' && j + 1 < n) {
+					emit(o, j, 2, TK_ESCAPE);
+					j += 2;
+					continue;
+				}
+				emit(o, j, 1, TK_STRING);
+				j++;
+			}
+		} else {
+			emit(o, 0, n, TK_STRING);
+		}
+		return state;
+	}
+	if (mode == PL_STR) {
+		u32 kind = (state >> 3) & 3u;
+		bool interp = state & 0x20u;
+		u8 close = (u8)((state >> 6) & 0x7Fu);
+		u32 depth = (state >> 13) & 31u;
+		u32 carry;
+		if (kind == PK_GAP) {
+			i = skip_ws(s, n, 0);
+			if (i >= n)
+				return state;
+			u8 o2 = (u8)s[i];
+			emit(o, i, 1, TK_REGEX);
+			i = pl_quoted(&c, i + 1, PK_REGEX, interp, pl_close_of(o2), 0, &carry);
+		} else {
+			i = pl_quoted(&c, 0, kind, interp, close, depth, &carry);
+		}
+		if (carry)
+			return carry;
+	}
+	if (pod_line && i == 0) {
+		emit(o, 0, n, TK_COMMENT);
+		if (n >= 4 && memcmp(s, "=cut", 4) == 0)
+			return PL_NORMAL;
+		return PL_POD;
+	}
+	if (i == 0 && pl_end_marker(s, n)) {
+		emit(o, 0, n, TK_LANGCONST);
+		return PL_END;
+	}
+	bool term = true;
+	int next_kind = 0; /* 1: sub name, 2: package name */
+	u32 carry = 0;
+	while (i < n) {
+		u8 ch = (u8)s[i];
+		if (is_space(ch)) {
+			i++;
+			continue;
+		}
+		if (ch == '#') {
+			emit(o, i, n - i, TK_COMMENT);
+			break;
+		}
+		if (ch == '$' || ch == '@' || (ch == '%' && term)) {
+			u32 j = i + 1;
+			if (ch == '$' && j < n && s[j] == '#') {
+				/* $#array, $#{expr}, $#$ref */
+				if (j + 1 < n && (is_alpha((u8)s[j + 1]) || s[j + 1] == '_' || s[j + 1] == '{' || s[j + 1] == '$'))
+					j++;
+			}
+			if (j < n && s[j] == '{') {
+				u32 k = j + 1;
+				while (k < n && (is_word((u8)s[k]) || s[k] == ':' || s[k] == '^'))
+					k++;
+				if (k < n && s[k] == '}' && k > j + 1) {
+					emit(o, i, k + 1 - i, TK_VARIABLE);
+					i = k + 1;
+				} else {
+					emit(o, i, j - i, TK_VARIABLE);
+					i = j;
+				}
+				term = false;
+				continue;
+			}
+			if (j < n && (is_alpha((u8)s[j]) || s[j] == '_' || (s[j] == ':' && j + 1 < n && s[j + 1] == ':'))) {
+				while (j < n && (is_word((u8)s[j]) || (s[j] == ':' && j + 1 < n && s[j + 1] == ':')))
+					j += s[j] == ':' ? 2 : 1;
+				emit(o, i, j - i, TK_VARIABLE);
+				i = j;
+				term = false;
+				continue;
+			}
+			if (ch == '$' && j < n && s[j] == '^' && j + 1 < n && is_alpha((u8)s[j + 1])) {
+				emit(o, i, 3, TK_VARIABLE);
+				i += 3;
+				term = false;
+				continue;
+			}
+			if (ch == '$' && j < n && (is_digit((u8)s[j]) || in_set("&`'+!@/\\,;.<>()[]^:?|$\"-~=%*0_", (u8)s[j]))) {
+				if (s[j] == '$' && j + 1 < n && (is_alpha((u8)s[j + 1]) || s[j + 1] == '_' || s[j + 1] == '{')) {
+					emit(o, i, 1, TK_VARIABLE); /* $$ref deref */
+					i++;
+					continue;
+				}
+				u32 e = j + 1;
+				if (is_digit((u8)s[j]))
+					while (e < n && is_digit((u8)s[e]))
+						e++;
+				emit(o, i, e - i, TK_VARIABLE);
+				i = e;
+				term = false;
+				continue;
+			}
+			if (ch == '@' && j < n && (s[j] == '$' || s[j] == '_')) {
+				emit(o, i, 1, TK_VARIABLE);
+				i++;
+				continue;
+			}
+			i++;
+			term = true;
+			continue;
+		}
+		if (ch == '"' || ch == '`' || ch == '\'') {
+			emit(o, i, 1, TK_STRING);
+			i = pl_quoted(&c, i + 1, PK_STR, ch != '\'', ch, 0, &carry);
+			if (carry)
+				break;
+			term = false;
+			continue;
+		}
+		if (ch == '/' && term) {
+			emit(o, i, 1, TK_REGEX);
+			i = pl_quoted(&c, i + 1, PK_REGEX, true, '/', 0, &carry);
+			if (carry)
+				break;
+			term = false;
+			continue;
+		}
+		if (ch == '<' && i + 2 < n && s[i + 1] == '<' &&
+		    (s[i + 2] == '"' || s[i + 2] == '\'' || s[i + 2] == '~' ||
+		     (term && (is_alpha((u8)s[i + 2]) || s[i + 2] == '_')))) {
+			i = pl_heredoc_op(&c, i);
+			term = false;
+			continue;
+		}
+		if (is_digit(ch) || (ch == '.' && term && i + 1 < n && is_digit((u8)s[i + 1]))) {
+			u32 j = pl_number(s, n, ch == '.' ? i + 1 : i);
+			emit(o, i, j - i, TK_NUMBER);
+			i = j;
+			term = false;
+			continue;
+		}
+		if (ch == '-' && term && i + 1 < n && in_set("rwxoRWXOezsfdlpSbctugkTBMAC", (u8)s[i + 1]) &&
+		    (i + 2 >= n || !is_word((u8)s[i + 2]))) {
+			emit(o, i, 2, TK_OPERATOR); /* file test */
+			i += 2;
+			continue;
+		}
+		if (is_alpha(ch) || ch == '_') {
+			u32 j = i;
+			while (j < n && (is_word((u8)s[j]) || (s[j] == ':' && j + 1 < n && s[j + 1] == ':')))
+				j += s[j] == ':' ? 2 : 1;
+			const char *w = s + i;
+			u32 wl = j - i;
+			u32 p = skip_ws(s, n, j);
+			bool fat = p + 1 < n && s[p] == '=' && s[p + 1] == '>';
+			bool arrow = i >= 2 && s[i - 1] == '>' && s[i - 2] == '-';
+			bool brace_key = i > 0 && s[i - 1] == '{' && j < n && s[j] == '}';
+			if (next_kind) {
+				emit(o, i, wl, next_kind == 1 ? TK_FUNCTION : TK_TYPE);
+				next_kind = 0;
+				i = j;
+				term = false;
+				continue;
+			}
+			if (fat || arrow || brace_key) {
+				i = j;
+				term = false;
+				continue;
+			}
+			u32 qk;
+			bool qi, two;
+			if (pl_quote_op(w, wl, &qk, &qi, &two) && p < n) {
+				u8 d = (u8)s[p];
+				bool ok = !is_word(d) && d != ',' && d != ';' && d != ')' && !(d == '=' && p + 1 < n && s[p + 1] == '>') &&
+				          !(p > j && (d == '#' || d == '='));
+				if (ok) {
+					emit(o, i, p + 1 - i, qk == PK_STR ? TK_STRING : TK_REGEX);
+					(void)two;
+					i = pl_quoted(&c, p + 1, qk, qi && d != '\'', pl_close_of(d), 0, &carry);
+					if (carry)
+						break;
+					term = false;
+					continue;
+				}
+			}
+			int k = kw_find(&kw_pl, w, wl);
+			switch (k) {
+			case PLK_CTRL:
+				emit(o, i, wl, TK_CONTROL);
+				term = true;
+				break;
+			case PLK_STORAGE:
+				emit(o, i, wl, TK_STORAGE);
+				term = true;
+				break;
+			case PLK_FUNC:
+				emit(o, i, wl, TK_FUNCTION);
+				term = true;
+				break;
+			case PLK_OP:
+				emit(o, i, wl, TK_OPERATOR);
+				term = true;
+				break;
+			case PLK_CONST:
+				emit(o, i, wl, TK_LANGCONST);
+				term = false;
+				break;
+			case PLK_SUB:
+				emit(o, i, wl, TK_STORAGE);
+				next_kind = 1;
+				term = true;
+				break;
+			case PLK_PACKAGE:
+				emit(o, i, wl, TK_STORAGE);
+				next_kind = 2;
+				term = true;
+				break;
+			case PLK_BLOCK:
+				emit(o, i, wl, p < n && s[p] == '{' ? TK_CONTROL : TK_TEXT);
+				term = true;
+				break;
+			default:
+				term = false;
+				break;
+			}
+			i = j;
+			continue;
+		}
+		/* operators and punctuation */
+		if (ch == '=' && i + 1 < n && (s[i + 1] == '>' || s[i + 1] == '~')) {
+			emit(o, i, 2, TK_OPERATOR);
+			i += 2;
+			term = true;
+			continue;
+		}
+		if (ch == '-' && i + 1 < n && s[i + 1] == '>') {
+			emit(o, i, 2, TK_OPERATOR);
+			i += 2;
+			term = false;
+			continue;
+		}
+		if (ch == '<' && i + 2 < n && s[i + 1] == '=' && s[i + 2] == '>') {
+			emit(o, i, 3, TK_OPERATOR);
+			i += 3;
+			term = true;
+			continue;
+		}
+		term = !(ch == ')' || ch == ']' || ch == '}');
+		i++;
+	}
+	if (carry)
+		return carry;
+	if (c.hd)
+		return c.hd;
+	return PL_NORMAL;
+}
+
+/* ================================================================== */
+/* troff (man, mdoc, ms, me, mm)                                        */
+/*
+ * VSCodium has no built-in roff grammar; this follows the scopes of the
+ * common "roff" TextMate grammar: requests and macros at line start are
+ * keywords (keyword.control -> TK_CONTROL), section headings (.SH/.Sh)
+ * markup.heading, .B/.I arguments markup.bold/italic, font and size escapes
+ * (\fB \s+2 \(em \[name] \e) constant.character.escape, strings and
+ * registers (\*x \n(xx \$1) variables, comments (.\" \" \#) comments,
+ * quoted macro arguments strings, numbers numbers, and mdoc callable
+ * macros inside a macro line (Fl Ar Op ...) storage keywords.
+ *
+ * State: 0 normal, 1 inside .ig ... .. (shown as a comment). */
+
+static const char mdoc_callable[] =
+	"Ad An Ap Ar At Bc Bo Bq Brc Bro Brq Bsx Bx Cd Cm Dc Do Dq Dv Dx Ec Em Eo Er Es Ev Fa Fc Fl Fn Fo Fr "
+	"Ic Li Lk Ms Mt Nm Nm Nx Oc Oo Op Ot Ox Pa Pc Pf Po Pq Qc Ql Qo Qq Sc So Sq Sx Sy Ta Tn Ux Va Vt Xc "
+	"Xo Xr No Ns Ns";
+
+/* One escape at i (s[i] == '\\'); returns its end, or 0 for a comment. */
+static u32 roff_escape(const char *s, u32 n, u32 i, SynSpans *o)
+{
+	if (i + 1 >= n) {
+		emit(o, i, 1, TK_ESCAPE);
+		return n;
+	}
+	u8 c = (u8)s[i + 1];
+	u32 j = i + 2;
+	u32 cls = TK_ESCAPE;
+	if (c == '"' || c == '#') {
+		emit(o, i, n - i, TK_COMMENT);
+		return 0;
+	}
+	/* argument form: x, (xx, [name] */
+	bool arg = in_set("fFsnm*gkYVOMmz$", c);
+	if (c == '*' || c == 'n' || c == '$' || c == 'g' || c == 'V')
+		cls = TK_VARIABLE;
+	if (c == '(') {
+		j = VX_MIN(i + 4, n);
+	} else if (c == '[') {
+		while (j < n && s[j] != ']')
+			j++;
+		if (j < n)
+			j++;
+	} else if (arg) {
+		if (c == 's' && j < n && (s[j] == '+' || s[j] == '-'))
+			j++;
+		if (c == 'n' && j < n && (s[j] == '+' || s[j] == '-'))
+			j++;
+		if (j < n && s[j] == '(')
+			j = VX_MIN(j + 3, n);
+		else if (j < n && s[j] == '[') {
+			while (j < n && s[j] != ']')
+				j++;
+			if (j < n)
+				j++;
+		} else if (c == 's') {
+			while (j < n && is_digit((u8)s[j]) && j < i + 5)
+				j++;
+		} else if (j < n) {
+			j++;
+		}
+	} else if (in_set("hvlLbDoRwXZAB", c) && j < n && (s[j] == '\'' || s[j] == '"')) {
+		u8 q = (u8)s[j];
+		j++;
+		while (j < n && (u8)s[j] != q)
+			j++;
+		if (j < n)
+			j++;
+	}
+	emit(o, i, j - i, cls);
+	return j;
+}
+
+/* Text with escapes in [i, n) using base class cls. Returns n. */
+static void roff_text(const char *s, u32 n, u32 i, u32 cls, SynSpans *o)
+{
+	while (i < n) {
+		if (s[i] == '\\') {
+			u32 e = roff_escape(s, n, i, o);
+			if (!e)
+				return;
+			i = e;
+			continue;
+		}
+		u32 j = i;
+		while (j < n && s[j] != '\\')
+			j++;
+		emit(o, i, j - i, cls);
+		i = j;
+	}
+}
+
+static u32 lex_troff(u32 state, const char *s, u32 n, SynSpans *o)
+{
+	if (state == 1) {
+		if (n >= 2 && s[0] == '.' && s[1] == '.' && skip_ws(s, n, 2) == n) {
+			emit(o, 0, n, TK_CONTROL);
+			return 0;
+		}
+		emit(o, 0, n, TK_COMMENT);
+		return 1;
+	}
+	if (n == 0)
+		return 0;
+	if (s[0] != '.' && s[0] != '\'') {
+		roff_text(s, n, 0, TK_TEXT, o);
+		return 0;
+	}
+	u32 i = skip_ws(s, n, 1);
+	if (i < n && s[i] == '\\' && i + 1 < n && (s[i + 1] == '"' || s[i + 1] == '#')) {
+		emit(o, 0, n, TK_COMMENT);
+		return 0;
+	}
+	u32 j = i;
+	while (j < n && !is_space((u8)s[j]) && s[j] != '\\')
+		j++;
+	emit(o, 0, j, TK_CONTROL);
+	const char *m = s + i;
+	u32 ml = j - i;
+	if (word_is(m, ml, "ig")) {
+		roff_text(s, n, j, TK_TEXT, o);
+		return 1;
+	}
+	u32 arg = TK_TEXT;
+	if (word_is(m, ml, "SH") || word_is(m, ml, "SS") || word_is(m, ml, "Sh") || word_is(m, ml, "Ss") ||
+	    word_is(m, ml, "NH") || word_is(m, ml, "TL"))
+		arg = TK_HEADING;
+	else if (word_is(m, ml, "B") || word_is(m, ml, "SB") || word_is(m, ml, "Sy"))
+		arg = TK_BOLD;
+	else if (word_is(m, ml, "I") || word_is(m, ml, "Em"))
+		arg = TK_ITALIC;
+	bool mdoc = ml >= 2 && ml <= 3 && s[i] >= 'A' && s[i] <= 'Z' && s[i + 1] >= 'a' && s[i + 1] <= 'z';
+	i = j;
+	while (i < n) {
+		u8 ch = (u8)s[i];
+		if (is_space(ch)) {
+			i++;
+			continue;
+		}
+		if (ch == '"') {
+			u32 k = i + 1;
+			while (k < n && s[k] != '"') {
+				if (s[k] == '\\' && k + 1 < n && s[k + 1] == '"')
+					break;
+				k++;
+			}
+			if (k < n && s[k] == '"')
+				k++;
+			emit(o, i, 1, arg == TK_TEXT ? TK_STRING : arg);
+			roff_text(s, k, i + 1, arg == TK_TEXT ? TK_STRING : arg, o);
+			i = k;
+			continue;
+		}
+		u32 k = i;
+		while (k < n && !is_space((u8)s[k]) && s[k] != '"') {
+			if (s[k] == '\\') {
+				if (k + 1 < n && (s[k + 1] == '"' || s[k + 1] == '#'))
+					break;
+				k = VX_MIN(k + 2, n);
+				continue;
+			}
+			k++;
+		}
+		const char *w = s + i;
+		u32 wl = k - i;
+		if (mdoc && wl >= 2 && wl <= 3 && kw_find(&kw_mdoc, w, wl) >= 0)
+			emit(o, i, wl, TK_STORAGE);
+		else if (wl && (is_digit((u8)w[0]) || ((w[0] == '-' || w[0] == '+') && wl > 1 && is_digit((u8)w[1])))) {
+			u32 q = w[0] == '-' || w[0] == '+' ? 1 : 0;
+			while (q < wl && (is_digit((u8)w[q]) || w[q] == '.'))
+				q++;
+			if (q < wl && in_set("ciPpmnvuMf", (u8)w[q]) && q + 1 == wl)
+				q++;
+			emit(o, i, q, q == wl ? TK_NUMBER : TK_TEXT);
+			if (q < wl)
+				roff_text(s, k, i + q, arg, o);
+		} else {
+			roff_text(s, k, i, arg, o);
+		}
+		if (k < n && s[k] == '\\') { /* comment */
+			emit(o, k, n - k, TK_COMMENT);
+			break;
+		}
+		i = k;
+	}
+	return 0;
+}
+
+/* ================================================================== */
+/* Markdown                                                            */
+/*
+ * Block structure per line, inline spans after it, following VSCodium's
+ * markdown.tmLanguage scopes under Dark+/Light+. Fenced code with a known
+ * info string is highlighted by that language's lexer (fenced code with an
+ * unknown language has no colour, as in VSCodium).
+ *
+ * State (32 bits):
+ *   bits 0-1   mode: 0 normal, 1 fenced code, 2 inside <!-- -->
+ *   bits 2-5   embedded LANG_* of the fence (0 = none)
+ *   bit 6      fence uses '~'
+ *   bits 7-11  fence length (3..31)
+ *   bits 12-31 embedded lexer state (20 bits) in fenced code;
+ *              in normal mode bit 12 = the previous line was paragraph
+ *              text (an ===/--- line under it is a setext heading). */
+enum { MD_NORMAL, MD_FENCE, MD_HTMLCMT };
+#define MD_PARA (1u << 12)
+
+static u32 lex_any(int lang, u32 state, const char *s, u32 n, SynSpans *o);
+
+static int md_fence_lang(const char *w, u32 n)
+{
+	char b[16];
+	if (n == 0 || n >= sizeof b)
+		return LANG_NONE;
+	for (u32 i = 0; i < n; i++)
+		b[i] = (char)lower((u8)w[i]);
+	b[n] = 0;
+	static const struct {
+		const char *name;
+		u8 lang;
+	} map[] = {
+	    {"c", LANG_C},          {"h", LANG_C},           {"sh", LANG_SH},          {"bash", LANG_SH},
+	    {"shell", LANG_SH},     {"zsh", LANG_SH},        {"ksh", LANG_SH},         {"console", LANG_SH},
+	    {"shellscript", LANG_SH}, {"perl", LANG_PERL},   {"pl", LANG_PERL},        {"pm", LANG_PERL},
+	    {"pod", LANG_PERL},     {"lisp", LANG_LISP},     {"elisp", LANG_LISP},     {"scheme", LANG_LISP},
+	    {"clojure", LANG_LISP}, {"clj", LANG_LISP},      {"cljs", LANG_LISP},      {"racket", LANG_LISP},
+	    {"commonlisp", LANG_LISP}, {"asm", LANG_ASM_INTEL}, {"nasm", LANG_ASM_INTEL}, {"x86asm", LANG_ASM_INTEL},
+	    {"masm", LANG_ASM_INTEL}, {"gas", LANG_ASM_GAS}, {"att", LANG_ASM_GAS},    {"s", LANG_ASM_GAS},
+	    {"troff", LANG_TROFF},  {"roff", LANG_TROFF},    {"groff", LANG_TROFF},    {"nroff", LANG_TROFF},
+	    {"man", LANG_TROFF},    {"mdoc", LANG_TROFF},
+	};
+	for (size_t i = 0; i < VX_COUNT(map); i++)
+		if (!strcmp(b, map[i].name))
+			return map[i].lang;
+	return LANG_NONE;
+}
+
+/* Find a closing run of `k` backticks/markers starting at or after i. */
+static u32 md_find(const char *s, u32 n, u32 i, const char *mk, u32 ml)
+{
+	for (; i + ml <= n; i++) {
+		if (s[i] == '\\') {
+			i++;
+			continue;
+		}
+		if (memcmp(s + i, mk, ml) == 0)
+			return i;
+	}
+	return UINT32_MAX;
+}
+
+static u32 md_inline(const char *s, u32 n, u32 i, u32 base, SynSpans *o, u32 *mode);
+
+/* HTML tag at i (s[i] == '<'); returns its end or i when not a tag. */
+static u32 md_tag(const char *s, u32 n, u32 i, SynSpans *o)
+{
+	u32 j = i + 1;
+	bool close = j < n && s[j] == '/';
+	if (close)
+		j++;
+	if (j >= n || !is_alpha((u8)s[j]))
+		return i;
+	u32 a = j;
+	while (j < n && (is_word((u8)s[j]) || s[j] == '-'))
+		j++;
+	u32 name_end = j;
+	/* scan attributes up to '>' */
+	u32 k = j;
+	while (k < n && s[k] != '>' && s[k] != '<') {
+		if (s[k] == '"' || s[k] == '\'') {
+			u8 q = (u8)s[k];
+			k++;
+			while (k < n && (u8)s[k] != q)
+				k++;
+		}
+		if (k < n)
+			k++;
+	}
+	if (k >= n || s[k] != '>')
+		return i;
+	emit(o, i, a - i, TK_TAGPUNCT);
+	emit(o, a, name_end - a, TK_TAG);
+	k = j;
+	while (k < n && s[k] != '>') {
+		u8 ch = (u8)s[k];
+		if (is_alpha(ch) || ch == '_' || ch == ':') {
+			u32 e = k;
+			while (e < n && (is_word((u8)s[e]) || s[e] == '-' || s[e] == ':'))
+				e++;
+			emit(o, k, e - k, TK_ATTR);
+			k = e;
+		} else if (ch == '"' || ch == '\'') {
+			u32 e = k + 1;
+			while (e < n && s[e] != (char)ch)
+				e++;
+			if (e < n)
+				e++;
+			emit(o, k, e - k, TK_STRING);
+			k = e;
+		} else if (ch == '/') {
+			emit(o, k, 1, TK_TAGPUNCT);
+			k++;
+		} else {
+			k++;
+		}
+	}
+	emit(o, k, 1, TK_TAGPUNCT);
+	return k + 1;
+}
+
+static bool md_url_start(const char *s, u32 n, u32 i)
+{
+	return (n - i > 7 && memcmp(s + i, "http://", 7) == 0) || (n - i > 8 && memcmp(s + i, "https://", 8) == 0) ||
+	       (n - i > 4 && memcmp(s + i, "www.", 4) == 0);
+}
+
+/* Inline spans in [i, n) over base class `base`; *mode may become an open
+ * HTML comment. */
+static u32 md_inline(const char *s, u32 n, u32 i, u32 base, SynSpans *o, u32 *mode)
+{
+	while (i < n) {
+		u8 ch = (u8)s[i];
+		if (ch == '\\' && i + 1 < n && in_set("\\`*_{}[]()#+-.!<>|~", (u8)s[i + 1])) {
+			emit(o, i, 2, TK_ESCAPE);
+			i += 2;
+			continue;
+		}
+		if (ch == '`') {
+			u32 k = i;
+			while (k < n && s[k] == '`')
+				k++;
+			u32 run = k - i;
+			u32 e = k;
+			for (;;) {
+				while (e < n && s[e] != '`')
+					e++;
+				if (e >= n)
+					break;
+				u32 f = e;
+				while (f < n && s[f] == '`')
+					f++;
+				if (f - e == run) {
+					e = f;
+					break;
+				}
+				e = f;
+			}
+			if (e <= n && e > k && s[e - 1] == '`') {
+				emit(o, i, e - i, TK_RAW);
+				i = e;
+				continue;
+			}
+			emit(o, i, run, base);
+			i = k;
+			continue;
+		}
+		if (ch == '<' && n - i >= 4 && memcmp(s + i, "<!--", 4) == 0) {
+			u32 e = md_find(s, n, i + 4, "-->", 3);
+			if (e == UINT32_MAX) {
+				emit(o, i, n - i, TK_COMMENT);
+				*mode = MD_HTMLCMT;
+				return n;
+			}
+			emit(o, i, e + 3 - i, TK_COMMENT);
+			i = e + 3;
+			continue;
+		}
+		if (ch == '<') {
+			/* autolink <http://...> or tag */
+			u32 e = i + 1;
+			while (e < n && s[e] != '>' && s[e] != ' ')
+				e++;
+			if (e < n && s[e] == '>' && (md_url_start(s, e, i + 1) || memchr(s + i + 1, '@', e - i - 1))) {
+				emit(o, i + 1, e - i - 1, TK_LINK);
+				i = e + 1;
+				continue;
+			}
+			u32 t = md_tag(s, n, i, o);
+			if (t > i) {
+				i = t;
+				continue;
+			}
+		}
+		if ((ch == '*' || ch == '_') && i + 1 < n && s[i + 1] == ch) {
+			char mk[2] = {(char)ch, (char)ch};
+			bool open_ok = i + 2 < n && !is_space((u8)s[i + 2]) && (ch == '*' || i == 0 || !is_word((u8)s[i - 1]));
+			u32 e = open_ok ? md_find(s, n, i + 2, mk, 2) : UINT32_MAX;
+			if (e != UINT32_MAX && e > i + 2 && !is_space((u8)s[e - 1])) {
+				emit(o, i, 2, TK_BOLD);
+				md_inline(s, e, i + 2, TK_BOLD, o, mode);
+				emit(o, e, 2, TK_BOLD);
+				i = e + 2;
+				continue;
+			}
+		}
+		if (ch == '*' || ch == '_') {
+			bool open_ok = i + 1 < n && !is_space((u8)s[i + 1]) && (ch == '*' || i == 0 || !is_word((u8)s[i - 1]));
+			u32 e = UINT32_MAX;
+			if (open_ok)
+				for (u32 k = i + 1; k < n; k++) {
+					if (s[k] == '\\') {
+						k++;
+						continue;
+					}
+					if (s[k] == ch && !(k + 1 < n && s[k + 1] == ch) && !is_space((u8)s[k - 1]) &&
+					    (ch == '*' || k + 1 >= n || !is_word((u8)s[k + 1]))) {
+						e = k;
+						break;
+					}
+					if (s[k] == ch && k + 1 < n && s[k + 1] == ch)
+						k++;
+				}
+			if (e != UINT32_MAX && e > i + 1) {
+				emit(o, i, 1, TK_ITALIC);
+				md_inline(s, e, i + 1, TK_ITALIC, o, mode);
+				emit(o, e, 1, TK_ITALIC);
+				i = e + 1;
+				continue;
+			}
+		}
+		if (ch == '~' && i + 1 < n && s[i + 1] == '~') {
+			u32 e = md_find(s, n, i + 2, "~~", 2);
+			if (e != UINT32_MAX && e > i + 2) {
+				emit(o, i, 2, TK_STRIKE);
+				md_inline(s, e, i + 2, TK_STRIKE, o, mode);
+				emit(o, e, 2, TK_STRIKE);
+				i = e + 2;
+				continue;
+			}
+		}
+		if (ch == '[' || (ch == '!' && i + 1 < n && s[i + 1] == '[')) {
+			u32 a = ch == '!' ? i + 2 : i + 1;
+			int d = 1;
+			u32 k = a;
+			for (; k < n; k++) {
+				if (s[k] == '\\') {
+					k++;
+					continue;
+				}
+				if (s[k] == '[')
+					d++;
+				else if (s[k] == ']' && --d == 0)
+					break;
+			}
+			if (k < n && k + 1 < n && (s[k + 1] == '(' || s[k + 1] == '[')) {
+				u8 cl = s[k + 1] == '(' ? ')' : ']';
+				u32 e = k + 2;
+				int pd = 1;
+				for (; e < n; e++) {
+					if (s[e] == (char)(cl == ')' ? '(' : '['))
+						pd++;
+					else if ((u8)s[e] == cl && --pd == 0)
+						break;
+				}
+				if (e < n) {
+					md_inline(s, k, a, TK_STRING, o, mode);
+					if (cl == ')') {
+						u32 u = k + 2, ue = u;
+						while (ue < e && !is_space((u8)s[ue]))
+							ue++;
+						emit(o, u, ue - u, TK_LINK);
+						if (ue < e)
+							emit(o, ue, e - ue, TK_STRING); /* "title" */
+					}
+					i = e + 1;
+					continue;
+				}
+			}
+		}
+		if ((ch == 'h' || ch == 'w') && (i == 0 || !is_word((u8)s[i - 1])) && md_url_start(s, n, i)) {
+			u32 e = i;
+			while (e < n && !is_space((u8)s[e]) && s[e] != ')' && s[e] != '>' && s[e] != '"')
+				e++;
+			while (e > i && in_set(".,;:!?", (u8)s[e - 1]))
+				e--;
+			emit(o, i, e - i, TK_LINK);
+			i = e;
+			continue;
+		}
+		emit(o, i, 1, base);
+		i++;
+	}
+	return n;
+}
+
+static u32 lex_md(u32 state, const char *s, u32 n, SynSpans *o)
+{
+	u32 mode = state & 3u;
+	if (mode == MD_FENCE) {
+		u8 fch = (state & 0x40u) ? '~' : '`';
+		u32 flen = (state >> 7) & 31u;
+		u32 k = skip_ws(s, n, 0);
+		u32 r = k;
+		while (r < n && (u8)s[r] == fch)
+			r++;
+		if (r - k >= flen && skip_ws(s, n, r) == n)
+			return MD_NORMAL; /* closing fence */
+		int lang = (int)((state >> 2) & 15u);
+		if (lang == LANG_NONE)
+			return state;
+		u32 inner = lex_any(lang, state >> 12, s, n, o) & ((1u << SYN_STATE_BITS) - 1u);
+		return (state & 0xFFFu) | (inner << 12);
+	}
+	if (mode == MD_HTMLCMT) {
+		u32 e = md_find(s, n, 0, "-->", 3);
+		if (e == UINT32_MAX) {
+			emit(o, 0, n, TK_COMMENT);
+			return MD_HTMLCMT;
+		}
+		emit(o, 0, e + 3, TK_COMMENT);
+		u32 m = MD_NORMAL;
+		md_inline(s, n, e + 3, TK_TEXT, o, &m);
+		return m;
+	}
+	bool para = state & MD_PARA;
+	u32 i = 0;
+	u32 ind = 0;
+	while (i < n && s[i] == ' ') {
+		i++;
+		ind++;
+	}
+	if (i >= n)
+		return MD_NORMAL; /* blank */
+	u8 ch = (u8)s[i];
+	/* fenced code */
+	if ((ch == '`' || ch == '~') && ind <= 3) {
+		u32 r = i;
+		while (r < n && (u8)s[r] == ch)
+			r++;
+		if (r - i >= 3 && !(ch == '`' && memchr(s + r, '`', n - r))) {
+			u32 a = skip_ws(s, n, r), b = a;
+			while (b < n && !is_space((u8)s[b]) && s[b] != '{' && s[b] != ',')
+				b++;
+			int lang = md_fence_lang(s + a, b - a);
+			u32 fl = VX_MIN(r - i, 31u);
+			return MD_FENCE | ((u32)lang << 2) | (ch == '~' ? 0x40u : 0u) | (fl << 7);
+		}
+	}
+	/* ATX heading */
+	if (ch == '#' && ind <= 3) {
+		u32 h = i;
+		while (h < n && s[h] == '#')
+			h++;
+		if (h - i <= 6 && (h == n || is_space((u8)s[h]))) {
+			emit(o, i, n - i, TK_HEADING);
+			return MD_NORMAL;
+		}
+	}
+	/* setext underline / thematic break */
+	if ((ch == '=' || ch == '-' || ch == '*' || ch == '_') && ind <= 3) {
+		u32 k = i, cnt = 0;
+		bool only = true;
+		while (k < n) {
+			if ((u8)s[k] == ch)
+				cnt++;
+			else if (!is_space((u8)s[k]) && !(ch != '=' && is_space((u8)s[k])))
+				only = false;
+			k++;
+		}
+		if (only && (ch == '=' || ch == '-') && para && cnt >= 1) {
+			bool contiguous = true;
+			u32 e = n;
+			while (e > i && is_space((u8)s[e - 1]))
+				e--;
+			for (u32 q = i; q < e; q++)
+				if ((u8)s[q] != ch)
+					contiguous = false;
+			if (contiguous) {
+				emit(o, i, e - i, TK_HEADING);
+				return MD_NORMAL;
+			}
+		}
+		if (only && cnt >= 3 && ch != '=')
+			return MD_NORMAL; /* meta.separator: no colour */
+	}
+	u32 mode_out = MD_NORMAL;
+	/* block quotes (possibly nested) */
+	while (i < n && s[i] == '>') {
+		emit(o, i, 1, TK_QUOTE);
+		i = skip_ws(s, n, i + 1);
+	}
+	/* list markers */
+	if (i < n && (s[i] == '*' || s[i] == '+' || s[i] == '-') && i + 1 < n && is_space((u8)s[i + 1])) {
+		emit(o, i, 1, TK_LIST);
+		i = skip_ws(s, n, i + 1);
+		/* task list [ ] / [x] */
+	} else if (i < n && is_digit((u8)s[i])) {
+		u32 k = i;
+		while (k < n && is_digit((u8)s[k]) && k < i + 9)
+			k++;
+		if (k < n && (s[k] == '.' || s[k] == ')') && (k + 1 >= n || is_space((u8)s[k + 1]))) {
+			emit(o, i, k + 1 - i, TK_LIST);
+			i = skip_ws(s, n, k + 1);
+		}
+	}
+	md_inline(s, n, i, TK_TEXT, o, &mode_out);
+	if (mode_out != MD_NORMAL)
+		return mode_out;
+	return MD_NORMAL | MD_PARA;
+}
+
+static u32 lex_any(int lang, u32 state, const char *s, u32 n, SynSpans *o)
+{
+	switch (lang) {
+	case LANG_C: return lex_c(state, s, n, o);
+	case LANG_ASM_GAS: return lex_asm(true, state, s, n, o);
+	case LANG_ASM_INTEL: return lex_asm(false, state, s, n, o);
+	case LANG_LISP: return lex_lisp(state, s, n, o);
+	case LANG_SH: return lex_sh(state, s, n, o);
+	case LANG_MARKDOWN: return lex_md(state, s, n, o);
+	case LANG_TROFF: return lex_troff(state, s, n, o);
+	case LANG_PERL: return lex_perl(state, s, n, o);
+	default: return 0;
+	}
+}
+
+static void syn_build2(void)
+{
+	kw_list(&kw_sh, sh_ctrl_cmd, SHK_CTRL_CMD);
+	kw_list(&kw_sh, sh_end, SHK_END);
+	kw_list(&kw_sh, sh_loop, SHK_LOOP);
+	kw_list(&kw_sh, sh_ctrl, SHK_CTRL);
+	kw_list(&kw_sh, sh_decl, SHK_DECL);
+	kw_add(&kw_sh, "function", 8, SHK_FUNCTION);
+	kw_add(&kw_sh, "in", 2, SHK_IN);
+
+	kw_add(&kw_pl, "sub", 3, PLK_SUB);
+	kw_add(&kw_pl, "package", 7, PLK_PACKAGE);
+	kw_list(&kw_pl, pl_ctrl, PLK_CTRL);
+	kw_list(&kw_pl, pl_storage, PLK_STORAGE);
+	kw_list(&kw_pl, pl_func, PLK_FUNC);
+	kw_list(&kw_pl, pl_op, PLK_OP);
+	kw_list(&kw_pl, pl_const, PLK_CONST);
+	kw_list(&kw_pl, pl_block, PLK_BLOCK);
+
+	kw_list(&kw_mdoc, mdoc_callable, 1);
+}
+
+/* ================================================================== */
 /* Public API                                                          */
 
 u32 syn_line(int lang, u32 state, const char *s, u32 n, SynSpans *out)
@@ -1554,13 +3376,7 @@ u32 syn_line(int lang, u32 state, const char *s, u32 n, SynSpans *out)
 	syn_init();
 	if (out)
 		out->count = 0;
-	switch (lang) {
-	case LANG_C: return lex_c(state, s, n, out);
-	case LANG_ASM_GAS: return lex_asm(true, state, s, n, out);
-	case LANG_ASM_INTEL: return lex_asm(false, state, s, n, out);
-	case LANG_LISP: return lex_lisp(state, s, n, out);
-	default: return 0;
-	}
+	return lex_any(lang, state, s, n, out);
 }
 
 const char *syn_lang_name(int lang)
@@ -1570,6 +3386,10 @@ const char *syn_lang_name(int lang)
 	case LANG_ASM_GAS: return "x86 Assembly (AT&T)";
 	case LANG_ASM_INTEL: return "x86 Assembly (Intel)";
 	case LANG_LISP: return "Lisp";
+	case LANG_SH: return "Shell Script";
+	case LANG_MARKDOWN: return "Markdown";
+	case LANG_TROFF: return "Roff";
+	case LANG_PERL: return "Perl";
 	default: return "Plain Text";
 	}
 }
@@ -1581,6 +3401,9 @@ const char *syn_lang_lsp_id(int lang)
 	case LANG_ASM_GAS:
 	case LANG_ASM_INTEL: return "asm";
 	case LANG_LISP: return "lisp";
+	case LANG_SH: return "shellscript";
+	case LANG_MARKDOWN: return "markdown";
+	case LANG_PERL: return "perl";
 	default: return NULL;
 	}
 }
@@ -1589,9 +3412,12 @@ const char *syn_line_comment(int lang)
 {
 	switch (lang) {
 	case LANG_C: return "//";
-	case LANG_ASM_GAS: return "#";
+	case LANG_ASM_GAS:
+	case LANG_SH:
+	case LANG_PERL: return "#";
 	case LANG_ASM_INTEL:
 	case LANG_LISP: return ";";
+	case LANG_TROFF: return ".\\\"";
 	default: return NULL;
 	}
 }
@@ -1659,17 +3485,94 @@ static int asm_guess(const char *h, size_t n)
 	return score;
 }
 
+/* Interpreter named by a "#!" line: LANG_SH, LANG_PERL or LANG_NONE. */
+static int shebang_lang(const char *h, size_t n)
+{
+	if (!h || n < 3 || h[0] != '#' || h[1] != '!')
+		return LANG_NONE;
+	size_t e = 2;
+	while (e < n && h[e] != '\n')
+		e++;
+	/* split the line into words; take the interpreter's basename, skipping
+	 * "env" and its options */
+	size_t i = 2;
+	bool env = false;
+	while (i < e) {
+		while (i < e && (h[i] == ' ' || h[i] == '\t'))
+			i++;
+		size_t a = i;
+		while (i < e && h[i] != ' ' && h[i] != '\t' && h[i] != '\r')
+			i++;
+		if (a == i)
+			break;
+		size_t b = a;
+		for (size_t k = a; k < i; k++)
+			if (h[k] == '/')
+				b = k + 1;
+		const char *w = h + b;
+		size_t wl = i - b;
+		if (wl == 3 && memcmp(w, "env", 3) == 0) {
+			env = true;
+			continue;
+		}
+		if (env && (w[0] == '-' || memchr(w, '=', wl)))
+			continue;
+		static const char *const shells[] = {"sh", "bash", "zsh", "ksh", "dash", "ash", "mksh", "yash", "pdksh", "ksh93", "rbash"};
+		for (size_t k = 0; k < VX_COUNT(shells); k++)
+			if (wl == strlen(shells[k]) && memcmp(w, shells[k], wl) == 0)
+				return LANG_SH;
+		if (wl >= 4 && memcmp(w, "perl", 4) == 0 && (wl == 4 || is_digit((u8)w[4])))
+			return LANG_PERL;
+		return LANG_NONE;
+	}
+	return LANG_NONE;
+}
+
+/* Does the head look like roff (.TH, .Dd, .\" ...)? */
+static bool roff_head(const char *h, size_t n)
+{
+	if (!h)
+		return false;
+	size_t i = 0;
+	int lines = 0;
+	while (i < n && lines < 20) {
+		size_t e = i;
+		while (e < n && h[e] != '\n')
+			e++;
+		if (e > i + 1 && (h[i] == '.' || h[i] == '\'')) {
+			const char *l = h + i + 1;
+			size_t ln = e - i - 1;
+			static const char *const req[] = {"\\\"", "TH", "Dd", "Dt", "SH", "Sh", "so", "de", "ig", "Os", "TL", "PP", "LP", "Nm", "ds", "nr", "ad", "nh"};
+			for (size_t k = 0; k < VX_COUNT(req); k++) {
+				size_t rl = strlen(req[k]);
+				if (ln >= rl && memcmp(l, req[k], rl) == 0 && (ln == rl || !is_alpha((u8)l[rl]) || req[k][0] == '\\'))
+					return true;
+			}
+		}
+		i = e + 1;
+		lines++;
+	}
+	return false;
+}
+
 int syn_lang_for_path(const char *path, const char *head, size_t headlen)
 {
 	const char *base = strrchr(path, '/');
 	base = base ? base + 1 : path;
+	static const char *const sh_names[] = {".bashrc", ".bash_profile", ".bash_login", ".bash_logout", ".bash_aliases",
+	                                       ".profile", ".zshrc", ".zprofile", ".zshenv", ".zlogin", ".zlogout",
+	                                       ".kshrc", ".mkshrc", "PKGBUILD", "APKBUILD", ".xinitrc", ".xsession"};
+	for (size_t i = 0; i < VX_COUNT(sh_names); i++)
+		if (!strcmp(base, sh_names[i]))
+			return LANG_SH;
+	int bang = shebang_lang(head, headlen);
 	const char *dot = strrchr(base, '.');
 	if (!dot || dot == base)
-		return LANG_NONE;
+		return bang;
 	char e[12];
 	size_t el = strlen(dot + 1);
 	if (el == 0 || el >= sizeof e)
-		return LANG_NONE;
+		return bang;
 	for (size_t i = 0; i <= el; i++)
 		e[i] = (char)lower((u8)dot[1 + i]);
 	if (!strcmp(e, "c") || !strcmp(e, "h"))
@@ -1688,5 +3591,34 @@ int syn_lang_for_path(const char *path, const char *head, size_t headlen)
 		int sc = head ? asm_guess(head, headlen) : 0;
 		return sc > 0 ? LANG_ASM_GAS : LANG_ASM_INTEL;
 	}
-	return LANG_NONE;
+	static const char *const sh[] = {"sh", "bash", "zsh", "ksh", "ash", "dash", "mksh", "bats", "command", "ebuild", "eclass"};
+	for (size_t i = 0; i < VX_COUNT(sh); i++)
+		if (!strcmp(e, sh[i]))
+			return LANG_SH;
+	static const char *const md[] = {"md", "markdown", "mdown", "mkd", "mkdn", "mdwn", "mdtxt", "mdtext", "workbook"};
+	for (size_t i = 0; i < VX_COUNT(md); i++)
+		if (!strcmp(e, md[i]))
+			return LANG_MARKDOWN;
+	static const char *const pl[] = {"pl", "pm", "pod", "psgi", "perl", "plx", "ph"};
+	for (size_t i = 0; i < VX_COUNT(pl); i++)
+		if (!strcmp(e, pl[i]))
+			return LANG_PERL;
+	if (!strcmp(e, "t")) /* Perl test unless it is a roff document */
+		return roff_head(head, headlen) ? LANG_TROFF : LANG_PERL;
+	if (!strcmp(e, "cgi") || !strcmp(e, "fcgi"))
+		return bang ? bang : LANG_PERL;
+	static const char *const roff[] = {"man", "mdoc", "ms", "me", "mm", "mom", "roff", "tr", "tmac", "groff", "nroff", "troff", "1in", "3in"};
+	for (size_t i = 0; i < VX_COUNT(roff); i++)
+		if (!strcmp(e, roff[i]))
+			return LANG_TROFF;
+	/* man sections: .1 .3p .1m .8 .3ssl ... */
+	if (e[0] >= '1' && e[0] <= '9') {
+		bool ok = true;
+		for (size_t i = 1; i < el; i++)
+			if (!is_alpha((u8)e[i]))
+				ok = false;
+		if (ok && (el <= 4 || roff_head(head, headlen)))
+			return LANG_TROFF;
+	}
+	return bang;
 }

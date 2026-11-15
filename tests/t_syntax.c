@@ -52,7 +52,9 @@ static int cls_nth(const char *sub, int nth)
 static const char *const names[] = {
 	"TEXT", "COMMENT", "STRING", "ESCAPE", "NUMBER", "STORAGE", "CONTROL", "TYPE",
 	"FUNCTION", "VARIABLE", "CONSTANT", "LANGCONST", "PREPROC", "OPERATOR", "LABEL", "INVALID",
+	"HEADING", "BOLD", "ITALIC", "STRIKE", "RAW", "LINK", "LIST", "QUOTE", "TAG", "TAGPUNCT", "ATTR", "REGEX",
 };
+_Static_assert(sizeof names / sizeof names[0] == TK_COUNT, "names[] matches TK_*");
 
 static void expect(const char *sub, int nth, int cls, int lineno)
 {
@@ -427,6 +429,398 @@ static void test_detect(void)
 	CHECK(syn_line(LANG_C, 0, l, (u32)strlen(l), NULL) == s);
 }
 
+
+static void test_sh(void)
+{
+	u32 s;
+	s = lex(LANG_SH, 0, "#!/bin/sh");
+	T("#!/bin/sh", TK_COMMENT);
+	lex(LANG_SH, 0, "if [ -f \"$HOME/.rc\" ]; then echo hi; fi # done");
+	T("if", TK_CONTROL);
+	T("-f", TK_OPERATOR);
+	T("$HOME", TK_VARIABLE);
+	T("/.rc", TK_STRING);
+	T("then", TK_CONTROL);
+	T("echo", TK_FUNCTION);
+	T("hi", TK_STRING);
+	T("fi", TK_CONTROL);
+	T("# done", TK_COMMENT);
+	lex(LANG_SH, 0, "FOO=1 BAR=\"x\" make -j4 --prefix=/usr all 2>&1 | tee log");
+	T("FOO", TK_VARIABLE);
+	TN("=", 0, TK_OPERATOR);
+	T("1", TK_NUMBER);
+	T("BAR", TK_VARIABLE);
+	T("\"x\"", TK_STRING);
+	T("make", TK_FUNCTION);
+	T("-j4", TK_LANGCONST);
+	T("--prefix=/usr", TK_LANGCONST);
+	T("all", TK_STRING);
+	T("2>&1", TK_OPERATOR);
+	T("|", TK_OPERATOR);
+	T("tee", TK_FUNCTION);
+	lex(LANG_SH, 0, "local x=${1:-def} n=$# st=$?");
+	T("local", TK_STORAGE);
+	T("x", TK_VARIABLE);
+	T("${1:-def}", TK_VARIABLE);
+	T("$#", TK_LANGCONST);
+	T("$?", TK_LANGCONST);
+	lex(LANG_SH, 0, "greet() {");
+	T("greet", TK_FUNCTION);
+	lex(LANG_SH, 0, "function build {");
+	T("function", TK_STORAGE);
+	T("build", TK_FUNCTION);
+	lex(LANG_SH, 0, "for f in *.c; do cc \"$f\" -o \"${f%.c}\"; done");
+	T("for", TK_CONTROL);
+	T("in", TK_CONTROL);
+	T("do", TK_CONTROL);
+	T("cc", TK_FUNCTION);
+	T("$f", TK_VARIABLE);
+	T("${f%.c}", TK_VARIABLE);
+	T("done", TK_CONTROL);
+	lex(LANG_SH, 0, "echo \"n=$(wc -l <\"$f\") \\$x\" 'raw $x' $'a\\tb'");
+	T("wc", TK_FUNCTION);
+	T("-l", TK_LANGCONST);
+	T("\\$", TK_ESCAPE);
+	T("'raw $x'", TK_STRING);
+	T("\\t", TK_ESCAPE);
+	lex(LANG_SH, 0, "n=$((a + 2 * $b))");
+	T("a", TK_VARIABLE);
+	T("2", TK_NUMBER);
+	T("$b", TK_VARIABLE);
+	T("+", TK_OPERATOR);
+	/* heredocs */
+	s = lex(LANG_SH, 0, "cat <<EOF > out.txt");
+	T("<<", TK_OPERATOR);
+	T("cat", TK_FUNCTION);
+	CHECK((s & 7) == 4);
+	u32 h = s;
+	s = lex(LANG_SH, h, "body $x line");
+	T("body $x line", TK_STRING);
+	CHECK(s == h);
+	s = lex(LANG_SH, h, "EOFX");
+	CHECK(s == h);
+	s = lex(LANG_SH, h, "EOF");
+	CHECK(s == 0);
+	s = lex(LANG_SH, 0, "\tcat <<-'END'");
+	CHECK((s & 7) == 4 && (s & 0x18) == 0x18);
+	s = lex(LANG_SH, s, "\t\tEND");
+	CHECK(s == 0);
+	/* strings spanning lines */
+	s = lex(LANG_SH, 0, "msg=\"first");
+	CHECK(s == 2);
+	s = lex(LANG_SH, s, "second $v\" ; ls");
+	T("second", TK_STRING);
+	T("$v", TK_VARIABLE);
+	T("ls", TK_FUNCTION);
+	CHECK(s == 0);
+	s = lex(LANG_SH, 0, "x='a");
+	CHECK(s == 1);
+	s = lex(LANG_SH, s, "b' # c");
+	T("b'", TK_STRING);
+	T("# c", TK_COMMENT);
+	CHECK(s == 0);
+	lex(LANG_SH, 0, "case \"$1\" in");
+	T("case", TK_CONTROL);
+	T("in", TK_CONTROL);
+	lex(LANG_SH, 0, "export PATH=/bin:$PATH; return 1");
+	T("export", TK_STORAGE);
+	T("PATH", TK_VARIABLE);
+	T("$PATH", TK_VARIABLE);
+	T("return", TK_CONTROL);
+	lex(LANG_SH, 0, "test \"x#y\" && true");
+	T("x#y", TK_STRING);
+	T("&&", TK_OPERATOR);
+	T("true", TK_FUNCTION);
+	(void)s;
+}
+
+static void test_perl(void)
+{
+	u32 s;
+	lex(LANG_PERL, 0, "use strict; my ($x, @y, %h) = (1_000, 0x1F, 0b101); # c");
+	T("use", TK_CONTROL);
+	T("my", TK_STORAGE);
+	T("$x", TK_VARIABLE);
+	T("@y", TK_VARIABLE);
+	T("%h", TK_VARIABLE);
+	T("1_000", TK_NUMBER);
+	T("0x1F", TK_NUMBER);
+	T("0b101", TK_NUMBER);
+	T("# c", TK_COMMENT);
+	lex(LANG_PERL, 0, "sub greet { print \"hi $name\\n\" if $#ARGV > 0; }");
+	T("sub", TK_STORAGE);
+	T("greet", TK_FUNCTION);
+	T("print", TK_FUNCTION);
+	T("\"hi ", TK_STRING);
+	T("$name", TK_VARIABLE);
+	T("\\n", TK_ESCAPE);
+	T("if", TK_CONTROL);
+	T("$#ARGV", TK_VARIABLE);
+	lex(LANG_PERL, 0, "$s =~ s{foo(\\d+)}{bar$1}gx; $t =~ tr/a-z/A-Z/;");
+	T("s{foo(", TK_REGEX);
+	T("\\d", TK_ESCAPE);
+	T("}{bar", TK_REGEX);
+	T("$1", TK_VARIABLE);
+	T("gx", TK_CONTROL);
+	T("tr/a-z/A-Z/", TK_REGEX);
+	T("=~", TK_OPERATOR);
+	lex(LANG_PERL, 0, "my @w = qw(a b c); my $q = q{it's {nested}}; if ($x =~ /^ab+c$/i) {}");
+	T("qw(a b c)", TK_STRING);
+	T("q{it's {nested}}", TK_STRING);
+	T("/^ab+c$/", TK_REGEX);
+	CHECK(map[strstr(cur_line, "/i)") - cur_line + 1] == TK_CONTROL);
+	lex(LANG_PERL, 0, "my $r = $a / $b / 2; my %h = (key => 1, s => 2, y => 3);");
+	TN(" / ", 0, TK_TEXT);
+	TN(" / ", 1, TK_TEXT);
+	T("key", TK_TEXT);
+	T(" s ", TK_TEXT);
+	T("=>", TK_OPERATOR);
+	lex(LANG_PERL, 0, "split /,/, $line; join ',', @list; $h{y} = 1; $_ = 3;");
+	T("split", TK_FUNCTION);
+	T("/,/", TK_REGEX);
+	T("',", TK_STRING);
+	T("{y}", TK_TEXT);
+	T("$_", TK_VARIABLE);
+	lex(LANG_PERL, 0, "package Foo::Bar; return __PACKAGE__ unless -e $f and not $g;");
+	T("package", TK_STORAGE);
+	T("Foo::Bar", TK_TYPE);
+	T("__PACKAGE__", TK_LANGCONST);
+	T("unless", TK_CONTROL);
+	T("-e", TK_OPERATOR);
+	T("and", TK_OPERATOR);
+	T("not", TK_OPERATOR);
+	/* POD */
+	s = lex(LANG_PERL, 0, "=head1 NAME");
+	T("=head1 NAME", TK_COMMENT);
+	CHECK(s == 1);
+	s = lex(LANG_PERL, s, "my $x = 1;");
+	T("my $x = 1;", TK_COMMENT);
+	s = lex(LANG_PERL, s, "=cut");
+	CHECK(s == 0);
+	/* multi-line strings and regexes */
+	s = lex(LANG_PERL, 0, "my $t = qq{a $x");
+	CHECK((s & 7) == 2);
+	s = lex(LANG_PERL, s, "  {b} c} . $y;");
+	T("{b} c}", TK_STRING);
+	T("$y", TK_VARIABLE);
+	CHECK(s == 0);
+	s = lex(LANG_PERL, 0, "$x =~ s{a}");
+	CHECK((s & 7) == 2);
+	s = lex(LANG_PERL, s, "  {b}g;");
+	T("{b}", TK_REGEX);
+	T("g", TK_CONTROL);
+	CHECK(s == 0);
+	/* heredocs */
+	s = lex(LANG_PERL, 0, "print <<\"EOT\", <<'RAW';");
+	T("<<\"EOT\"", TK_STRING);
+	CHECK((s & 7) == 3);
+	u32 h = s;
+	s = lex(LANG_PERL, h, "Hello $name");
+	T("Hello ", TK_STRING);
+	T("$name", TK_VARIABLE);
+	CHECK(s == h);
+	s = lex(LANG_PERL, h, "EOT");
+	CHECK(s == 0);
+	s = lex(LANG_PERL, 0, "my $t = <<~END;");
+	s = lex(LANG_PERL, s, "    indented");
+	s = lex(LANG_PERL, s, "    END");
+	CHECK(s == 0);
+	/* __END__ */
+	s = lex(LANG_PERL, 0, "__END__");
+	CHECK(s == 4);
+	s = lex(LANG_PERL, s, "some data $x");
+	T("some data $x", TK_TEXT);
+	CHECK(s == 4);
+}
+
+static void test_troff(void)
+{
+	u32 s;
+	lex(LANG_TROFF, 0, ".TH LS 1 \"2024-01-01\" \"GNU\"");
+	T(".TH", TK_CONTROL);
+	T("1", TK_NUMBER);
+	T("\"2024-01-01\"", TK_STRING);
+	lex(LANG_TROFF, 0, ".\\\" a comment");
+	T(".\\\" a comment", TK_COMMENT);
+	lex(LANG_TROFF, 0, ".SH DESCRIPTION");
+	T(".SH", TK_CONTROL);
+	T("DESCRIPTION", TK_HEADING);
+	lex(LANG_TROFF, 0, ".B bold words");
+	T("bold", TK_BOLD);
+	T("words", TK_BOLD);
+	lex(LANG_TROFF, 0, "Use \\fBls\\fR \\-l with \\*(lq quotes \\*[rq] and \\n(.l \\(em \\s+2big\\s0 \\\" note");
+	T("\\fB", TK_ESCAPE);
+	T("\\fR", TK_ESCAPE);
+	T("\\-", TK_ESCAPE);
+	T("\\*(lq", TK_VARIABLE);
+	T("\\*[rq]", TK_VARIABLE);
+	T("\\n(.l", TK_VARIABLE);
+	T("\\(em", TK_ESCAPE);
+	T("\\s+2", TK_ESCAPE);
+	T("\\s0", TK_ESCAPE);
+	T("\\\" note", TK_COMMENT);
+	T("ls", TK_TEXT);
+	lex(LANG_TROFF, 0, ".Op Fl a Ar file");
+	T(".Op", TK_CONTROL);
+	T("Fl", TK_STORAGE);
+	T("Ar", TK_STORAGE);
+	T("file", TK_TEXT);
+	lex(LANG_TROFF, 0, "'br");
+	T("'br", TK_CONTROL);
+	s = lex(LANG_TROFF, 0, ".ig");
+	CHECK(s == 1);
+	s = lex(LANG_TROFF, s, "ignored text");
+	T("ignored text", TK_COMMENT);
+	s = lex(LANG_TROFF, s, "..");
+	CHECK(s == 0);
+}
+
+static void test_md(void)
+{
+	u32 s;
+	lex(LANG_MARKDOWN, 0, "# Title *x*");
+	T("# Title *x*", TK_HEADING);
+	lex(LANG_MARKDOWN, 0, "Some **bold** and *it* and _it2_ and ~~gone~~ and `code` here.");
+	T("**bold**", TK_BOLD);
+	T("*it*", TK_ITALIC);
+	T("_it2_", TK_ITALIC);
+	T("~~gone~~", TK_STRIKE);
+	T("`code`", TK_RAW);
+	T("Some", TK_TEXT);
+	lex(LANG_MARKDOWN, 0, "snake_case_word stays and 2*3*4 too");
+	T("snake_case_word", TK_TEXT);
+	lex(LANG_MARKDOWN, 0, "- item [link](http://x.org \"t\") <b class=\"a\">x</b>");
+	T("-", TK_LIST);
+	T("link", TK_STRING);
+	T("http://x.org", TK_LINK);
+	T("<", TK_TAGPUNCT);
+	TN("b", 0, TK_TAG);
+	T("class", TK_ATTR);
+	T("\"a\"", TK_STRING);
+	lex(LANG_MARKDOWN, 0, "12. step see https://example.com/a.");
+	T("12.", TK_LIST);
+	T("https://example.com/a", TK_LINK);
+	lex(LANG_MARKDOWN, 0, "> quoted \\*not italic\\*");
+	T(">", TK_QUOTE);
+	T("\\*", TK_ESCAPE);
+	/* setext heading needs a paragraph above */
+	s = lex(LANG_MARKDOWN, 0, "Para text");
+	CHECK(s & (1u << 12));
+	lex(LANG_MARKDOWN, s, "=====");
+	T("=====", TK_HEADING);
+	lex(LANG_MARKDOWN, 0, "---");
+	T("---", TK_TEXT);
+	/* fenced code with an embedded lexer */
+	s = lex(LANG_MARKDOWN, 0, "```c");
+	CHECK((s & 3) == 1);
+	s = lex(LANG_MARKDOWN, s, "int x = 1; /* open");
+	T("int", TK_STORAGE);
+	T("1", TK_NUMBER);
+	CHECK((s & 3) == 1 && (s >> 12) != 0);
+	s = lex(LANG_MARKDOWN, s, "still comment */ return;");
+	T("still comment */", TK_COMMENT);
+	T("return", TK_CONTROL);
+	s = lex(LANG_MARKDOWN, s, "```");
+	CHECK(s == 0);
+	s = lex(LANG_MARKDOWN, 0, "~~~bash");
+	s = lex(LANG_MARKDOWN, s, "echo $HOME");
+	T("echo", TK_FUNCTION);
+	T("$HOME", TK_VARIABLE);
+	s = lex(LANG_MARKDOWN, s, "```");
+	CHECK((s & 3) == 1); /* a ``` does not close a ~~~ fence */
+	s = lex(LANG_MARKDOWN, s, "~~~~");
+	CHECK(s == 0);
+	s = lex(LANG_MARKDOWN, 0, "```unknownlang");
+	s = lex(LANG_MARKDOWN, s, "plain *stuff*");
+	T("plain *stuff*", TK_TEXT);
+	s = lex(LANG_MARKDOWN, s, "```");
+	/* html comments across lines */
+	s = lex(LANG_MARKDOWN, 0, "text <!-- hidden");
+	T("<!-- hidden", TK_COMMENT);
+	CHECK(s == 2);
+	s = lex(LANG_MARKDOWN, s, "more --> **after**");
+	T("more -->", TK_COMMENT);
+	T("**after**", TK_BOLD);
+	CHECK((s & 3) == 0);
+}
+
+static void test_detect2(void)
+{
+	const char *bang_sh = "#!/bin/sh\necho hi\n";
+	const char *bang_bash = "#!/usr/bin/env bash\nset -e\n";
+	const char *bang_env = "#!/usr/bin/env -S perl -w\n";
+	const char *bang_perl = "#!/usr/local/bin/perl5.36 -w\nuse strict;\n";
+	const char *bang_py = "#!/usr/bin/env python3\n";
+	CHECK(syn_lang_for_path("configure", bang_sh, strlen(bang_sh)) == LANG_SH);
+	CHECK(syn_lang_for_path("tools/run", bang_bash, strlen(bang_bash)) == LANG_SH);
+	CHECK(syn_lang_for_path("x", bang_env, strlen(bang_env)) == LANG_PERL);
+	CHECK(syn_lang_for_path("script", bang_perl, strlen(bang_perl)) == LANG_PERL);
+	CHECK(syn_lang_for_path("script", bang_py, strlen(bang_py)) == LANG_NONE);
+	CHECK(syn_lang_for_path("configure", NULL, 0) == LANG_NONE);
+	CHECK(syn_lang_for_path("a.sh", NULL, 0) == LANG_SH);
+	CHECK(syn_lang_for_path("a.bash", NULL, 0) == LANG_SH);
+	CHECK(syn_lang_for_path("/home/u/.bashrc", NULL, 0) == LANG_SH);
+	CHECK(syn_lang_for_path(".zshrc", NULL, 0) == LANG_SH);
+	CHECK(syn_lang_for_path("PKGBUILD", NULL, 0) == LANG_SH);
+	CHECK(syn_lang_for_path("README.md", NULL, 0) == LANG_MARKDOWN);
+	CHECK(syn_lang_for_path("x.markdown", NULL, 0) == LANG_MARKDOWN);
+	CHECK(syn_lang_for_path("lib/A.pm", NULL, 0) == LANG_PERL);
+	CHECK(syn_lang_for_path("a.pl", NULL, 0) == LANG_PERL);
+	CHECK(syn_lang_for_path("a.pod", NULL, 0) == LANG_PERL);
+	CHECK(syn_lang_for_path("t/basic.t", "use Test::More;\n", 16) == LANG_PERL);
+	const char *th = ".\\\" comment\n.TH X 1\n";
+	CHECK(syn_lang_for_path("x.t", th, strlen(th)) == LANG_TROFF);
+	CHECK(syn_lang_for_path("ls.1", NULL, 0) == LANG_TROFF);
+	CHECK(syn_lang_for_path("ssl.3ssl", NULL, 0) == LANG_TROFF);
+	CHECK(syn_lang_for_path("x.3p", NULL, 0) == LANG_TROFF);
+	CHECK(syn_lang_for_path("x.mdoc", NULL, 0) == LANG_TROFF);
+	CHECK(syn_lang_for_path("x.ms", NULL, 0) == LANG_TROFF);
+	CHECK(syn_lang_for_path("x.cgi", bang_sh, strlen(bang_sh)) == LANG_SH);
+	CHECK(syn_lang_for_path("x.cgi", NULL, 0) == LANG_PERL);
+	CHECK(syn_lang_for_path("x.c", bang_sh, strlen(bang_sh)) == LANG_C);
+	CHECK_STR(syn_lang_name(LANG_SH), "Shell Script");
+	CHECK_STR(syn_lang_name(LANG_TROFF), "Roff");
+	CHECK_STR(syn_lang_lsp_id(LANG_SH), "shellscript");
+	CHECK_STR(syn_lang_lsp_id(LANG_PERL), "perl");
+	CHECK(syn_lang_lsp_id(LANG_TROFF) == NULL);
+	CHECK_STR(syn_line_comment(LANG_TROFF), ".\\\"");
+	CHECK(syn_line_comment(LANG_MARKDOWN) == NULL);
+	CHECK_STR(syn_line_comment(LANG_PERL), "#");
+}
+
+static void bench2(int lang, const char *name, const char *const *lines, u32 nl)
+{
+	u32 sp_s[256], sp_l[256];
+	u8 sp_c[256];
+	SynSpans o = { sp_s, sp_l, sp_c, 0, 256 };
+	struct timespec t0, t1;
+	size_t bytes = 0;
+	u32 s = 0;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (u32 i = 0; i < 200000; i++) {
+		const char *l = lines[i % nl];
+		u32 n = (u32)strlen(l);
+		s = syn_line(lang, s, l, n, &o);
+		bytes += n + 1;
+	}
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	double sec = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) * 1e-9;
+	fprintf(stderr, "bench: %s lexer %.1f MB/s\n", name, (double)bytes / sec / 1e6);
+}
+
+static void bench_more(void)
+{
+	static const char *const sh[] = {"for f in *.c; do", "\tcc -O2 -c \"$f\" -o \"${f%.c}.o\" || exit 1",
+	                                 "done # build", "X=$(ls | wc -l); echo \"n=$X\""};
+	static const char *const pl[] = {"my ($a, $b) = @_;", "return $a =~ s/(\\d+)/<$1>/gr if $b;",
+	                                 "print join(', ', map { $_ * 2 } @list), \"\\n\";", "}"};
+	static const char *const md[] = {"## Heading", "Some **bold** text with `code` and [a link](http://x).",
+	                                 "- item *one*", ""};
+	bench2(LANG_SH, "sh", sh, 4);
+	bench2(LANG_PERL, "perl", pl, 4);
+	bench2(LANG_MARKDOWN, "markdown", md, 4);
+}
+
 static void bench(void)
 {
 	static const char *const lines[] = {
@@ -467,6 +861,12 @@ int main(void)
 	test_asm();
 	test_lisp();
 	test_detect();
+	test_sh();
+	test_perl();
+	test_troff();
+	test_md();
+	test_detect2();
 	bench();
+	bench_more();
 	return tap_done();
 }

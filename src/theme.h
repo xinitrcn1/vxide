@@ -103,6 +103,7 @@ enum {
 	C_DESCRIPTION_FG,
 	C_DIFF_INSERTED,
 	C_DIFF_REMOVED,
+	C_CODELENS,
 	C_COUNT_
 };
 
@@ -113,5 +114,9 @@ typedef struct {
 } Theme;
 
 extern const Theme themes[THEME_COUNT];
+
+/* Font style per token class, from the themes' fontStyle (same in both). */
+enum { TS_BOLD = 1, TS_ITALIC = 2, TS_STRIKE = 4, TS_UNDERLINE = 8 };
+extern const u8 tk_style[TK_COUNT];
 
 #endif
