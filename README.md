@@ -128,6 +128,15 @@ DejaVu Sans Mono for code, with DejaVu Sans as the fallback.
   marks in the overview ruler. "Profile: Go to Next / Previous Hot Line"
   walks them; "Profile: Annotate Source with Profile..." picks the
   profile; "Profile: Open Raw Report" shows gprof's or gcov's own text.
+- **Profiling** (FreeBSD): a top-level tab for hardware counters through
+  hwpmc and pmcstat(8). It checks pmcstat first and, when the counters
+  cannot be used, shows how to enable them (kldload hwpmc, loader.conf,
+  security.bsd.unprivileged_proc_debug). Events from `pmcstat -L` are
+  listed with a filter and toggles; a program runs with its arguments in
+  the project's folder. Count mode shows the totals (and instructions per
+  cycle); Sample mode records callchains and opens them as a profile
+  (flame graph, callers, hot lines with source heat). `VXIDE_PMCSTAT`
+  picks another pmcstat.
 - **Markdown preview**: Markdown tabs have Edit and Preview subtabs
   (Ctrl+Shift+V): headings, emphasis, code (highlighted by the fence's
   language), lists and task lists, quotes, tables, links (anchors, files,
