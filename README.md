@@ -40,7 +40,10 @@ DejaVu Sans Mono for code, with DejaVu Sans as the fallback.
   Intel/NASM, detected from the file head), Lisp (CL, Scheme, Elisp,
   Clojure), shell (sh/bash/zsh, heredocs), Markdown (with fenced code
   highlighted in its own language), troff/man/mdoc and Perl (POD, `s{}{}`,
-  regexes, heredocs). Languages are also detected from shebangs. They were checked against VSCodium's own `c.tmLanguage.json`
+  regexes, heredocs), CMake, Make (BSD and GNU; recipe lines highlighted as
+  shell), JSON / JSON with Comments, ignore files (.gitignore and friends),
+  diff/patch, git commit messages and git-rebase-todo. Languages are also
+  detected from shebangs and file heads. They were checked against VSCodium's own `c.tmLanguage.json`
   scopes and the Dark+/Light+ rules. When clangd is running, its semantic
   tokens are overlaid the way the clangd extension does it (readonly
   variables as constants, macros, parameters, ...).
@@ -64,15 +67,40 @@ DejaVu Sans Mono for code, with DejaVu Sans as the fallback.
   `(?i)`, `\Q..\E`, `\x{..}`. Lookaround and backreferences are
   rejected with RE2's messages. `^`/`$` match per line, and matches cross
   line ends only when the pattern contains `\n` (as in VSCodium).
-  Replacements take `$1`, `${1}`, `$name`, `$&`, `$$`, `\n`, `\t` and
+  Replacements take `$0`/`$&` (whole match), `$1`, `${1}`, `$name`, `$$`, `\n`, `\t` and
   the case operators `\u \l \U \L \E`. On this host the DFA scans
   about 540 MB/s; `(a+)+b` over 100k characters takes 0.3 ms.
+- **Search** skips git-ignored files (search.useIgnoreFiles), also when
+  the project is a subfolder of the repository; files in results, Quick
+  Open, tabs and the explorer carry their git colour (yellow modified,
+  green untracked/added, red deleted, grey ignored).
 - **Git blame** on the cursor line, on by default (VSCodium's
   `git.blame.editorDecoration`): `summary, author (3 days ago)`, or
   "Not Committed Yet" for edited lines. A worker thread runs
   `git blame --incremental --contents <buffer snapshot>`; libgit2 is the
   fallback without a git binary (much slower on long histories). Toggle it
-  with "Git: Toggle Git Blame Editor Decoration".
+  with "Git: Toggle Git Blame Editor Decoration". Hovering the blame text
+  shows the commit: author, relative and absolute date, the full message,
+  hash and change stats.
+- **Source Control graph** (VSCodium's scm.graph): a GRAPH section with
+  square lanes and commit markers (hollow for HEAD, ringed for merges),
+  branch/tag badges, a hover card per commit, click to list a commit's
+  files, click a file to open its diff, double click to open the whole
+  commit. Right click: checkout (detached), create branch/tag, cherry pick,
+  copy id/message.
+- **Git actions** from the view's "..." menu and the palette, run
+  asynchronously with output in Output > Git: pull/push/fetch/sync
+  (prune, rebase, force with lease), publish, checkout, create/rename/delete
+  branch, merge, rebase (continue/abort), abort merge, stash (include
+  untracked, apply/pop/drop latest or picked), tags, commit all/amend, undo
+  last commit, unstage/discard all. Rebase/merge in progress shows in the
+  view. "Git: Open Changes" shows a file's diff read-only.
+- **Context menus** (right click): editor (go to definition, declaration,
+  type definition, references, find all references, change all occurrences,
+  cut/copy/paste, toggle comment, command palette), explorer, tabs, Source
+  Control files and graph rows.
+- **Mouse cursors**: I-beam over text and inputs, a hand on Ctrl+hover
+  (go to definition), resize arrows on the sashes.
 - **Git**: branch and ahead/behind in the status bar, explorer
   decorations (M/U/A/D colours, folder dots, ignored files greyed out),
   quick-diff gutter against the index, and a Source Control view with
@@ -102,8 +130,12 @@ DejaVu Sans Mono for code, with DejaVu Sans as the fallback.
 | Ctrl+F, Ctrl+H, F3, Shift+F3 | Find, replace, next, previous (Alt+C case, Alt+W word, Alt+R regex) |
 | Enter / Ctrl+Alt+Enter in replace | Replace one / replace all |
 | Ctrl+Shift+H, Ctrl+Shift+J, F4/Shift+F4 | Replace in files, include/exclude globs, next/previous result |
-| Ctrl+D, Ctrl+Shift+L | Add next occurrence, select all occurrences |
-| Shift+Alt+Up/Down, Alt+click | Add cursor above/below, add cursor |
+| Ctrl+D, Ctrl+K Ctrl+D, Ctrl+Shift+L, Ctrl+F2 | Add next occurrence, move last selection to next, select / change all occurrences |
+| Shift+Alt+Up/Down, Ctrl+Shift+Up/Down, Alt+click | Add cursor above/below, add cursor |
+| Shift+Alt+I, Ctrl+U | Cursors at the ends of the selected lines, cursor undo |
+| Shift+Alt+drag, middle drag, Ctrl+Shift+Alt+arrows/PgUp/PgDn | Column (box) selection |
+| Shift+F12, Shift+Alt+F12 | Go to references, find all references |
+| Ctrl+Alt+C, Ctrl+Shift+Alt+C | Copy path, copy relative path |
 | Alt+Up/Down, Ctrl+Shift+Alt+Up/Down | Move line, copy line |
 | Ctrl+Shift+K, Ctrl+Enter, Ctrl+Shift+Enter | Delete line, insert line below/above |
 | Ctrl+/, Ctrl+], Ctrl+[ | Toggle comment, indent, outdent |
@@ -130,6 +162,9 @@ one quad buffer.
 | `src/syntax.c` | Line lexers with a per-line state, cached per document |
 | `src/regex.c` | RE2-style regex: byte program, lazy DFA, Pike VM, replacement expansion |
 | `src/blame.c` | Inline blame worker thread (git CLI, libgit2 fallback) |
+| `src/gitgraph.c`, `src/gitops.c` | Commit graph lanes, commit details; async git runner and queries |
+| `src/gitui.c` | Graph section, git actions, hover cards, diff documents |
+| `src/menu.c`, `src/actions.c` | Context menus, picker, references, multi-cursor and path actions |
 | `src/lsp.c`, `src/json.c` | LSP client over pipes (non-blocking), jsmn-style token table |
 | `src/git.c` | libgit2: status table, index ops, commit, quick diff |
 | `src/fstree.c`, `src/search.c` | Explorer tree, file walk, fuzzy match, text search |

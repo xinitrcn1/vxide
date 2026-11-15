@@ -12,13 +12,14 @@
 #include "theme.h"
 #include "draw.h"
 #include "font.h"
+#include "menu.h"
 
 /* ---- input ------------------------------------------------------------ */
 
 enum { MOD_CTRL = 1, MOD_SHIFT = 2, MOD_ALT = 4, MOD_SUPER = 8 };
 enum { EV_KEY, EV_TEXT, EV_MDOWN, EV_MUP, EV_MMOVE, EV_WHEEL, EV_RESIZE, EV_FOCUS, EV_QUIT };
 
-typedef struct {
+typedef struct Event {
 	int type;
 	u32 key; /* SDL keycode */
 	int mods;
@@ -39,6 +40,7 @@ typedef struct {
 	u8 lang[MAX_DOCS];
 	u8 untitled[MAX_DOCS];
 	u8 tabs[MAX_DOCS]; /* indentation uses tabs (detected) */
+	u8 readonly[MAX_DOCS]; /* virtual documents (diffs, commits) */
 	u32 refs[MAX_DOCS]; /* views showing it */
 
 	/* highlighter: lexer state at the start of each line */
@@ -113,7 +115,10 @@ enum {
 	FOCUS_SEARCH_INPUT,
 	FOCUS_SCM_INPUT,
 };
-enum { QUICK_NONE, QUICK_FILES, QUICK_COMMANDS, QUICK_GOTO_LINE, QUICK_PROMPT, QUICK_CONFIRM };
+enum { QUICK_NONE, QUICK_FILES, QUICK_COMMANDS, QUICK_GOTO_LINE, QUICK_PROMPT, QUICK_CONFIRM, QUICK_PICK };
+
+/* Mouse cursor shapes (main.c maps them to SDL system cursors). */
+enum { CURSOR_ARROW, CURSOR_IBEAM, CURSOR_HAND, CURSOR_EW, CURSOR_NS };
 
 /* Single-line text input (find box, quick input, search, commit message
  * is multi-line but uses the same storage). */
@@ -185,6 +190,10 @@ typedef struct {
 	u32 blame_gen;  /* bumps on every git refresh (HEAD may move) */
 	u32 blame_doc, blame_key;
 	bool blame_asked;
+	bool blame_hover; /* mouse rests on the inline blame text */
+	char blame_hover_hash[41];
+	int blame_hover_x, blame_hover_y;
+	u64 blame_hover_t;
 	Input commit_in;
 	i32 scm_scroll;
 	u32 scm_sel;
@@ -257,6 +266,26 @@ typedef struct {
 	/* chord prefix (Ctrl+K) */
 	bool chord;
 
+	/* context menu target */
+	int ctx;
+	u32 ctx_a, ctx_b, ctx_off;
+	char ctx_path[4096];
+
+	/* generic picker (QUICK_PICK): label / description / value per item */
+	int pick_kind;
+	Pool pick_pool;
+	u32 *pick_label, *pick_desc, *pick_val;
+	u32 pick_n, pick_cap;
+	i32 refs_req, decl_req;
+
+	/* mouse cursor shape wanted by the UI */
+	int cursor;
+
+	/* cursor history for Ctrl+U (cursorUndo) */
+	u32 ch_doc[32], ch_nc[32];
+	u32 *ch_head[32], *ch_anchor[32];
+	u32 ch_n;
+
 	/* clipboard fallback when there is no window (headless runs) */
 	char *clip;
 	bool clip_whole_line;
@@ -318,6 +347,8 @@ u32 ed_line_col_to_off(Text *t, u32 line, u32 col);
 void ed_lex_until(u32 d, u32 line);
 int ed_gutter_w(View *v);
 void ed_insert_text(View *v, const char *s, size_t n, u8 kind);
+u32 ed_offset_at(View *v, int mx, int my, int x, int y);
+int ed_cursor_shape(View *v, int mx, int my, int x, int y, int w, int h, int mods);
 u32 blame_key_of(u32 d);
 const char *doc_repo_rel(u32 d);
 bool ed_command(View *v, int cmd);
@@ -348,6 +379,21 @@ bool input_key(Input *in, const Event *e); /* edit keys; false if unhandled */
 void input_text(Input *in, const char *s, size_t n);
 void input_draw(Input *in, int x, int y, int w, int h, const char *placeholder, bool focused);
 void input_click(Input *in, int font, int x0, int mx);
+
+/* actions.c: context menus, picker results, the commands below CMD_QUIT */
+void ctx_menu_editor(View *v, int x, int y, u32 off);
+void ctx_menu_explorer(int x, int y, u32 node);
+void ctx_menu_tab(int x, int y, u32 group, u32 tab);
+void ctx_menu_scm_file(int x, int y, const char *repo_rel, bool staged);
+void ctx_menu_scm_title(int x, int y);
+bool actions_command(int cmd); /* true when handled */
+void pick_begin(int kind, const char *title, const char *placeholder);
+void pick_add(const char *label, const char *desc, u32 val);
+void pick_show(void);
+void pick_accept(int kind, u32 item);
+void actions_take_locations(const LspEvent *ev);
+void cursor_history_push(View *v);
+u32 doc_new_virtual(const char *name, const char *text, size_t n, int lang);
 
 /* commands */
 enum {
@@ -425,6 +471,71 @@ enum {
 	CMD_REVEAL_IN_EXPLORER,
 	CMD_RESTART_LSP,
 	CMD_QUIT,
+	CMD_GOTO_DECLARATION,
+	CMD_GOTO_TYPE_DEFINITION,
+	CMD_GOTO_REFERENCES,
+	CMD_FIND_ALL_REFERENCES,
+	CMD_CHANGE_ALL_OCCURRENCES,
+	CMD_CURSOR_UNDO,
+	CMD_CURSORS_LINE_ENDS,
+	CMD_MOVE_SEL_NEXT_MATCH,
+	CMD_COLUMN_SELECT_LEFT,
+	CMD_COLUMN_SELECT_RIGHT,
+	CMD_COLUMN_SELECT_UP,
+	CMD_COLUMN_SELECT_DOWN,
+	CMD_COPY_PATH,
+	CMD_COPY_REL_PATH,
+	CMD_EXPLORER_NEW_FILE,
+	CMD_EXPLORER_NEW_FOLDER,
+	CMD_EXPLORER_RENAME,
+	CMD_EXPLORER_DELETE,
+	CMD_CLOSE_OTHERS,
+	CMD_CLOSE_RIGHT,
+	CMD_SCM_OPEN_CHANGES,
+	CMD_SCM_OPEN_FILE,
+	CMD_SCM_STAGE,
+	CMD_SCM_UNSTAGE,
+	CMD_SCM_DISCARD,
+	CMD_SCM_MENU,
+	CMD_GIT_UNSTAGE_ALL,
+	CMD_GIT_DISCARD_ALL,
+	CMD_GIT_COMMIT_ALL,
+	CMD_GIT_COMMIT_AMEND,
+	CMD_GIT_UNDO_COMMIT,
+	CMD_GIT_FETCH,
+	CMD_GIT_FETCH_PRUNE,
+	CMD_GIT_PULL,
+	CMD_GIT_PULL_REBASE,
+	CMD_GIT_PUSH,
+	CMD_GIT_PUSH_FORCE,
+	CMD_GIT_SYNC,
+	CMD_GIT_PUBLISH,
+	CMD_GIT_CHECKOUT,
+	CMD_GIT_CREATE_BRANCH,
+	CMD_GIT_CREATE_BRANCH_FROM,
+	CMD_GIT_RENAME_BRANCH,
+	CMD_GIT_DELETE_BRANCH,
+	CMD_GIT_MERGE,
+	CMD_GIT_REBASE,
+	CMD_GIT_REBASE_CONTINUE,
+	CMD_GIT_REBASE_ABORT,
+	CMD_GIT_MERGE_ABORT,
+	CMD_GIT_STASH,
+	CMD_GIT_STASH_UNTRACKED,
+	CMD_GIT_STASH_APPLY_LATEST,
+	CMD_GIT_STASH_APPLY,
+	CMD_GIT_STASH_POP_LATEST,
+	CMD_GIT_STASH_POP,
+	CMD_GIT_STASH_DROP,
+	CMD_GIT_CREATE_TAG,
+	CMD_GIT_DELETE_TAG,
+	CMD_GRAPH_CHECKOUT,
+	CMD_GRAPH_CREATE_BRANCH,
+	CMD_GRAPH_CHERRY_PICK,
+	CMD_GRAPH_COPY_ID,
+	CMD_GRAPH_COPY_MESSAGE,
+	CMD_GRAPH_OPEN_COMMIT,
+	CMD_GIT_SHOW_OUTPUT,
 	CMD_COUNT
 };
 

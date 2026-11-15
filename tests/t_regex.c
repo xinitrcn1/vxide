@@ -117,6 +117,7 @@ int main(void)
 	/* replacement */
 	CHECK_STR(rep("(\\w+)-(\\w+)", "foo-bar", "$2_$1"), "bar_foo");
 	CHECK_STR(rep("b+", "abbbc", "[$&]$$"), "[bbb]$");
+	CHECK_STR(rep("(b)+", "abbbc", "<$0|$1>"), "<bbb|b>"); /* $0 is the whole match */
 	CHECK_STR(rep("(\\w+)", "word", "\\u$1 \\U$1\\E!"), "Word WORD!");
 	CHECK_STR(rep("(?P<x>a)", "a", "<${x}$x>\\n"), "<aa>\n");
 	CHECK_STR(rep("a", "a", "$9"), "$9");

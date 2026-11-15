@@ -107,7 +107,7 @@ u32 doc_open(const char *abs)
 	/* reuse a free slot */
 	u32 d = UINT32_MAX;
 	for (u32 i = 0; i < D->n; i++)
-		if (!D->path[i] && !D->untitled[i]) {
+		if (!D->path[i] && !D->untitled[i] && !D->readonly[i] && !D->refs[i]) {
 			d = i;
 			break;
 		}
@@ -196,6 +196,7 @@ void doc_release(u32 d)
 	D->path[d] = NULL;
 	D->rel[d] = NULL;
 	D->untitled[d] = 0;
+	D->readonly[d] = 0;
 	D->dn[d] = D->sn[d] = D->gm_n[d] = 0;
 	pool_clear(&D->d_pool[d]);
 }
@@ -208,6 +209,8 @@ static void git_marks_due(u32 d, u64 delay)
 bool doc_save(u32 d)
 {
 	Docs *D = &app.docs;
+	if (D->readonly[d])
+		return false;
 	if (D->untitled[d]) {
 		/* Save As: prompt for a path relative to the project. */
 		app.quick = QUICK_PROMPT;
@@ -284,6 +287,10 @@ void doc_replace(u32 d, u32 pos, u32 del, const char *ins, u32 nins, u32 group)
 {
 	Docs *D = &app.docs;
 	Text *t = &D->text[d];
+	if (D->readonly[d]) {
+		ui_status("Cannot edit in read-only editor");
+		return;
+	}
 	if (pos > t->len)
 		pos = t->len;
 	if (pos + del > t->len)
@@ -411,6 +418,13 @@ static void remember_position(void)
 	View *v = active_view();
 	if (v)
 		nav_push(v->doc, v->head[0]);
+}
+
+static u32 show_doc(u32 d, bool preview);
+void show_doc_public(u32 d)
+{
+	show_doc(d, false);
+	app.focus = FOCUS_EDITOR;
 }
 
 static u32 show_doc(u32 d, bool preview)
@@ -610,6 +624,20 @@ static const Binding bindings[] = {
     {C, SDLK_I, W_EDITOR, CMD_SHOW_HOVER, 1},
     {C, SDLK_T, W_ANY, CMD_TOGGLE_THEME, 1},
     {C, SDLK_Q, W_ANY, CMD_QUIT, 0},
+    {S, SDLK_F12, W_EDITOR, CMD_GOTO_REFERENCES, 0},
+    {S | A, SDLK_F12, W_EDITOR, CMD_FIND_ALL_REFERENCES, 0},
+    {C, SDLK_F2, W_EDITOR, CMD_CHANGE_ALL_OCCURRENCES, 0},
+    {C, SDLK_U, W_EDITOR, CMD_CURSOR_UNDO, 0},
+    {S | A, SDLK_I, W_EDITOR, CMD_CURSORS_LINE_ENDS, 0},
+    {C, SDLK_D, W_EDITOR, CMD_MOVE_SEL_NEXT_MATCH, 1},
+    {C | S, SDLK_UP, W_EDITOR, CMD_CURSOR_ABOVE, 0},
+    {C | S, SDLK_DOWN, W_EDITOR, CMD_CURSOR_BELOW, 0},
+    {C | S | A, SDLK_LEFT, W_EDITOR, CMD_COLUMN_SELECT_LEFT, 0},
+    {C | S | A, SDLK_RIGHT, W_EDITOR, CMD_COLUMN_SELECT_RIGHT, 0},
+    {C | S | A, SDLK_PAGEUP, W_EDITOR, CMD_COLUMN_SELECT_UP, 0},
+    {C | S | A, SDLK_PAGEDOWN, W_EDITOR, CMD_COLUMN_SELECT_DOWN, 0},
+    {C | A, SDLK_C, W_NOT_INPUT, CMD_COPY_PATH, 0},
+    {C | S | A, SDLK_C, W_NOT_INPUT, CMD_COPY_REL_PATH, 0},
 };
 #undef C
 #undef S
@@ -689,6 +717,56 @@ static const char *cmd_titles[CMD_COUNT] = {
     [CMD_REVEAL_IN_EXPLORER] = "File: Reveal Active File in Explorer View",
     [CMD_RESTART_LSP] = "clangd: Restart language server",
     [CMD_QUIT] = "File: Exit",
+    [CMD_GOTO_DECLARATION] = "Go to Declaration",
+    [CMD_GOTO_TYPE_DEFINITION] = "Go to Type Definition",
+    [CMD_GOTO_REFERENCES] = "Go to References",
+    [CMD_FIND_ALL_REFERENCES] = "References: Find All References",
+    [CMD_CHANGE_ALL_OCCURRENCES] = "Change All Occurrences",
+    [CMD_CURSOR_UNDO] = "Cursor Undo",
+    [CMD_CURSORS_LINE_ENDS] = "Add Cursors to Line Ends",
+    [CMD_MOVE_SEL_NEXT_MATCH] = "Move Last Selection to Next Find Match",
+    [CMD_COLUMN_SELECT_LEFT] = "Column Select Left",
+    [CMD_COLUMN_SELECT_RIGHT] = "Column Select Right",
+    [CMD_COLUMN_SELECT_UP] = "Column Select Page Up",
+    [CMD_COLUMN_SELECT_DOWN] = "Column Select Page Down",
+    [CMD_COPY_PATH] = "File: Copy Path of Active File",
+    [CMD_COPY_REL_PATH] = "File: Copy Relative Path of Active File",
+    [CMD_CLOSE_OTHERS] = "View: Close Other Editors in Group",
+    [CMD_CLOSE_RIGHT] = "View: Close Editors to the Right in Group",
+    [CMD_GIT_UNSTAGE_ALL] = "Git: Unstage All Changes",
+    [CMD_GIT_DISCARD_ALL] = "Git: Discard All Changes",
+    [CMD_GIT_COMMIT_ALL] = "Git: Commit All",
+    [CMD_GIT_COMMIT_AMEND] = "Git: Commit Staged (Amend)",
+    [CMD_GIT_UNDO_COMMIT] = "Git: Undo Last Commit",
+    [CMD_GIT_FETCH] = "Git: Fetch",
+    [CMD_GIT_FETCH_PRUNE] = "Git: Fetch (Prune)",
+    [CMD_GIT_PULL] = "Git: Pull",
+    [CMD_GIT_PULL_REBASE] = "Git: Pull (Rebase)",
+    [CMD_GIT_PUSH] = "Git: Push",
+    [CMD_GIT_PUSH_FORCE] = "Git: Push (Force With Lease)",
+    [CMD_GIT_SYNC] = "Git: Sync",
+    [CMD_GIT_PUBLISH] = "Git: Publish Branch...",
+    [CMD_GIT_CHECKOUT] = "Git: Checkout to...",
+    [CMD_GIT_CREATE_BRANCH] = "Git: Create Branch...",
+    [CMD_GIT_CREATE_BRANCH_FROM] = "Git: Create Branch From...",
+    [CMD_GIT_RENAME_BRANCH] = "Git: Rename Branch...",
+    [CMD_GIT_DELETE_BRANCH] = "Git: Delete Branch...",
+    [CMD_GIT_MERGE] = "Git: Merge...",
+    [CMD_GIT_REBASE] = "Git: Rebase Branch...",
+    [CMD_GIT_REBASE_CONTINUE] = "Git: Continue Rebase",
+    [CMD_GIT_REBASE_ABORT] = "Git: Abort Rebase",
+    [CMD_GIT_MERGE_ABORT] = "Git: Abort Merge",
+    [CMD_GIT_STASH] = "Git: Stash",
+    [CMD_GIT_STASH_UNTRACKED] = "Git: Stash (Include Untracked)",
+    [CMD_GIT_STASH_APPLY_LATEST] = "Git: Apply Latest Stash",
+    [CMD_GIT_STASH_APPLY] = "Git: Apply Stash...",
+    [CMD_GIT_STASH_POP_LATEST] = "Git: Pop Latest Stash",
+    [CMD_GIT_STASH_POP] = "Git: Pop Stash...",
+    [CMD_GIT_STASH_DROP] = "Git: Drop Stash...",
+    [CMD_GIT_CREATE_TAG] = "Git: Create Tag",
+    [CMD_GIT_DELETE_TAG] = "Git: Delete Tag...",
+    [CMD_GIT_SHOW_OUTPUT] = "Git: Show Git Output",
+    [CMD_SCM_OPEN_CHANGES] = "Git: Open Changes",
 };
 
 const char *command_title(int cmd) { return cmd_titles[cmd] ? cmd_titles[cmd] : ""; }
@@ -726,10 +804,21 @@ static void quick_close(void)
 	app.dirty = true;
 }
 
+/* files.exclude + .gitignore (search.useIgnoreFiles): the walk passes
+ * paths relative to the project root, git wants them relative to the
+ * work tree, which may be an ancestor of the root. */
 static bool skip_ignored(void *ctx, const char *rel, bool dir)
 {
 	Git *g = ctx;
-	return g && (git_path_flags(g, rel) & GS_IGNORED);
+	if (!g)
+		return false;
+	char abs[8192];
+	snprintf(abs, sizeof abs, "%s/%s", app.root, rel);
+	const char *wd = git_workdir(g);
+	size_t wl = strlen(wd);
+	if (strncmp(abs, wd, wl) != 0)
+		return false;
+	return git_path_flags(g, abs + wl) & GS_IGNORED;
 }
 
 static void ensure_files(void);
@@ -797,6 +886,27 @@ static void quick_update(void)
 		else
 			app.quick = QUICK_FILES;
 	}
+	if (app.quick == QUICK_PICK) {
+		quick_reserve(app.pick_n + 1);
+		u32 n = 0;
+		for (u32 i = 0; i < app.pick_n; i++) {
+			const char *l = app.pick_pool.b + app.pick_label[i];
+			u64 m = 0;
+			int sc = in->n ? fuzzy_score(in->b, in->n, l, strlen(l), &m) : 0;
+			if (sc < 0) {
+				const char *d = app.pick_pool.b + app.pick_desc[i];
+				if (fuzzy_score(in->b, in->n, d, strlen(d), &m) < 0)
+					continue;
+				m = 0;
+			}
+			app.quick_items[n] = i;
+			app.quick_mask[n] = m;
+			n++;
+		}
+		app.quick_n = n;
+		app.dirty = true;
+		return;
+	}
 	if (app.quick == QUICK_COMMANDS) {
 		const char *q = in->b + 1;
 		u32 nq = in->n - 1;
@@ -809,8 +919,8 @@ static void quick_update(void)
 		u32 n = 0;
 		int *score = vx_alloc(CMD_COUNT * sizeof(int));
 		for (int c = 1; c < CMD_COUNT; c++) {
-			if (c == CMD_COMMANDS || c == CMD_QUICK_OPEN)
-				continue;
+			if (c == CMD_COMMANDS || c == CMD_QUICK_OPEN || !cmd_titles[c])
+				continue; /* context-menu-only commands have no palette title */
 			u64 m;
 			const char *t = command_title(c);
 			int s = fuzzy_score(q, nq, t, strlen(t), &m);
@@ -902,6 +1012,15 @@ static void quick_update(void)
 	app.dirty = true;
 }
 
+void quick_show_pick(void)
+{
+	app.quick = QUICK_PICK;
+	app.focus = FOCUS_QUICK;
+	input_set(&app.quick_in, "", 0);
+	app.compl_open = app.hover_open = false;
+	quick_update();
+}
+
 static void quick_open(int kind, const char *initial)
 {
 	app.quick = kind;
@@ -935,6 +1054,15 @@ static void quick_accept(void)
 			ed_set_cursor(v, off, false);
 			ed_reveal(v, off, true);
 		}
+		return;
+	}
+	if ((kind == QUICK_PROMPT || kind == QUICK_CONFIRM) && app.quick_prompt_kind >= 100) {
+		extern void gitui_prompt_accept(int kind, const char *text);
+		char *s = vx_strndup(in->b ? in->b : "", in->n);
+		int pk = app.quick_prompt_kind;
+		quick_close();
+		gitui_prompt_accept(pk, s);
+		free(s);
 		return;
 	}
 	if (kind == QUICK_PROMPT) {
@@ -1061,7 +1189,9 @@ static void quick_accept(void)
 	}
 	u32 item = app.quick_items[app.quick_sel];
 	quick_close();
-	if (kind == QUICK_COMMANDS) {
+	if (kind == QUICK_PICK) {
+		pick_accept(app.pick_kind, item);
+	} else if (kind == QUICK_COMMANDS) {
 		run_command((int)item);
 	} else if (item & 0x80000000u) {
 		u32 d = item & 0x7FFFFFFFu;
@@ -1125,7 +1255,7 @@ static void quick_draw(void)
 	int ih = PX(26);
 	int rh = PX(22);
 	u32 maxrows = 16;
-	bool listing = app.quick == QUICK_FILES || app.quick == QUICK_COMMANDS;
+	bool listing = app.quick == QUICK_FILES || app.quick == QUICK_COMMANDS || app.quick == QUICK_PICK;
 	if (app.quick == QUICK_CONFIRM)
 		ih = -pad;
 	u32 rows = listing ? VX_MIN(app.quick_n, maxrows) : 0;
@@ -1143,7 +1273,8 @@ static void quick_draw(void)
 		          app.quick_title, strlen(app.quick_title), COL(C_QUICK_FG));
 		cy += title_h;
 	}
-	const char *ph = app.quick == QUICK_FILES     ? "Search files by name (append : to go to line)"
+	const char *ph = app.quick == QUICK_PICK ? "Type to filter"
+	                 : app.quick == QUICK_FILES     ? "Search files by name (append : to go to line)"
 	                 : app.quick == QUICK_GOTO_LINE ? ""
 	                 : app.quick == QUICK_CONFIRM   ? ""
 	                                                : "";
@@ -1190,7 +1321,19 @@ static void quick_draw(void)
 		u32 item = app.quick_items[i];
 		u64 mask = app.quick_mask[i];
 		int tx = x + pad + PX(6);
-		if (app.quick == QUICK_COMMANDS) {
+		if (app.quick == QUICK_PICK) {
+			const char *t = app.pick_pool.b + app.pick_label[item];
+			const char *d = app.pick_pool.b + app.pick_desc[item];
+			size_t n = strlen(t);
+			int dw = *d ? font_width(FONT_UI, d, strlen(d)) + PX(16) : 0;
+			int room = x + w - pad - PX(8) - tx - VX_MIN(dw, w / 2);
+			for (size_t k = 0; k < n && tx < x + pad + room; k++) {
+				bool hl = k < 63 && ((mask >> k) & 1);
+				tx = draw_text(hl ? FONT_UI_BOLD : FONT_UI, tx, ty, t + k, 1, hl ? COL(C_QUICK_HIGHLIGHT) : fg);
+			}
+			if (*d)
+				draw_text_fit(FONT_UI, tx + PX(10), ty, d, strlen(d), x + w - pad - PX(8) - tx - PX(10), COL(C_DESCRIPTION_FG));
+		} else if (app.quick == QUICK_COMMANDS) {
 			const char *t = command_title((int)item);
 			size_t n = strlen(t);
 			for (size_t k = 0; k < n; k++) {
@@ -1219,6 +1362,14 @@ static void quick_draw(void)
 			}
 			tx = file_icon_draw(base, tx, ry, rh);
 			bool path_mask = (mask >> 63) & 1;
+			{
+				/* git decoration colour, like the explorer */
+				char letter;
+				bool has;
+				u32 gc = path_git_color(path, &letter, &has);
+				if (has && !sel)
+					fg = gc;
+			}
 			size_t bn = strlen(base);
 			size_t off = (size_t)(base - path);
 			for (size_t k = 0; k < bn; k++) {
@@ -1343,6 +1494,13 @@ void run_command(int cmd)
 	app.dirty = true;
 	if (v && ed_command(v, cmd))
 		return;
+	if (actions_command(cmd))
+		return;
+	{
+		extern bool gitui_command(int cmd);
+		if (gitui_command(cmd))
+			return;
+	}
 	switch (cmd) {
 	case CMD_QUICK_OPEN:
 		quick_open(QUICK_FILES, "");
@@ -1659,6 +1817,8 @@ static bool try_bindings(const Event *e)
 			continue;
 		if (b->when == W_EDITOR && app.focus != FOCUS_EDITOR)
 			continue;
+		if (b->when == W_NOT_INPUT && focus_is_input())
+			continue;
 		/* inputs keep their own editing keys */
 		if (focus_is_input() && b->when != W_EDITOR &&
 		    (b->cmd == CMD_UNDO || b->cmd == CMD_SELECT_ALL))
@@ -1699,12 +1859,113 @@ static void panel_area(int *x, int *y, int *w, int *h)
 }
 
 static bool tabs_mouse(Group *g, u32 gi, const Event *e);
+static int tab_width(View *v);
+static int tabs_scroll_for(Group *g);
+
+/* Right click: a context menu for whatever is under the mouse. */
+static void context_click(int mx, int my)
+{
+	app.compl_open = app.hover_open = false;
+	if (my >= app.h - app.status_h || mx < app.act_w)
+		return;
+	if (app.side_visible && mx < app.side_x + app.side_w) {
+		int x = app.side_x, w = app.side_w, h = app.h - app.status_h;
+		if (app.side_view == SIDE_EXPLORER) {
+			int cy = PX(35) + PX(22);
+			u32 r = my >= cy ? (u32)((my - cy + app.tree_scroll) / app.row_h) : UINT32_MAX;
+			u32 node = r < app.nrows ? app.rows[r] : FS_NONE;
+			if (node != FS_NONE)
+				app.tree_sel = node;
+			app.focus = FOCUS_SIDEBAR;
+			ctx_menu_explorer(mx, my, node);
+		} else if (app.side_view == SIDE_SCM) {
+			extern bool scm_context(int x, int y, int w, int h, int mx, int my);
+			scm_context(x, 0, w, h, mx, my);
+		}
+		return;
+	}
+	if (app.panel_visible && my >= app.panel_y)
+		return;
+	for (u32 gi = 0; gi < app.ngroups; gi++) {
+		Group *g = &app.groups[gi];
+		if (mx < g->x || mx >= g->x + g->w)
+			continue;
+		if (my < g->y + app.tabs_h) {
+			int x = g->x - tabs_scroll_for(g);
+			for (u32 t = 0; t < g->nt; t++) {
+				int w = tab_width(g->tab[t]);
+				if (mx >= x && mx < x + w) {
+					ctx_menu_tab(mx, my, gi, t);
+					return;
+				}
+				x += w;
+			}
+			return;
+		}
+		if (!g->nt || my < g->y + app.tabs_h + app.crumbs_h)
+			return;
+		app.active_group = gi;
+		app.focus = FOCUS_EDITOR;
+		View *v = g->tab[g->active];
+		u32 off = ed_offset_at(v, mx, my, g->x, g->y + app.tabs_h + app.crumbs_h);
+		/* like VSCodium: a right click outside the selection moves the cursor */
+		bool inside = false;
+		for (u32 c = 0; c < v->nc; c++) {
+			u32 a = VX_MIN(v->head[c], v->anchor[c]), b = VX_MAX(v->head[c], v->anchor[c]);
+			if (off >= a && off <= b && a != b)
+				inside = true;
+		}
+		if (!inside)
+			ed_set_cursor(v, off, false);
+		ctx_menu_editor(v, mx, my, off);
+		return;
+	}
+}
+
+/* Mouse cursor shape for a position (VSCodium: I-beam over text and
+ * inputs, a hand for Ctrl+hover links, resize arrows on sashes). */
+static int cursor_at(int mx, int my, int mods)
+{
+	if (app.quick) {
+		int w = VX_MIN(PX(600), app.w - PX(40));
+		int x = (app.w - w) / 2;
+		int iy = PX(4) + PX(6) + (app.quick_title[0] ? PX(22) : 0);
+		return (mx >= x && mx < x + w && my >= iy && my < iy + PX(26)) ? CURSOR_IBEAM : CURSOR_ARROW;
+	}
+	if (app.side_visible && abs(mx - (app.side_x + app.side_w)) <= PX(2) && my < app.h - app.status_h)
+		return CURSOR_EW;
+	if (app.panel_visible && abs(my - app.panel_y) <= PX(2) && mx >= app.ed_x)
+		return CURSOR_NS;
+	if (my >= app.h - app.status_h || mx < app.act_w)
+		return CURSOR_ARROW;
+	if (app.side_visible && mx < app.side_x + app.side_w) {
+		extern bool sidebar_over_input(int x, int y, int w, int mx, int my);
+		return sidebar_over_input(app.side_x, 0, app.side_w, mx, my) ? CURSOR_IBEAM : CURSOR_ARROW;
+	}
+	if (app.panel_visible && my >= app.panel_y)
+		return CURSOR_ARROW;
+	for (u32 gi = 0; gi < app.ngroups; gi++) {
+		Group *g = &app.groups[gi];
+		if (mx < g->x || mx >= g->x + g->w || !g->nt)
+			continue;
+		int ey = g->y + app.tabs_h + app.crumbs_h;
+		if (my < ey)
+			return CURSOR_ARROW;
+		View *v = g->tab[g->active];
+		return ed_cursor_shape(v, mx, my, g->x, ey, g->w, g->h - app.tabs_h - app.crumbs_h, mods);
+	}
+	return CURSOR_ARROW;
+}
 static bool panel_mouse(const Event *e);
 
 void ui_event(const Event *e)
 {
 	app.dirty = true;
 	app.blink_t0 = vx_now_ns();
+	if (menu_is_open() && menu_event(e)) {
+		app.cursor = CURSOR_ARROW;
+		return;
+	}
 	if (e->type == EV_RESIZE) {
 		app.w = e->x;
 		app.h = e->y;
@@ -1847,6 +2108,12 @@ void ui_event(const Event *e)
 	}
 	/* mouse */
 	int mx = e->x, my = e->y;
+	if (e->type == EV_MDOWN && e->button == 3 && !app.quick) {
+		context_click(mx, my);
+		return;
+	}
+	if (e->type == EV_MMOVE && !app.drag)
+		app.cursor = cursor_at(mx, my, e->mods);
 	if (e->type == EV_MMOVE) {
 		app.hover_x = mx;
 		app.hover_y = my;
@@ -1996,7 +2263,8 @@ static const IconRule icon_rules[] = {
     {".txt", "\xE2\x89\xA1", 0x6D8086FF}, {".cpp", "C", 0xA074C4FF}, {".hpp", "h", 0xA074C4FF},
     {".glsl", "G", 0x519ABAFF},  {".vert", "G", 0x519ABAFF},  {".frag", "G", 0x519ABAFF},
     {".comp", "G", 0x519ABAFF},  {".yml", "y", 0xA074C4FF},   {".yaml", "y", 0xA074C4FF},
-    {".toml", "t", 0x6D8086FF},  {".pl", "pl", 0x519ABAFF},  {".pm", "pm", 0x519ABAFF},
+    {".toml", "t", 0x6D8086FF},  {".cmake", "C", 0x519ABAFF}, {".mk", "M", 0xE37933FF},
+    {".jsonc", "{}", 0xCBCB41FF}, {".diff", "\xC2\xB1", 0x519ABAFF}, {".patch", "\xC2\xB1", 0x519ABAFF},  {".pl", "pl", 0x519ABAFF},  {".pm", "pm", 0x519ABAFF},
     {".bash", ">", 0x4D5A5EFF},  {".zsh", ">", 0x4D5A5EFF},  {".markdown", "M", 0x519ABAFF},  {".png", "\xE2\x96\xA3", 0xA074C4FF}, {".mk", "M", 0xE37933FF},
 };
 
@@ -2004,7 +2272,10 @@ int file_icon_draw(const char *name, int x, int y, int h)
 {
 	const char *glyph = NULL;
 	u32 color = 0;
-	if (strcmp(name, "Makefile") == 0 || strcmp(name, "GNUmakefile") == 0 ||
+	if (strcmp(name, "CMakeLists.txt") == 0) {
+		glyph = "C";
+		color = 0x519ABAFF;
+	} else if (strcmp(name, "Makefile") == 0 || strcmp(name, "GNUmakefile") == 0 ||
 	    strcmp(name, "BSDmakefile") == 0 || strcmp(name, "makefile") == 0) {
 		glyph = "M";
 		color = 0xE37933FF;
@@ -2566,8 +2837,13 @@ void ui_draw(void)
 	View *v = active_view();
 	if (v)
 		ed_draw_popups(v);
+	{
+		extern void gitui_draw_popups(void);
+		gitui_draw_popups();
+	}
 	if (app.quick)
 		quick_draw();
+	menu_draw();
 	gpu_frame(draw.q, draw.n, COL(C_EDITOR_BG));
 	app.dirty = false;
 }
@@ -2680,7 +2956,10 @@ static void lsp_tick(void)
 			ed_take_hover(&ev);
 			break;
 		case LSP_EV_LOCATION:
-			ed_take_definition(&ev);
+			if (ev.req == app.refs_req || ev.req == app.decl_req)
+				actions_take_locations(&ev);
+			else
+				ed_take_definition(&ev);
 			break;
 		case LSP_EV_LOG:
 			ui_log("[lsp] %s", ev.text ? ev.text : "");
@@ -2803,6 +3082,13 @@ void ui_tick(void)
 		app.tree_scan_ns = app.now;
 	}
 	search_tick();
+	{
+		extern void gitui_tick(void);
+		extern bool gitui_wants_redraw(void);
+		gitui_tick();
+		if (gitui_wants_redraw())
+			app.dirty = true;
+	}
 	if (app.hover_due && app.now >= app.hover_due) {
 		app.hover_due = 0;
 		View *v = active_view();
@@ -2878,6 +3164,10 @@ void ui_shutdown(void)
 	app.lsp = NULL;
 	blame_stop(app.blame);
 	app.blame = NULL;
+	{
+		extern void gitui_shutdown(void);
+		gitui_shutdown();
+	}
 	if (app.git)
 		git_close(app.git);
 	app.git = NULL;

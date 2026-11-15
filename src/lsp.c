@@ -13,7 +13,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-enum { RQ_INIT = 1, RQ_SHUTDOWN, RQ_COMPLETION, RQ_HOVER, RQ_DEFINITION, RQ_SEMANTIC };
+enum { RQ_INIT = 1, RQ_SHUTDOWN, RQ_COMPLETION, RQ_HOVER, RQ_DEFINITION, RQ_SEMANTIC, RQ_REFERENCES };
 
 typedef struct {
 	char *b;
@@ -438,6 +438,9 @@ static void send_initialize(Lsp *l, const char *root)
 	          "\"labelDetailsSupport\":false}},"
 	          "\"hover\":{\"contentFormat\":[\"plaintext\",\"markdown\"]},"
 	          "\"definition\":{\"linkSupport\":true},"
+	          "\"declaration\":{\"linkSupport\":true},"
+	          "\"typeDefinition\":{\"linkSupport\":true},"
+	          "\"references\":{},"
 	          "\"semanticTokens\":{\"requests\":{\"full\":true,\"range\":false},"
 	          "\"formats\":[\"relative\"],\"overlappingTokenSupport\":false,"
 	          "\"multilineTokenSupport\":false,\"tokenTypes\":[");
@@ -1068,6 +1071,7 @@ static bool handle_message(Lsp *l, LspEvent *ev)
 		es.has_text = true;
 		break;
 	case RQ_DEFINITION:
+	case RQ_REFERENCES:
 		ev_init(l, ev, LSP_EV_LOCATION, rid);
 		if (ok)
 			handle_definition(l, res);
@@ -1271,6 +1275,33 @@ i32 lsp_hover(Lsp *l, const char *path, u32 line, u32 col)
 i32 lsp_definition(Lsp *l, const char *path, u32 line, u32 col)
 {
 	return pos_request(l, "textDocument/definition", RQ_DEFINITION, path, line, col);
+}
+
+i32 lsp_declaration(Lsp *l, const char *path, u32 line, u32 col)
+{
+	return pos_request(l, "textDocument/declaration", RQ_DEFINITION, path, line, col);
+}
+
+i32 lsp_type_definition(Lsp *l, const char *path, u32 line, u32 col)
+{
+	return pos_request(l, "textDocument/typeDefinition", RQ_DEFINITION, path, line, col);
+}
+
+i32 lsp_references(Lsp *l, const char *path, u32 line, u32 col)
+{
+	if (!lsp_ready(l) || l->fd_in < 0)
+		return -1;
+	u32 c = col_out(l, path, line, col);
+	i32 id = msg_begin_request(l, "textDocument/references", RQ_REFERENCES, path);
+	jb_raw(&l->msg, "{\"textDocument\":{\"uri\":");
+	jb_uri(&l->msg, path);
+	jb_raw(&l->msg, "},\"position\":{\"line\":");
+	jb_int(&l->msg, line);
+	jb_raw(&l->msg, ",\"character\":");
+	jb_int(&l->msg, c);
+	jb_raw(&l->msg, "},\"context\":{\"includeDeclaration\":true}}}");
+	send_msg(l, false);
+	return id;
 }
 
 i32 lsp_semantic_tokens(Lsp *l, const char *path)

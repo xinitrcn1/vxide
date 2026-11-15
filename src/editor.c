@@ -12,6 +12,12 @@
 #define MAX_LINE_BYTES 8192
 
 static u32 next_group = 1;
+
+/* where the inline blame text was drawn (for its hover card) */
+static int blame_rect_x0, blame_rect_x1 = -1, blame_rect_y;
+static u32 blame_rect_doc = UINT32_MAX;
+static char blame_rect_hash[16];
+
 enum { GK_NONE, GK_TYPE, GK_DELETE, GK_OTHER };
 
 static Text *T(View *v) { return &app.docs.text[v->doc]; }
@@ -273,6 +279,61 @@ static u32 group_for(View *v, u8 kind)
 	return v->group;
 }
 
+static bool readonly_doc(View *v)
+{
+	if (!app.docs.readonly[v->doc])
+		return false;
+	ui_status("Cannot edit in read-only editor");
+	return true;
+}
+
+/* ---- box (column) selection ---------------------------------------------------- */
+
+static struct {
+	bool on;
+	u32 doc;
+	u32 al, hl; /* anchor / head lines */
+	int ax, hx; /* anchor / head x in pixels */
+} box;
+
+static u32 off_at_x(Text *t, u32 l, int px);
+static int x_of(Text *t, u32 l, u32 off);
+
+static void box_apply(View *v)
+{
+	Text *t = T(v);
+	u32 l0 = VX_MIN(box.al, box.hl), l1 = VX_MAX(box.al, box.hl);
+	v->nc = 0;
+	for (u32 l = l0; l <= l1 && v->nc < MAX_CURSORS; l++) {
+		/* VSCodium skips lines too short to reach the box (unless the box is empty) */
+		int end = x_of(t, l, text_line_start(t, l) + text_line_len(t, l));
+		if (end < VX_MIN(box.ax, box.hx) && box.ax != box.hx && l != box.hl)
+			continue;
+		u32 k = v->nc++;
+		v->anchor[k] = off_at_x(t, l, box.ax);
+		v->head[k] = off_at_x(t, l, box.hx);
+		v->want_x[k] = box.hx;
+	}
+	if (!v->nc) {
+		v->nc = 1;
+		v->anchor[0] = v->head[0] = off_at_x(t, box.hl, box.hx);
+	}
+	ed_reveal(v, v->head[v->nc - 1], false);
+	app.dirty = true;
+}
+
+static void box_start(View *v)
+{
+	Text *t = T(v);
+	u32 c = v->nc - 1;
+	box.on = true;
+	box.doc = v->doc;
+	box.al = text_line_of(t, v->anchor[c]);
+	box.ax = x_of(t, box.al, v->anchor[c]);
+	box.hl = text_line_of(t, v->head[c]);
+	box.hx = x_of(t, box.hl, v->head[c]);
+}
+
 static void edit(View *v, u32 pos, u32 del, const char *ins, u32 n, u32 group)
 {
 	doc_replace(v->doc, pos, del, ins, n, group);
@@ -395,6 +456,9 @@ static bool word_before(Text *t, u32 off) { return off > 0 && is_word_byte(text_
 void ed_text(View *v, const char *s, size_t n)
 {
 	Text *t = T(v);
+	box.on = false;
+	if (readonly_doc(v))
+		return;
 	app.hover_open = false;
 	if (n == 1) {
 		char c = s[0];
@@ -1070,6 +1134,7 @@ static void select_word_or_next(View *v, bool all)
 
 static void move_cursors(View *v, u32 key, int mods, int page_lines)
 {
+	box.on = false;
 	Text *t = T(v);
 	bool ext = mods & MOD_SHIFT;
 	bool ctrl = mods & MOD_CTRL;
@@ -1175,10 +1240,75 @@ static void undo_redo(View *v, bool redo)
 	ed_reveal(v, b, false);
 }
 
+static void move_sel_next_match(View *v)
+{
+	/* Ctrl+K Ctrl+D: like Ctrl+D, but the last selection moves instead */
+	u32 before = v->nc;
+	u32 last_a = v->anchor[v->nc - 1], last_h = v->head[v->nc - 1];
+	select_word_or_next(v, false);
+	if (v->nc > before) {
+		/* drop the old last selection */
+		for (u32 c = 0; c < v->nc; c++)
+			if (v->anchor[c] == last_a && v->head[c] == last_h) {
+				memmove(v->head + c, v->head + c + 1, (v->nc - c - 1) * sizeof(u32));
+				memmove(v->anchor + c, v->anchor + c + 1, (v->nc - c - 1) * sizeof(u32));
+				memmove(v->want_x + c, v->want_x + c + 1, (v->nc - c - 1) * sizeof(i32));
+				v->nc--;
+				break;
+			}
+	}
+}
+
 bool ed_command(View *v, int cmd)
 {
 	Text *t = T(v);
 	switch (cmd) {
+	case CMD_CUT:
+	case CMD_PASTE:
+	case CMD_TOGGLE_COMMENT:
+	case CMD_INDENT:
+	case CMD_OUTDENT:
+	case CMD_MOVE_LINE_UP:
+	case CMD_MOVE_LINE_DOWN:
+	case CMD_COPY_LINE_UP:
+	case CMD_COPY_LINE_DOWN:
+	case CMD_DELETE_LINE:
+	case CMD_INSERT_LINE_BELOW:
+	case CMD_INSERT_LINE_ABOVE:
+	case CMD_UNDO:
+	case CMD_REDO:
+		if (readonly_doc(v))
+			return true;
+		break;
+	default:
+		break;
+	}
+	switch (cmd) {
+	case CMD_MOVE_SEL_NEXT_MATCH:
+		cursor_history_push(v);
+		move_sel_next_match(v);
+		return true;
+	case CMD_COLUMN_SELECT_LEFT:
+	case CMD_COLUMN_SELECT_RIGHT:
+	case CMD_COLUMN_SELECT_UP:
+	case CMD_COLUMN_SELECT_DOWN:
+		if (!box.on || box.doc != v->doc) {
+			cursor_history_push(v);
+			box_start(v);
+		}
+		if (cmd == CMD_COLUMN_SELECT_LEFT)
+			box.hx = VX_MAX(box.hx - app.char_w, 0);
+		else if (cmd == CMD_COLUMN_SELECT_RIGHT)
+			box.hx += app.char_w;
+		else {
+			u32 page = (u32)VX_MAX(g_view_h / app.line_h - 1, 1);
+			if (cmd == CMD_COLUMN_SELECT_UP)
+				box.hl = box.hl > page ? box.hl - page : 0;
+			else
+				box.hl = VX_MIN(box.hl + page, text_lines(t) - 1);
+		}
+		box_apply(v);
+		return true;
 	case CMD_UNDO:
 		undo_redo(v, false);
 		return true;
@@ -1208,11 +1338,13 @@ bool ed_command(View *v, int cmd)
 		}
 		return true;
 	case CMD_ADD_NEXT_MATCH:
+		cursor_history_push(v);
 		if (v->nc == 1 && v->head[0] == v->anchor[0])
 			app.find_flags &= ~0x200;
 		select_word_or_next(v, false);
 		return true;
 	case CMD_SELECT_ALL_MATCHES:
+		cursor_history_push(v);
 		select_word_or_next(v, true);
 		return true;
 	case CMD_TOGGLE_COMMENT:
@@ -1246,9 +1378,11 @@ bool ed_command(View *v, int cmd)
 		insert_line(v, true);
 		return true;
 	case CMD_CURSOR_ABOVE:
+		cursor_history_push(v);
 		add_cursor_vert(v, -1);
 		return true;
 	case CMD_CURSOR_BELOW:
+		cursor_history_push(v);
 		add_cursor_vert(v, 1);
 		return true;
 	case CMD_FIND:
@@ -1303,6 +1437,9 @@ bool ed_key(View *v, const Event *e)
 {
 	int mods = e->mods & (MOD_CTRL | MOD_SHIFT | MOD_ALT);
 	u32 k = e->key;
+	if ((k == SDLK_BACKSPACE || k == SDLK_DELETE || k == SDLK_RETURN || k == SDLK_KP_ENTER || k == SDLK_TAB) &&
+	    readonly_doc(v))
+		return true;
 	if (app.compl_open) {
 		if (k == SDLK_DOWN || k == SDLK_UP || k == SDLK_PAGEDOWN || k == SDLK_PAGEUP) {
 			u32 n = app.compl_nf;
@@ -1803,6 +1940,29 @@ static u32 hit_offset(View *v, int mx, int my, int x, int y)
 }
 
 static bool find_widget_click(View *v, const Event *e);
+static int fw_x, fw_y, fw_w, fw_h; /* find widget rect, set while drawing */
+
+u32 ed_offset_at(View *v, int mx, int my, int x, int y);
+
+int ed_cursor_shape(View *v, int mx, int my, int x, int y, int w, int h, int mods)
+{
+	int mm = minimap_w(w);
+	if (mx >= x + w - SCROLL_W - mm || mx < x + ed_gutter_w(v))
+		return CURSOR_ARROW;
+	if (app.find_open && mx >= fw_x && mx < fw_x + fw_w && my >= fw_y && my < fw_y + fw_h)
+		return CURSOR_ARROW;
+	(void)h;
+	if (mods & MOD_CTRL) {
+		/* a go-to-definition link under the mouse */
+		Text *t = T(v);
+		u32 off = ed_offset_at(v, mx, my, x, y);
+		if (off < t->len && is_word_byte(text_byte(t, off)))
+			return CURSOR_HAND;
+	}
+	return CURSOR_IBEAM;
+}
+
+u32 ed_offset_at(View *v, int mx, int my, int x, int y) { return hit_offset(v, mx, my, x, y); }
 
 static int drag_mode; /* 1 chars, 2 words, 3 lines, 4 scrollbar, 5 minimap */
 static u32 drag_a, drag_b;
@@ -1828,6 +1988,20 @@ void ed_mouse(View *v, const Event *e, int x, int y, int w, int h)
 	}
 	if (e->type == EV_MDOWN && e->button == 1 && find_widget_click(v, e))
 		return;
+	if (e->type == EV_MDOWN && e->button == 2) {
+		/* middle-button drag: column selection (editor.columnSelection) */
+		Text *t2 = T(v);
+		u32 off = hit_offset(v, e->x, e->y, x, y);
+		cursor_history_push(v);
+		box.on = true;
+		box.doc = v->doc;
+		box.al = box.hl = text_line_of(t2, off);
+		box.ax = box.hx = e->x - x - ed_gutter_w(v) + v->scroll_x;
+		box_apply(v);
+		drag_mode = 6;
+		app.drag = 3; /* DRAG_EDITOR in ui.c */
+		return;
+	}
 	if (e->type == EV_MDOWN && e->button == 1) {
 		app.compl_open = false;
 		app.hover_open = false;
@@ -1849,7 +2023,19 @@ void ed_mouse(View *v, const Event *e, int x, int y, int w, int h)
 			drag_mode = 0;
 			return;
 		}
+		if ((e->mods & (MOD_ALT | MOD_SHIFT)) == (MOD_ALT | MOD_SHIFT)) {
+			/* column (box) selection from the primary cursor to here */
+			Text *t2 = T(v);
+			cursor_history_push(v);
+			box_start(v);
+			box.hl = text_line_of(t2, off);
+			box.hx = x_of(t2, box.hl, off);
+			box_apply(v);
+			drag_mode = 6;
+			return;
+		}
 		if (e->mods & MOD_ALT) {
+			cursor_history_push(v);
 			if (v->nc < MAX_CURSORS) {
 				u32 k = v->nc++;
 				v->head[k] = v->anchor[k] = off;
@@ -1896,6 +2082,14 @@ void ed_mouse(View *v, const Event *e, int x, int y, int w, int h)
 		return;
 	}
 	if (e->type == EV_MMOVE && app.mouse_down && drag_mode) {
+		if (drag_mode == 6) {
+			Text *t2 = T(v);
+			i64 py = (i64)(e->y - y) + v->scroll_y;
+			box.hl = py < 0 ? 0 : (u32)VX_MIN((u64)(py / app.line_h), (u64)text_lines(t2) - 1);
+			box.hx = VX_MAX(e->x - x - ed_gutter_w(v) + v->scroll_x, 0);
+			box_apply(v);
+			return;
+		}
 		if (drag_mode >= 4)
 			goto drag_scroll;
 		u32 off = hit_offset(v, e->x, e->y, x, y);
@@ -1930,6 +2124,20 @@ void ed_mouse(View *v, const Event *e, int x, int y, int w, int h)
 		return;
 	}
 	if (e->type == EV_MMOVE && !app.mouse_down) {
+		/* the inline blame text shows the commit card */
+		bool over = blame_rect_doc == v->doc && blame_rect_x1 > blame_rect_x0 && e->x >= blame_rect_x0 &&
+		            e->x < blame_rect_x1 && e->y >= blame_rect_y && e->y < blame_rect_y + app.line_h;
+		if (over != app.blame_hover || (over && strcmp(app.blame_hover_hash, blame_rect_hash))) {
+			app.blame_hover = over;
+			app.blame_hover_t = vx_now_ns();
+			snprintf(app.blame_hover_hash, sizeof app.blame_hover_hash, "%s", blame_rect_hash);
+			app.blame_hover_x = blame_rect_x0;
+			app.blame_hover_y = blame_rect_y;
+		}
+		if (over) {
+			app.hover_due = 0;
+			return;
+		}
 		/* hover after a rest of 300 ms over text */
 		if (e->x < x + ed_gutter_w(v) || e->x >= mm_x) {
 			app.hover_due = 0;
@@ -2067,7 +2275,6 @@ static int line_indent_cols(Text *t, u32 l, bool *blank)
 
 /* ---- find widget ------------------------------------------------------------ */
 
-static int fw_x, fw_y, fw_w, fw_h; /* last drawn rect, for clicks */
 
 static void fw_layout(int x, int y, int w, int *fx, int *fy, int *fwid, int *fh, int *ix, int *iw)
 {
@@ -2200,6 +2407,8 @@ static bool find_widget_click(View *v, const Event *e)
 
 void ed_draw(Group *g, View *v, int x, int y, int w, int h, bool focused)
 {
+	if (v->doc == blame_rect_doc)
+		blame_rect_x1 = -1; /* re-recorded below if still shown */
 	(void)g;
 	Docs *D = &app.docs;
 	u32 d = v->doc;
@@ -2427,7 +2636,14 @@ void ed_draw(Group *g, View *v, int x, int y, int w, int h, bool focused)
 			}
 			int ly = y0 + (int)(l - first) * lh;
 			int bx = tx + x_of(t, l, text_line_start(t, l) + text_line_len(t, l)) + app.char_w * 3;
-			draw_text_fit(FONT_MONO, bx, ly, msg, strlen(msg), VX_MAX(text_x + text_w - bx, 0), COL(C_CODELENS));
+			int ex = draw_text_fit(FONT_MONO, bx, ly, msg, strlen(msg), VX_MAX(text_x + text_w - bx, 0), COL(C_CODELENS));
+			if (!bl.uncommitted && c == 0) {
+				blame_rect_x0 = bx;
+				blame_rect_x1 = ex;
+				blame_rect_y = ly;
+				blame_rect_doc = d;
+				snprintf(blame_rect_hash, sizeof blame_rect_hash, "%s", bl.hash);
+			}
 		}
 	}
 

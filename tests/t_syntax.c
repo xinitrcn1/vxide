@@ -53,6 +53,7 @@ static const char *const names[] = {
 	"TEXT", "COMMENT", "STRING", "ESCAPE", "NUMBER", "STORAGE", "CONTROL", "TYPE",
 	"FUNCTION", "VARIABLE", "CONSTANT", "LANGCONST", "PREPROC", "OPERATOR", "LABEL", "INVALID",
 	"HEADING", "BOLD", "ITALIC", "STRIKE", "RAW", "LINK", "LIST", "QUOTE", "TAG", "TAGPUNCT", "ATTR", "REGEX",
+	"PROPERTY", "INSERTED", "DELETED", "CHANGED", "DIFFHDR",
 };
 _Static_assert(sizeof names / sizeof names[0] == TK_COUNT, "names[] matches TK_*");
 
@@ -400,8 +401,8 @@ static void test_detect(void)
 	CHECK(syn_lang_for_path("x.lisp", NULL, 0) == LANG_LISP);
 	CHECK(syn_lang_for_path("init.el", NULL, 0) == LANG_LISP);
 	CHECK(syn_lang_for_path("core.clj", NULL, 0) == LANG_LISP);
-	CHECK(syn_lang_for_path("Makefile", NULL, 0) == LANG_NONE);
-	CHECK(syn_lang_for_path(".gitignore", NULL, 0) == LANG_NONE);
+	CHECK(syn_lang_for_path("Makefile", NULL, 0) == LANG_MAKE);
+	CHECK(syn_lang_for_path(".gitignore", NULL, 0) == LANG_IGNORE);
 	const char *gas = "\t.text\n\t.globl main\nmain:\n\tmovl $1, %eax\n";
 	const char *nasm = "bits 64\nsection .text\nglobal _start\n_start:\n\tmov rax, [rsp]\n";
 	const char *intel_gas = ".intel_syntax noprefix\nmain:\n mov eax, 1\n";
@@ -821,6 +822,352 @@ static void bench_more(void)
 	bench2(LANG_MARKDOWN, "markdown", md, 4);
 }
 
+
+static void test_cmake(void)
+{
+	u32 s;
+	s = lex(LANG_CMAKE, 0, "cmake_minimum_required(VERSION 3.20) # min");
+	T("cmake_minimum_required", TK_FUNCTION);
+	T("VERSION", TK_CONSTANT);
+	T("3.20", TK_NUMBER);
+	T("# min", TK_COMMENT);
+	CHECK(s == 0);
+	lex(LANG_CMAKE, 0, "IF(WIN32) elseif (x) endif()");
+	T("IF", TK_CONTROL);
+	T("elseif", TK_CONTROL);
+	T("endif", TK_CONTROL);
+	T("WIN32", TK_CONSTANT);
+	lex(LANG_CMAKE, 0, "target_link_libraries(app PUBLIC ${LIB_${KIND}} $ENV{HOME} ON off)");
+	T("target_link_libraries", TK_FUNCTION);
+	T("app", TK_TEXT);
+	T("PUBLIC", TK_CONSTANT);
+	T("${LIB_", TK_VARIABLE);
+	T("${KIND}", TK_VARIABLE);
+	T("$ENV{HOME}", TK_VARIABLE);
+	T("ON", TK_LANGCONST);
+	T("off", TK_LANGCONST);
+	lex(LANG_CMAKE, 0, "set(F $<$<CONFIG:Debug>:-g> \"a\\tb ${X}\")");
+	T("set", TK_FUNCTION);
+	T("$<", TK_PREPROC);
+	T("$<CONFIG", TK_PREPROC);
+	T("\"a", TK_STRING);
+	T("\\t", TK_ESCAPE);
+	T("${X}", TK_VARIABLE);
+	/* bracket comment and bracket argument across lines */
+	s = lex(LANG_CMAKE, 0, "#[==[ start");
+	T("#[==[ start", TK_COMMENT);
+	CHECK(s != 0);
+	s = lex(LANG_CMAKE, s, "still ]] inside");
+	T("still ]] inside", TK_COMMENT);
+	s = lex(LANG_CMAKE, s, "end ]==] project(x)");
+	T("end ]==]", TK_COMMENT);
+	T("project", TK_FUNCTION);
+	CHECK((s & 3u) == 0);
+	s = lex(LANG_CMAKE, 0, "message([[multi");
+	T("[[multi", TK_STRING);
+	s = lex(LANG_CMAKE, s, "line]])");
+	T("line]]", TK_STRING);
+	CHECK(s == 0);
+	/* quoted string spanning lines, inside a command */
+	s = lex(LANG_CMAKE, 0, "message(\"one");
+	s = lex(LANG_CMAKE, s, "two\" X)");
+	T("two\"", TK_STRING);
+	T("X", TK_TEXT);
+	CHECK(s == 0);
+	/* a command name inside arguments is not a command */
+	lex(LANG_CMAKE, 0, "foo(bar(x))");
+	T("foo", TK_FUNCTION);
+	T("bar", TK_TEXT);
+}
+
+static void test_make(void)
+{
+	u32 s;
+	/* BSD make */
+	lex(LANG_MAKE, 0, ".include <bsd.prog.mk>");
+	T(".include", TK_CONTROL);
+	T("<bsd.prog.mk>", TK_STRING);
+	lex(LANG_MAKE, 0, ".if defined(DEBUG) && ${CC} == \"clang\"");
+	T(".if", TK_CONTROL);
+	T("defined", TK_FUNCTION);
+	T("&&", TK_OPERATOR);
+	T("${CC}", TK_VARIABLE);
+	T("==", TK_OPERATOR);
+	T("\"clang\"", TK_STRING);
+	lex(LANG_MAKE, 0, ".  for f in ${SRCS:M*.c}");
+	T(".", TK_CONTROL);
+	T("for", TK_CONTROL);
+	TN("f", 1, TK_VARIABLE); /* the loop variable, not the f of "for" */
+	T("in", TK_CONTROL);
+	T("${SRCS", TK_VARIABLE);
+	T(":M", TK_FUNCTION);
+	T("*.c", TK_TEXT);
+	T("}", TK_VARIABLE);
+	lex(LANG_MAKE, 0, ".endfor");
+	T(".endfor", TK_CONTROL);
+	lex(LANG_MAKE, 0, "OBJS= ${SRCS:S/.c/.o/g:T} ${.TARGET}");
+	T("OBJS", TK_VARIABLE);
+	T("=", TK_OPERATOR);
+	T(":S", TK_FUNCTION);
+	T(":T", TK_FUNCTION);
+	T("${.TARGET}", TK_LANGCONST);
+	lex(LANG_MAKE, 0, "HASH!= git rev-parse HEAD");
+	T("HASH", TK_VARIABLE);
+	T("!=", TK_OPERATOR);
+	lex(LANG_MAKE, 0, ".PHONY: all clean");
+	T(".PHONY", TK_FUNCTION);
+	/* GNU make */
+	lex(LANG_MAKE, 0, "OBJS := $(patsubst %.c,%.o,$(SRCS)) # objects");
+	T("OBJS", TK_VARIABLE);
+	T(":=", TK_OPERATOR);
+	T("$(patsubst", TK_FUNCTION);
+	T("$(SRCS)", TK_VARIABLE);
+	T("# objects", TK_COMMENT);
+	lex(LANG_MAKE, 0, "CFLAGS += -O2");
+	T("CFLAGS", TK_VARIABLE);
+	T("+=", TK_OPERATOR);
+	lex(LANG_MAKE, 0, "ifeq ($(CC),gcc)");
+	T("ifeq", TK_CONTROL);
+	T("$(CC)", TK_VARIABLE);
+	lex(LANG_MAKE, 0, "else ifdef FOO");
+	T("else", TK_CONTROL);
+	T("ifdef", TK_CONTROL);
+	lex(LANG_MAKE, 0, "%.o: %.c $(DEPS)");
+	TN("%", 0, TK_VARIABLE);
+	T(".o", TK_FUNCTION);
+	T("$(DEPS)", TK_VARIABLE);
+	lex(LANG_MAKE, 0, "all: vxide");
+	T("all", TK_FUNCTION);
+	/* recipe: prefix, shell, make refs painted over */
+	s = lex(LANG_MAKE, 0, "\t@echo \"built $@\" && $(CC) -o $@ $^ $(MAKE)");
+	T("@", TK_CONTROL);
+	T("echo", TK_FUNCTION);
+	T("$@", TK_LANGCONST);
+	T("$(CC)", TK_VARIABLE);
+	T("$^", TK_LANGCONST);
+	T("$(MAKE)", TK_LANGCONST);
+	CHECK(s == 0);
+	/* recipe continuation keeps the shell going */
+	s = lex(LANG_MAKE, 0, "\tif [ -f x ]; then \\");
+	T("if", TK_CONTROL);
+	CHECK((s & 7u) == 2u);
+	s = lex(LANG_MAKE, s, "\t  rm -f x; fi");
+	T("rm", TK_FUNCTION);
+	T("fi", TK_CONTROL);
+	CHECK(s == 0);
+	/* continued assignment */
+	s = lex(LANG_MAKE, 0, "SRCS = a.c \\");
+	s = lex(LANG_MAKE, s, "  $(EXTRA) b.c");
+	T("$(EXTRA)", TK_VARIABLE);
+	CHECK(s == 0);
+	/* define body */
+	s = lex(LANG_MAKE, 0, "define RULE");
+	T("define", TK_CONTROL);
+	T("RULE", TK_VARIABLE);
+	s = lex(LANG_MAKE, s, "$(1): ; echo $(2)");
+	T("$(1)", TK_VARIABLE);
+	s = lex(LANG_MAKE, s, "endef");
+	T("endef", TK_CONTROL);
+	CHECK(s == 0);
+	lex(LANG_MAKE, 0, "-include $(wildcard *.d)");
+	T("-include", TK_CONTROL);
+	T("$(wildcard", TK_FUNCTION);
+}
+
+static void test_json(void)
+{
+	u32 s;
+	lex(LANG_JSON, 0, "{\"name\": \"vx\\nide\", \"n\": -1.5e3, \"ok\": true, \"x\": null}");
+	T("\"name\"", TK_PROPERTY);
+	T("\"vx", TK_STRING);
+	T("\\n", TK_ESCAPE);
+	T("-1.5e3", TK_NUMBER);
+	T("true", TK_LANGCONST);
+	T("null", TK_LANGCONST);
+	T("\"ok\"", TK_PROPERTY);
+	lex(LANG_JSON, 0, "  \"bad\": \"\\q\",");
+	T("\\q", TK_INVALID);
+	lex(LANG_JSON, 0, "[\"a\", \"b\"]");
+	T("\"a\"", TK_STRING);
+	lex(LANG_JSON, 0, "\"key\"   :");
+	T("\"key\"", TK_PROPERTY);
+	s = lex(LANG_JSONC, 0, "{ // comment");
+	T("// comment", TK_COMMENT);
+	s = lex(LANG_JSONC, 0, "/* block");
+	CHECK(s == 1);
+	s = lex(LANG_JSONC, s, "end */ \"k\": 1");
+	T("end */", TK_COMMENT);
+	T("\"k\"", TK_PROPERTY);
+	CHECK(s == 0);
+	lex(LANG_JSON, 0, "\"\\u00e9\": 1");
+	T("\\u00e9", TK_ESCAPE);
+}
+
+static void test_ignore(void)
+{
+	lex(LANG_IGNORE, 0, "# build output");
+	T("# build output", TK_COMMENT);
+	lex(LANG_IGNORE, 0, "!keep/**/*.o");
+	T("!", TK_OPERATOR);
+	TN("*", 0, TK_REGEX);
+	T("keep", TK_TEXT);
+	lex(LANG_IGNORE, 0, "build/");
+	T("/", TK_OPERATOR);
+	lex(LANG_IGNORE, 0, "\\#notcomment [ab].txt");
+	T("\\#", TK_ESCAPE);
+	lex(LANG_IGNORE, 0, "*.[oa]");
+	T("[oa]", TK_REGEX);
+	lex(LANG_IGNORE, 0, "*.sh text eol=lf -diff");
+	T("text", TK_PROPERTY);
+	T("eol", TK_PROPERTY);
+	T("lf", TK_STRING);
+	T("-", TK_OPERATOR);
+	T("diff", TK_PROPERTY);
+}
+
+static void test_diff(void)
+{
+	lex(LANG_DIFF, 0, "diff --git a/x.c b/x.c");
+	T("diff --git a/x.c b/x.c", TK_DIFFHDR);
+	lex(LANG_DIFF, 0, "--- a/x.c");
+	T("--- a/x.c", TK_DIFFHDR);
+	lex(LANG_DIFF, 0, "+++ b/x.c");
+	T("+++ b/x.c", TK_DIFFHDR);
+	lex(LANG_DIFF, 0, "@@ -1,3 +1,4 @@ int main(void)");
+	T("@@", TK_TEXT);
+	lex(LANG_DIFF, 0, "+\tadded();");
+	T("+\tadded();", TK_INSERTED);
+	lex(LANG_DIFF, 0, "-\tremoved();");
+	T("-\tremoved();", TK_DELETED);
+	lex(LANG_DIFF, 0, "! changed");
+	T("! changed", TK_CHANGED);
+	lex(LANG_DIFF, 0, " context");
+	T("context", TK_TEXT);
+	lex(LANG_DIFF, 0, "index 1a2b3c4..5d6e7f8 100644");
+	T("index", TK_TEXT);
+	lex(LANG_DIFF, 0, "commit 2724520aabbccdd (HEAD -> main)");
+	T("commit", TK_DIFFHDR);
+	T("2724520aabbccdd", TK_NUMBER);
+	lex(LANG_DIFF, 0, "Author: Ada <a@x>");
+	T("Author:", TK_DIFFHDR);
+	lex(LANG_DIFF, 0, "---");
+	T("---", TK_TEXT);
+}
+
+static void test_git_msgs(void)
+{
+	u32 s;
+	s = lex(LANG_GIT_COMMIT, 0, "This subject line is definitely longer than fifty characters total");
+	T("This subject line is definitely longer than fifty ", TK_TEXT); /* 50 characters */
+	T("characters total", TK_INVALID);
+	s = lex(LANG_GIT_COMMIT, s, "");
+	s = lex(LANG_GIT_COMMIT, s, "A body line that is also quite long but is not a subject line at all");
+	T("not a subject", TK_TEXT);
+	s = lex(LANG_GIT_COMMIT, s, "# Please enter the commit message");
+	T("# Please enter the commit message", TK_COMMENT);
+	s = lex(LANG_GIT_COMMIT, s, "#\tmodified:   src/x.c");
+	T("modified:   src/x.c", TK_CHANGED);
+	s = lex(LANG_GIT_COMMIT, s, "#\tnew file:   y.c");
+	T("new file:   y.c", TK_INSERTED);
+	s = lex(LANG_GIT_COMMIT, s, "#\tdeleted:    z.c");
+	T("deleted:    z.c", TK_DELETED);
+	s = lex(LANG_GIT_COMMIT, s, "#\tbothmodified: w.c");
+	T("bothmodified", TK_STORAGE);
+	T("w.c", TK_STRING);
+	s = lex(LANG_GIT_COMMIT, s, "diff --git a/x b/x");
+	T("diff --git a/x b/x", TK_DIFFHDR);
+	s = lex(LANG_GIT_COMMIT, s, "+added");
+	T("+added", TK_INSERTED);
+	s = lex(LANG_GIT_COMMIT, s, "# not a comment inside the diff");
+	T("# not a comment inside the diff", TK_COMMENT);
+	CHECK(s == 1);
+
+	lex(LANG_GIT_REBASE, 0, "pick 1a2b3c4 Add the thing");
+	T("pick", TK_PROPERTY);
+	T("1a2b3c4", TK_NUMBER);
+	T("Add the thing", TK_TEXT);
+	lex(LANG_GIT_REBASE, 0, "f 5d6e7f8 fixup! Add");
+	T("f", TK_PROPERTY);
+	T("5d6e7f8", TK_NUMBER);
+	lex(LANG_GIT_REBASE, 0, "fixup -C 9abcdef msg");
+	T("-C", TK_PROPERTY);
+	T("9abcdef", TK_NUMBER);
+	lex(LANG_GIT_REBASE, 0, "exec make test");
+	T("exec", TK_PROPERTY);
+	T("make", TK_FUNCTION);
+	lex(LANG_GIT_REBASE, 0, "# Rebase 1a2..3b4 onto 1a2");
+	T("# Rebase", TK_COMMENT);
+	lex(LANG_GIT_REBASE, 0, "break");
+	T("break", TK_PROPERTY);
+}
+
+static void test_detect3(void)
+{
+	CHECK(syn_lang_for_path("/p/CMakeLists.txt", NULL, 0) == LANG_CMAKE);
+	CHECK(syn_lang_for_path("cmake/Find.cmake", NULL, 0) == LANG_CMAKE);
+	CHECK(syn_lang_for_path("config.cmake.in", NULL, 0) == LANG_CMAKE);
+	CHECK(syn_lang_for_path("/x/Makefile", NULL, 0) == LANG_MAKE);
+	CHECK(syn_lang_for_path("BSDmakefile", NULL, 0) == LANG_MAKE);
+	CHECK(syn_lang_for_path("GNUmakefile", NULL, 0) == LANG_MAKE);
+	CHECK(syn_lang_for_path("Makefile.inc", NULL, 0) == LANG_MAKE);
+	CHECK(syn_lang_for_path("rules.mk", NULL, 0) == LANG_MAKE);
+	CHECK(syn_lang_for_path("build.mak", NULL, 0) == LANG_MAKE);
+	const char *bsd = "# x\nPROG= foo\n.include <bsd.prog.mk>\n";
+	CHECK(syn_lang_for_path("/src/usr.bin/foo/Makefile.depend", bsd, strlen(bsd)) == LANG_MAKE);
+	CHECK(syn_lang_for_path("/src/mkfile", bsd, strlen(bsd)) == LANG_MAKE);
+	CHECK(syn_lang_for_path("a.json", NULL, 0) == LANG_JSON);
+	CHECK(syn_lang_for_path("x/.vscode/settings.json", NULL, 0) == LANG_JSONC);
+	CHECK(syn_lang_for_path("tsconfig.base.json", NULL, 0) == LANG_JSONC);
+	CHECK(syn_lang_for_path("a.jsonc", NULL, 0) == LANG_JSONC);
+	CHECK(syn_lang_for_path("p.code-workspace", NULL, 0) == LANG_JSONC);
+	CHECK(syn_lang_for_path("compile_commands.json", NULL, 0) == LANG_JSON);
+	CHECK(syn_lang_for_path("/r/.gitignore", NULL, 0) == LANG_IGNORE);
+	CHECK(syn_lang_for_path(".dockerignore", NULL, 0) == LANG_IGNORE);
+	CHECK(syn_lang_for_path(".gitattributes", NULL, 0) == LANG_IGNORE);
+	CHECK(syn_lang_for_path("/r/.git/info/exclude", NULL, 0) == LANG_IGNORE);
+	CHECK(syn_lang_for_path("fix.patch", NULL, 0) == LANG_DIFF);
+	CHECK(syn_lang_for_path("a.diff", NULL, 0) == LANG_DIFF);
+	const char *dg = "diff --git a/x b/x\n";
+	CHECK(syn_lang_for_path("noext", dg, strlen(dg)) == LANG_DIFF);
+	CHECK(syn_lang_for_path("/r/.git/COMMIT_EDITMSG", NULL, 0) == LANG_GIT_COMMIT);
+	CHECK(syn_lang_for_path("MERGE_MSG", NULL, 0) == LANG_GIT_COMMIT);
+	CHECK(syn_lang_for_path("/r/.git/rebase-merge/git-rebase-todo", NULL, 0) == LANG_GIT_REBASE);
+	const char *sh = "#!/bin/sh\n.include x\n";
+	CHECK(syn_lang_for_path("script", sh, strlen(sh)) == LANG_SH);
+	CHECK(syn_lang_for_path("notes", "hello\n", 6) == LANG_NONE);
+	CHECK_STR(syn_lang_name(LANG_MAKE), "Makefile");
+	CHECK_STR(syn_line_comment(LANG_JSONC), "//");
+	CHECK(syn_line_comment(LANG_JSON) == NULL);
+	CHECK(syn_line_comment(LANG_DIFF) == NULL);
+	CHECK_STR(syn_line_comment(LANG_CMAKE), "#");
+	CHECK(LANG_COUNT <= 32); /* Markdown keeps a fence language in 5 bits */
+	/* Markdown fences embed the new languages (language id > 15) */
+	u32 s = lex(LANG_MARKDOWN, 0, "```jsonc");
+	s = lex(LANG_MARKDOWN, s, "{\"a\": 1} // c");
+	T("\"a\"", TK_PROPERTY);
+	T("// c", TK_COMMENT);
+	s = lex(LANG_MARKDOWN, s, "```");
+	CHECK(s == 0);
+	s = lex(LANG_MARKDOWN, 0, "```makefile");
+	s = lex(LANG_MARKDOWN, s, "all: x");
+	T("all", TK_FUNCTION);
+	s = lex(LANG_MARKDOWN, s, "````"); /* longer fence closes */
+	CHECK((s & 3u) == 0);
+}
+
+static void bench3(void)
+{
+	static const char *const mk[] = {"OBJS := $(patsubst %.c,%.o,$(SRCS))", "\t$(CC) $(CFLAGS) -c $< -o $@",
+	                                 ".for f in ${SRCS:M*.c}", "all: ${PROG}"};
+	static const char *const js[] = {"  \"name\": \"vxide\",", "  \"deps\": [1, 2, 3, true, null],",
+	                                 "  \"nested\": {\"a\": \"b\\n\"},", "}"};
+	static const char *const cm[] = {"target_link_libraries(app PUBLIC ${LIBS})", "if(WIN32)",
+	                                 "  set(X \"${Y}/z\")", "endif()"};
+	bench2(LANG_MAKE, "make", mk, 4);
+	bench2(LANG_JSON, "json", js, 4);
+	bench2(LANG_CMAKE, "cmake", cm, 4);
+}
+
 static void bench(void)
 {
 	static const char *const lines[] = {
@@ -866,7 +1213,15 @@ int main(void)
 	test_troff();
 	test_md();
 	test_detect2();
+	test_cmake();
+	test_make();
+	test_json();
+	test_ignore();
+	test_diff();
+	test_git_msgs();
+	test_detect3();
 	bench();
 	bench_more();
+	bench3();
 	return tap_done();
 }

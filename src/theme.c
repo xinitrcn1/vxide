@@ -148,6 +148,11 @@ const Theme themes[THEME_COUNT] = {
                 [TK_TAGPUNCT] = 0x808080FF,
                 [TK_ATTR] = 0x9CDCFEFF,
                 [TK_REGEX] = 0xD16969FF,
+                [TK_PROPERTY] = 0x9CDCFEFF,
+                [TK_INSERTED] = 0xB5CEA8FF,
+                [TK_DELETED] = 0xCE9178FF,
+                [TK_CHANGED] = 0x569CD6FF,
+                [TK_DIFFHDR] = 0x569CD6FF,
             },
         },
     [THEME_LIGHT] =
@@ -295,6 +300,11 @@ const Theme themes[THEME_COUNT] = {
                 [TK_TAGPUNCT] = 0x800000FF,
                 [TK_ATTR] = 0xE50000FF,
                 [TK_REGEX] = 0x811F3FFF,
+                [TK_PROPERTY] = 0x0451A5FF,
+                [TK_INSERTED] = 0x098658FF,
+                [TK_DELETED] = 0xA31515FF,
+                [TK_CHANGED] = 0x0451A5FF,
+                [TK_DIFFHDR] = 0x000080FF,
             },
         },
 };

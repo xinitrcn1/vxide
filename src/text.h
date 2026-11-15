@@ -54,6 +54,8 @@ void text_free(Text *t);
 int text_save(Text *t, const char *path); /* atomic replace + remap */
 /* Did the file on disk change since load/save? */
 bool text_changed_on_disk(const Text *t, const char *path);
+/* Remember the file's current mtime/inode (after reloading its content). */
+void text_restat(Text *t, const char *path);
 
 static inline u32 text_lines(const Text *t) { return t->nl; }
 static inline u32 text_line_start(const Text *t, u32 line) { return t->ls[line]; }

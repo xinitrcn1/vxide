@@ -18,9 +18,9 @@ LDLIBS+=	${PKG_LIBS} -lm -lpthread
 B=		build
 
 # Core modules: no window or GPU, unit-tested on their own.
-CORE=		base text syntax theme fstree json lsp git blame regex search png
+CORE=		base text syntax theme fstree json lsp git gitops gitgraph blame regex search png
 # Front end: window, Vulkan, fonts, UI.
-APP=		main gpu font icons draw ui editor panes
+APP=		main gpu font icons draw ui editor panes menu actions gitui
 
 HDRS!=		ls src/*.h
 SHADERS=	${B}/ui_vert.h ${B}/ui_frag.h
@@ -28,7 +28,7 @@ SHADERS=	${B}/ui_vert.h ${B}/ui_frag.h
 CORE_OBJS=	${CORE:S/^/${B}\//:S/$/.o/}
 APP_OBJS=	${APP:S/^/${B}\//:S/$/.o/}
 
-TESTS=		t_text t_syntax t_json t_lsp t_git t_blame t_fstree t_regex t_search
+TESTS=		t_text t_syntax t_json t_lsp t_git t_gitops t_gitgraph t_blame t_fstree t_regex t_search
 TEST_BINS=	${TESTS:S/^/${B}\//}
 
 all: ${B}/vxide

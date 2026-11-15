@@ -1,0 +1,29 @@
+# Git actions from the command palette (stash, branch, checkout, tag)
+key ctrl+shift+p
+type git stash (include
+key Return
+type wip
+key Return
+wait 1500
+key ctrl+shift+p
+type git: create branch...
+key Return
+type topic
+key Return
+wait 1500
+key ctrl+shift+p
+type git: checkout to
+key Return
+type main
+key Return
+wait 1500
+key ctrl+shift+p
+type git: pop latest
+key Return
+wait 1500
+key ctrl+shift+p
+type git: create tag
+key Return
+type v1
+key Return
+wait 1500

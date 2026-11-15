@@ -2919,6 +2919,1181 @@ static u32 lex_troff(u32 state, const char *s, u32 n, SynSpans *o)
 }
 
 /* ================================================================== */
+/* Shared helpers for the build-file / data / git lexers               */
+
+static u32 lex_any(int lang, u32 state, const char *s, u32 n, SynSpans *o);
+
+/* Run another lexer on s[off, n) and emit its spans shifted by off. */
+static u32 lex_shifted(int lang, u32 state, const char *s, u32 n, u32 off, SynSpans *o)
+{
+	if (off > n)
+		off = n;
+	if (!o)
+		return lex_any(lang, state, s + off, n - off, NULL);
+	u32 st[512], ln[512];
+	u8 cl[512];
+	SynSpans t = {st, ln, cl, 0, 512};
+	u32 r = lex_any(lang, state, s + off, n - off, &t);
+	for (u32 k = 0; k < t.count; k++)
+		emit(o, t.start[k] + off, t.len[k], t.cls[k]);
+	return r;
+}
+
+/* Does the line end with an odd number of backslashes (continuation)? */
+static bool line_continues(const char *s, u32 n)
+{
+	while (n && (s[n - 1] == '\r'))
+		n--;
+	u32 k = 0;
+	while (k < n && s[n - 1 - k] == '\\')
+		k++;
+	return k & 1u;
+}
+
+static KwSet kw_cmake, kw_mkfn, kw_mkdir, kw_bsddir;
+
+/* ================================================================== */
+/* Ignore files (.gitignore, .dockerignore, .gitattributes ...)        */
+/*
+ * VSCodium's ignore.tmLanguage only scopes comments. vxide also marks the
+ * negation "!" and the trailing "/" (operators), escapes, and glob
+ * metacharacters (* ? ** [...], regexp colour). In .gitattributes-style
+ * lines, words after the pattern are attributes ("-text", "eol=lf"). */
+static u32 lex_ignore(u32 state, const char *s, u32 n, SynSpans *o)
+{
+	(void)state;
+	u32 i = skip_ws(s, n, 0);
+	if (i < n && s[i] == '#') {
+		emit(o, i, n - i, TK_COMMENT);
+		return 0;
+	}
+	if (i < n && s[i] == '!') {
+		emit(o, i, 1, TK_OPERATOR);
+		i++;
+	}
+	/* end of the pattern: first unescaped blank */
+	u32 e = i;
+	while (e < n && s[e] != ' ' && s[e] != '\t' && s[e] != '\r') {
+		if (s[e] == '\\' && e + 1 < n)
+			e++;
+		e++;
+	}
+	for (u32 k = i; k < e; k++) {
+		u8 c = (u8)s[k];
+		if (c == '\\' && k + 1 < e) {
+			emit(o, k, 2, TK_ESCAPE);
+			k++;
+		} else if (c == '*' || c == '?') {
+			emit(o, k, 1, TK_REGEX);
+		} else if (c == '[') {
+			u32 j = k + 1;
+			while (j < e && s[j] != ']')
+				j++;
+			if (j < e) {
+				emit(o, k, j - k + 1, TK_REGEX);
+				k = j;
+			}
+		} else if (c == '/' && (k + 1 == e || k == i)) {
+			emit(o, k, 1, TK_OPERATOR); /* directory marker / anchor */
+		}
+	}
+	/* attributes (.gitattributes) */
+	u32 k = e;
+	while (k < n) {
+		k = skip_ws(s, n, k);
+		if (k >= n)
+			break;
+		if (s[k] == '#') {
+			emit(o, k, n - k, TK_COMMENT);
+			break;
+		}
+		u32 a = k;
+		if (s[k] == '-' || s[k] == '!') {
+			emit(o, k, 1, TK_OPERATOR);
+			a = ++k;
+		}
+		while (k < n && s[k] != '=' && s[k] != ' ' && s[k] != '\t')
+			k++;
+		emit(o, a, k - a, TK_PROPERTY);
+		if (k < n && s[k] == '=') {
+			emit(o, k, 1, TK_OPERATOR);
+			u32 v = ++k;
+			while (k < n && s[k] != ' ' && s[k] != '\t')
+				k++;
+			emit(o, v, k - v, TK_STRING);
+		}
+	}
+	return 0;
+}
+
+/* ================================================================== */
+/* JSON / JSONC                                                        */
+/*
+ * Per VSCodium's JSON.tmLanguage under Dark+: object keys are
+ * support.type.property-name.json (#9CDCFE / #0451A5), string values
+ * string.quoted.double (#CE9178), escapes constant.character.escape,
+ * bad escapes invalid.illegal, numbers, true/false/null constant.language.
+ * A string is a key when the next non-blank character on its line is ':'.
+ * Comments are coloured in both JSON and JSONC (the grammar has them).
+ *
+ * State: 0 normal, 1 inside a block comment. */
+static u32 lex_json(u32 state, const char *s, u32 n, SynSpans *o)
+{
+	u32 i = 0;
+	if (state == 1) {
+		while (i + 1 < n && !(s[i] == '*' && s[i + 1] == '/'))
+			i++;
+		if (i + 1 >= n) {
+			emit(o, 0, n, TK_COMMENT);
+			return 1;
+		}
+		i += 2;
+		emit(o, 0, i, TK_COMMENT);
+	}
+	while (i < n) {
+		u8 c = (u8)s[i];
+		if (is_space(c)) {
+			i++;
+			continue;
+		}
+		if (c == '/' && i + 1 < n && s[i + 1] == '/') {
+			emit(o, i, n - i, TK_COMMENT);
+			return 0;
+		}
+		if (c == '/' && i + 1 < n && s[i + 1] == '*') {
+			u32 j = i + 2;
+			while (j + 1 < n && !(s[j] == '*' && s[j + 1] == '/'))
+				j++;
+			if (j + 1 >= n) {
+				emit(o, i, n - i, TK_COMMENT);
+				return 1;
+			}
+			emit(o, i, j + 2 - i, TK_COMMENT);
+			i = j + 2;
+			continue;
+		}
+		if (c == '"') {
+			/* find the end first to decide key vs value */
+			u32 j = i + 1;
+			while (j < n && s[j] != '"') {
+				if (s[j] == '\\' && j + 1 < n)
+					j++;
+				j++;
+			}
+			u32 end = j < n ? j + 1 : n;
+			u32 nx = skip_ws(s, n, end);
+			u32 cls = (nx < n && s[nx] == ':') ? TK_PROPERTY : TK_STRING;
+			u32 run = i;
+			for (u32 k = i + 1; k < end; k++) {
+				if (s[k] != '\\' || k + 1 >= end)
+					continue;
+				u8 e = (u8)s[k + 1];
+				u32 el = 2;
+				bool ok = in_set("\"\\/bfnrt", e);
+				if (e == 'u') {
+					ok = k + 5 < end + 1 && k + 5 <= n;
+					for (u32 q = 2; ok && q < 6; q++)
+						ok = k + q < n && is_xdigit((u8)s[k + q]);
+					el = ok ? 6 : 2;
+				}
+				emit(o, run, k - run, cls);
+				emit(o, k, el, ok ? TK_ESCAPE : TK_INVALID);
+				k += el - 1;
+				run = k + 1;
+			}
+			emit(o, run, end - run, cls);
+			i = end;
+			continue;
+		}
+		if (c == '-' || is_digit(c)) {
+			u32 j = i + (c == '-');
+			while (j < n && is_digit((u8)s[j]))
+				j++;
+			if (j < n && s[j] == '.') {
+				j++;
+				while (j < n && is_digit((u8)s[j]))
+					j++;
+			}
+			if (j < n && (s[j] == 'e' || s[j] == 'E')) {
+				j++;
+				if (j < n && (s[j] == '+' || s[j] == '-'))
+					j++;
+				while (j < n && is_digit((u8)s[j]))
+					j++;
+			}
+			emit(o, i, j - i, TK_NUMBER);
+			i = j;
+			continue;
+		}
+		if (is_alpha(c)) {
+			u32 j = i;
+			while (j < n && is_word((u8)s[j]))
+				j++;
+			if (word_is(s + i, j - i, "true") || word_is(s + i, j - i, "false") || word_is(s + i, j - i, "null"))
+				emit(o, i, j - i, TK_LANGCONST);
+			i = j;
+			continue;
+		}
+		i++;
+	}
+	return 0;
+}
+
+/* ================================================================== */
+/* CMake                                                               */
+/*
+ * VSCodium has no CMake grammar; scopes follow the twxs.cmake extension:
+ * flow control commands are keyword.control, other commands (known or
+ * user-defined) entity.name.function, upper-case arguments (PUBLIC,
+ * REQUIRED, CMAKE_C_STANDARD ...) constants, ON/OFF/TRUE/FALSE/YES/NO
+ * constant.language, ${VAR} $ENV{VAR} $CACHE{VAR} variables (nested),
+ * $<GENEX:...> preprocessor-like, quoted strings with escapes, bracket
+ * arguments [=[...]=] strings and #[=[...]=] bracket comments.
+ *
+ * State: bits 0-1 mode (0 normal, 1 bracket comment, 2 bracket argument,
+ * 3 quoted string), bits 2-5 '=' count of the open bracket, bits 6-9
+ * parenthesis depth (an identifier followed by '(' at depth 0 is a
+ * command). */
+enum { CMK_NORMAL, CMK_BCOMMENT, CMK_BARG, CMK_STRING };
+#define CMK_STATE(mode, eq, depth) ((u32)(mode) | ((u32)(eq) << 2) | ((u32)(depth) << 6))
+
+static const char cmake_control[] =
+    "if elseif else endif foreach endforeach while endwhile function endfunction macro endmacro "
+    "return break continue block endblock";
+static const char cmake_const[] = "on off true false yes no y n ignore notfound";
+
+/* Bracket "[" "="* "[" at i: returns '=' count, or -1. */
+static int cmake_bracket_open(const char *s, u32 n, u32 i)
+{
+	if (i >= n || s[i] != '[')
+		return -1;
+	u32 j = i + 1;
+	while (j < n && s[j] == '=')
+		j++;
+	if (j < n && s[j] == '[' && j - i - 1 < 16)
+		return (int)(j - i - 1);
+	return -1;
+}
+
+/* Find "]" "="*eq "]" from i; returns the index after it or UINT32_MAX. */
+static u32 cmake_bracket_close(const char *s, u32 n, u32 i, u32 eq)
+{
+	for (u32 k = i; k + eq + 1 < n; k++) {
+		if (s[k] != ']')
+			continue;
+		u32 q = 0;
+		while (q < eq && s[k + 1 + q] == '=')
+			q++;
+		if (q == eq && s[k + 1 + eq] == ']')
+			return k + eq + 2;
+	}
+	return UINT32_MAX;
+}
+
+/* ${...} $ENV{...} $CACHE{...} (nested) or $<...> at s[i] == '$'. */
+static u32 cmake_ref(const char *s, u32 n, u32 i, SynSpans *o, int depth)
+{
+	u32 j = i + 1;
+	if (j < n && s[j] == '<') {
+		/* generator expression: $<NAME:args> */
+		u32 a = j + 1;
+		while (a < n && (is_word((u8)s[a]) || s[a] == '-'))
+			a++;
+		emit(o, i, a - i, TK_PREPROC);
+		u32 k = a;
+		while (k < n && s[k] != '>') {
+			if (s[k] == '$' && depth < 8) {
+				k = cmake_ref(s, n, k, o, depth + 1);
+				continue;
+			}
+			k++;
+		}
+		if (k < n) {
+			emit(o, k, 1, TK_PREPROC);
+			k++;
+		}
+		return k;
+	}
+	if (j + 3 < n && memcmp(s + j, "ENV{", 4) == 0)
+		j += 3;
+	else if (j + 5 < n && memcmp(s + j, "CACHE{", 6) == 0)
+		j += 5;
+	if (j >= n || s[j] != '{') {
+		return i + 1; /* lone $ */
+	}
+	u32 k = j + 1, run = i;
+	while (k < n && s[k] != '}') {
+		if (s[k] == '$' && depth < 8 && k + 1 < n && (s[k + 1] == '{' || s[k + 1] == '<' || s[k + 1] == 'E' || s[k + 1] == 'C')) {
+			emit(o, run, k - run, TK_VARIABLE);
+			k = cmake_ref(s, n, k, o, depth + 1);
+			run = k;
+			continue;
+		}
+		k++;
+	}
+	if (k < n)
+		k++;
+	emit(o, run, k - run, TK_VARIABLE);
+	return k;
+}
+
+/* Quoted argument body from i (after the opening quote); returns the index
+ * after the closing quote, or n with *closed = false. */
+static u32 cmake_string(const char *s, u32 n, u32 i, SynSpans *o, bool *closed)
+{
+	u32 run = i;
+	*closed = false;
+	while (i < n) {
+		if (s[i] == '"') {
+			emit(o, run, i + 1 - run, TK_STRING);
+			*closed = true;
+			return i + 1;
+		}
+		if (s[i] == '\\' && i + 1 < n) {
+			emit(o, run, i - run, TK_STRING);
+			emit(o, i, 2, TK_ESCAPE);
+			i += 2;
+			run = i;
+			continue;
+		}
+		if (s[i] == '$' && i + 1 < n && (s[i + 1] == '{' || s[i + 1] == '<' || s[i + 1] == 'E' || s[i + 1] == 'C')) {
+			emit(o, run, i - run, TK_STRING);
+			u32 k = cmake_ref(s, n, i, o, 0);
+			if (k == i + 1)
+				emit(o, i, 1, TK_STRING);
+			i = k;
+			run = i;
+			continue;
+		}
+		i++;
+	}
+	emit(o, run, n - run, TK_STRING);
+	return n;
+}
+
+static u32 lex_cmake(u32 state, const char *s, u32 n, SynSpans *o)
+{
+	u32 mode = state & 3u, eq = (state >> 2) & 15u, depth = (state >> 6) & 15u;
+	u32 i = 0;
+	if (mode == CMK_BCOMMENT || mode == CMK_BARG) {
+		u32 e = cmake_bracket_close(s, n, 0, eq);
+		u32 cls = mode == CMK_BCOMMENT ? TK_COMMENT : TK_STRING;
+		if (e == UINT32_MAX) {
+			emit(o, 0, n, cls);
+			return state;
+		}
+		emit(o, 0, e, cls);
+		i = e;
+	} else if (mode == CMK_STRING) {
+		bool closed;
+		i = cmake_string(s, n, 0, o, &closed);
+		if (!closed)
+			return state;
+	}
+	while (i < n) {
+		u8 c = (u8)s[i];
+		if (is_space(c)) {
+			i++;
+			continue;
+		}
+		if (c == '#') {
+			int b = cmake_bracket_open(s, n, i + 1);
+			if (b >= 0) {
+				u32 e = cmake_bracket_close(s, n, i + (u32)b + 3, (u32)b);
+				if (e == UINT32_MAX) {
+					emit(o, i, n - i, TK_COMMENT);
+					return CMK_STATE(CMK_BCOMMENT, b, depth);
+				}
+				emit(o, i, e - i, TK_COMMENT);
+				i = e;
+				continue;
+			}
+			emit(o, i, n - i, TK_COMMENT);
+			break;
+		}
+		if (c == '[') {
+			int b = cmake_bracket_open(s, n, i);
+			if (b >= 0) {
+				u32 e = cmake_bracket_close(s, n, i + (u32)b + 2, (u32)b);
+				if (e == UINT32_MAX) {
+					emit(o, i, n - i, TK_STRING);
+					return CMK_STATE(CMK_BARG, b, depth);
+				}
+				emit(o, i, e - i, TK_STRING);
+				i = e;
+				continue;
+			}
+		}
+		if (c == '"') {
+			bool closed;
+			emit(o, i, 1, TK_STRING);
+			i = cmake_string(s, n, i + 1, o, &closed);
+			if (!closed)
+				return CMK_STATE(CMK_STRING, 0, depth);
+			continue;
+		}
+		if (c == '$') {
+			u32 k = cmake_ref(s, n, i, o, 0);
+			i = k > i ? k : i + 1;
+			continue;
+		}
+		if (c == '(') {
+			if (depth < 15)
+				depth++;
+			i++;
+			continue;
+		}
+		if (c == ')') {
+			if (depth)
+				depth--;
+			i++;
+			continue;
+		}
+		/* unquoted argument or command name */
+		u32 j = i;
+		while (j < n && !is_space((u8)s[j]) && !in_set("()\"#$", (u8)s[j])) {
+			if (s[j] == '\\' && j + 1 < n)
+				j++;
+			j++;
+		}
+		if (j == i) {
+			i++;
+			continue;
+		}
+		u32 wl = j - i;
+		bool ident = is_alpha(c) || c == '_';
+		for (u32 k = i; k < j && ident; k++)
+			ident = is_word((u8)s[k]);
+		if (depth == 0 && ident) {
+			u32 nx = skip_ws(s, n, j);
+			if (nx < n && s[nx] == '(') {
+				emit(o, i, wl, kw_find_ci(&kw_cmake, s + i, wl) == TK_CONTROL ? TK_CONTROL : TK_FUNCTION);
+				i = j;
+				continue;
+			}
+		}
+		if (kw_find_ci(&kw_cmake, s + i, wl) == TK_LANGCONST) {
+			emit(o, i, wl, TK_LANGCONST);
+		} else if (ident && wl >= 2) {
+			bool upper = true, alpha = false;
+			for (u32 k = i; k < j; k++) {
+				u8 q = (u8)s[k];
+				if (q >= 'a' && q <= 'z')
+					upper = false;
+				if (is_alpha(q))
+					alpha = true;
+			}
+			if (upper && alpha)
+				emit(o, i, wl, TK_CONSTANT);
+		} else {
+			bool num = is_digit(c);
+			for (u32 k = i; k < j && num; k++)
+				num = is_digit((u8)s[k]) || s[k] == '.';
+			if (num)
+				emit(o, i, wl, TK_NUMBER);
+			else
+				for (u32 k = i; k + 1 < j; k++)
+					if (s[k] == '\\') {
+						emit(o, k, 2, TK_ESCAPE);
+						k++;
+					}
+		}
+		i = j;
+	}
+	return CMK_STATE(CMK_NORMAL, 0, depth);
+}
+
+/* ================================================================== */
+/* Make (BSD make and GNU make)                                        */
+/*
+ * GNU parts follow VSCodium's make.tmLanguage under Dark+: targets are
+ * entity.name.function.target, assignments variable.other, $(VAR) and
+ * ${VAR} variable.other, automatic and built-in variables ($@ $< $(MAKE))
+ * variable.language, $(patsubst ...) and friends support.function, and
+ * directives keyword.control. Recipe lines (tab first) are highlighted
+ * with the shell lexer, with make references painted over it; the
+ * @/-/+ prefixes are keyword.control as in the grammar.
+ *
+ * BSD make: .if/.for/.include/... are keyword.control, condition
+ * functions (defined make empty exists target commands) functions,
+ * ${VAR:M*.c:S/a/b/} modifiers functions, local variables (${.TARGET},
+ * ${.ALLSRC} ...) variable.language.
+ *
+ * State: bits 0-2 mode (0 normal, 1 continued value line, 2 recipe
+ * continuation, 3 define body, 4 continued comment); bits 3-19 the shell
+ * lexer's state across continued recipe lines (17 bits: a heredoc cannot
+ * span recipe lines). */
+enum { MK_NORMAL, MK_CONT, MK_RECIPE, MK_DEFINE, MK_COMMENT };
+enum { MKF_FUNC = 1, MKF_BUILTIN };
+
+static const char mk_functions[] =
+    "subst patsubst strip findstring filter filter-out sort word wordlist words firstword lastword dir notdir "
+    "suffix basename addsuffix addprefix join wildcard realpath abspath error warning shell origin flavor "
+    "foreach if or and call eval file value info let intcmp guile";
+static const char mk_builtins[] =
+    "MAKEFILES VPATH SHELL MAKESHELL MAKE MAKELEVEL MAKEFLAGS MFLAGS MAKECMDGOALS CURDIR SUFFIXES "
+    ".LIBPATTERNS .DEFAULT_GOAL .RECIPEPREFIX .VARIABLES .FEATURES .INCLUDE_DIRS .SHELLSTATUS "
+    ".TARGET .ALLSRC .IMPSRC .OODATE .PREFIX .MEMBER .ARCHIVE .CURDIR .OBJDIR .MAKE .MAKEFLAGS "
+    ".MAKEOVERRIDES .PARSEDIR .PARSEFILE .INCLUDEDFROMDIR .INCLUDEDFROMFILE .MAKE.LEVEL .MAKE.MODE "
+    ".MAKE.OS .MAKE.PID .MAKE.PPID .MAKE.JOBS .MAKE.MAKEFILES .MAKE.META.FILES .SHELL .PATH .ERROR_TARGET "
+    "MACHINE MACHINE_ARCH MAKEOBJDIR MAKEOBJDIRPREFIX MAKESYSPATH";
+static const char mk_gnu_dirs[] =
+    "include -include sinclude ifeq ifneq ifdef ifndef else endif define endef export unexport override "
+    "undefine vpath private";
+static const char mk_bsd_dirs[] =
+    "if ifdef ifndef ifmake ifnmake elif elifdef elifndef elifmake elifnmake else endif for endfor include "
+    "sinclude dinclude -include undef export export-env export-literal unexport unexport-env info warning "
+    "error break poison";
+
+static u32 mk_ref(const char *s, u32 n, u32 i, SynSpans *o, int depth);
+
+/* Text with make references and comments; stops at a '#' comment unless
+ * no_comment. Returns the end. */
+static u32 mk_text(const char *s, u32 n, u32 i, u32 end, SynSpans *o, bool comments, u32 cls)
+{
+	(void)n;
+	u32 run = i;
+	while (i < end) {
+		u8 c = (u8)s[i];
+		if (c == '\\' && i + 1 < end) {
+			i += 2;
+			continue;
+		}
+		if (c == '$') {
+			emit(o, run, i - run, cls);
+			i = mk_ref(s, end, i, o, 0);
+			run = i;
+			continue;
+		}
+		if (c == '#' && comments) {
+			emit(o, run, i - run, cls);
+			emit(o, i, end - i, TK_COMMENT);
+			return end;
+		}
+		i++;
+	}
+	emit(o, run, end - run, cls);
+	return end;
+}
+
+/* $x, $(...), ${...} at s[i] == '$'. */
+static u32 mk_ref(const char *s, u32 n, u32 i, SynSpans *o, int depth)
+{
+	if (i + 1 >= n)
+		return i + 1;
+	u8 c = (u8)s[i + 1];
+	if (c != '(' && c != '{') {
+		emit(o, i, 2, TK_LANGCONST); /* $@ $< $^ $$ $1 ... */
+		return i + 2;
+	}
+	u8 close = c == '(' ? ')' : '}';
+	u32 a = i + 2, k = a;
+	while (k < n && !is_space((u8)s[k]) && s[k] != ':' && s[k] != close && s[k] != '$' && s[k] != '=' &&
+	       s[k] != '(' && s[k] != '{')
+		k++;
+	u32 nl = k - a;
+	int kind = kw_find(&kw_mkfn, s + a, nl);
+	bool fn = kind == MKF_FUNC && k < n && is_space((u8)s[k]);
+	u32 cls = fn ? TK_FUNCTION : kind == MKF_BUILTIN ? TK_LANGCONST : TK_VARIABLE;
+	if (!fn && nl == 1 && in_set("@<^?*%+|", (u8)s[a]))
+		cls = TK_LANGCONST; /* ${@} ${<} */
+	emit(o, i, k - i, cls);
+	/* nested name / arguments / modifiers up to the matching close */
+	u32 d = 0;
+	u32 run = k;
+	bool in_mod = false;
+	while (k < n) {
+		u8 q = (u8)s[k];
+		if (q == '$' && depth < 8) {
+			emit(o, run, k - run, (fn || in_mod) ? TK_TEXT : cls);
+			k = mk_ref(s, n, k, o, depth + 1);
+			run = k;
+			continue;
+		}
+		if (q == '(' || q == '{')
+			d++;
+		else if (q == close || q == (close == ')' ? '}' : ')')) {
+			if (d == 0 && q == close) {
+				emit(o, run, k - run, (fn || in_mod) ? TK_TEXT : cls);
+				emit(o, k, 1, cls);
+				return k + 1;
+			}
+			if (d)
+				d--;
+		} else if (q == ':' && !fn && d == 0) {
+			/* modifier: BSD :M :S/a/b/ :tl ...; GNU $(X:.c=.o) */
+			emit(o, run, k - run, in_mod ? TK_TEXT : cls);
+			u32 m = k + 1;
+			while (m < n && is_alpha((u8)s[m]))
+				m++;
+			if (m == k + 1 && m < n && in_set("!=?@%_[", (u8)s[m]))
+				m++;
+			emit(o, k, m - k, m > k + 1 ? TK_FUNCTION : TK_OPERATOR);
+			in_mod = true;
+			k = m;
+			run = k;
+			continue;
+		}
+		k++;
+	}
+	emit(o, run, n - run, (fn || in_mod) ? TK_TEXT : cls);
+	return n;
+}
+
+/* Make references in a recipe painted over the shell lexer's spans. */
+static u32 mk_recipe(u32 shst, const char *s, u32 n, u32 off, SynSpans *o)
+{
+	enum { MAXL = 2048 };
+	if (!o || n - off > MAXL) {
+		u32 r = lex_any(LANG_SH, shst, s + off, n - off, NULL);
+		mk_text(s, n, off, n, o, false, TK_TEXT);
+		return r;
+	}
+	u8 cls[MAXL];
+	u32 len = n - off;
+	memset(cls, TK_TEXT, len);
+	u32 st[512], ln[512];
+	u8 cl[512];
+	SynSpans t = {st, ln, cl, 0, 512};
+	u32 r = lex_any(LANG_SH, shst, s + off, len, &t);
+	for (u32 k = 0; k < t.count; k++)
+		memset(cls + t.start[k], t.cls[k], VX_MIN(t.len[k], len - t.start[k]));
+	t.count = 0;
+	for (u32 i = off; i < n;) {
+		if (s[i] == '$') {
+			u32 e = mk_ref(s, n, i, &t, 0);
+			memset(cls + (i - off), TK_TEXT, e - i);
+			i = e;
+		} else {
+			i++;
+		}
+	}
+	for (u32 k = 0; k < t.count; k++)
+		memset(cls + (t.start[k] - off), t.cls[k], VX_MIN(t.len[k], n - t.start[k]));
+	u32 a = 0;
+	for (u32 k = 1; k <= len; k++)
+		if (k == len || cls[k] != cls[a]) {
+			emit(o, off + a, k - a, cls[a]);
+			a = k;
+		}
+	return r;
+}
+
+static u32 mk_recipe_state(u32 shst, bool cont)
+{
+	if (!cont)
+		return MK_NORMAL;
+	if (shst >= (1u << 17))
+		shst = 0;
+	return MK_RECIPE | (shst << 3);
+}
+
+/* Assignment at i? Sets the name end and the operator span. */
+static bool mk_assign(const char *s, u32 n, u32 i, u32 *name_end, u32 *op, u32 *opl)
+{
+	u32 k = i;
+	int d = 0;
+	while (k < n) {
+		u8 c = (u8)s[k];
+		if (c == '$' && k + 1 < n && (s[k + 1] == '(' || s[k + 1] == '{')) {
+			d++;
+			k += 2;
+			continue;
+		}
+		if (d && (c == ')' || c == '}')) {
+			d--;
+			k++;
+			continue;
+		}
+		if (!d && (is_space(c) || c == '=' || c == ':' || c == '#' || c == ';'))
+			break;
+		if (!d && (c == '?' || c == '+' || c == '!') && k + 1 < n && s[k + 1] == '=')
+			break;
+		k++;
+	}
+	if (k == i)
+		return false;
+	*name_end = k;
+	u32 p = skip_ws(s, n, k);
+	static const char *const ops[] = {":::=", "::=", ":=", "?=", "+=", "!=", "="};
+	for (size_t q = 0; q < VX_COUNT(ops); q++) {
+		u32 l = (u32)strlen(ops[q]);
+		if (p + l <= n && memcmp(s + p, ops[q], l) == 0) {
+			*op = p;
+			*opl = l;
+			return true;
+		}
+	}
+	return false;
+}
+
+/* BSD conditional expression / directive arguments. */
+static void mk_cond(const char *s, u32 n, u32 i, SynSpans *o)
+{
+	while (i < n) {
+		u8 c = (u8)s[i];
+		if (c == '#') {
+			emit(o, i, n - i, TK_COMMENT);
+			return;
+		}
+		if (c == '$') {
+			i = mk_ref(s, n, i, o, 0);
+			continue;
+		}
+		if (c == '"' || c == '<') {
+			u8 q = c == '<' ? '>' : '"';
+			u32 j = i + 1, run = i;
+			while (j < n && s[j] != q) {
+				if (s[j] == '$') {
+					emit(o, run, j - run, TK_STRING);
+					j = mk_ref(s, n, j, o, 0);
+					run = j;
+					continue;
+				}
+				j++;
+			}
+			if (j < n)
+				j++;
+			emit(o, run, j - run, TK_STRING);
+			i = j;
+			continue;
+		}
+		if (in_set("=!<>&|", c)) {
+			u32 j = i + 1;
+			if (j < n && in_set("=&|", (u8)s[j]))
+				j++;
+			emit(o, i, j - i, TK_OPERATOR);
+			i = j;
+			continue;
+		}
+		if (is_digit(c)) {
+			u32 j = i;
+			while (j < n && (is_xdigit((u8)s[j]) || s[j] == 'x' || s[j] == '.'))
+				j++;
+			emit(o, i, j - i, TK_NUMBER);
+			i = j;
+			continue;
+		}
+		if (is_alpha(c)) {
+			u32 j = i;
+			while (j < n && is_word((u8)s[j]))
+				j++;
+			u32 nx = skip_ws(s, n, j);
+			if (nx < n && s[nx] == '(' &&
+			    (word_is(s + i, j - i, "defined") || word_is(s + i, j - i, "make") || word_is(s + i, j - i, "empty") ||
+			     word_is(s + i, j - i, "exists") || word_is(s + i, j - i, "target") || word_is(s + i, j - i, "commands")))
+				emit(o, i, j - i, TK_FUNCTION);
+			i = j;
+			continue;
+		}
+		i++;
+	}
+}
+
+static u32 mk_end_state(const char *s, u32 n, u32 mode_if_cont)
+{
+	return line_continues(s, n) ? mode_if_cont : MK_NORMAL;
+}
+
+static u32 lex_make(u32 state, const char *s, u32 n, SynSpans *o)
+{
+	u32 mode = state & 7u;
+	if (mode == MK_COMMENT) {
+		emit(o, 0, n, TK_COMMENT);
+		return mk_end_state(s, n, MK_COMMENT);
+	}
+	if (mode == MK_RECIPE) {
+		u32 r = mk_recipe(state >> 3, s, n, 0, o);
+		return mk_recipe_state(r, line_continues(s, n));
+	}
+	if (mode == MK_CONT) {
+		mk_text(s, n, 0, n, o, true, TK_TEXT);
+		return mk_end_state(s, n, MK_CONT);
+	}
+	if (mode == MK_DEFINE) {
+		u32 i = skip_ws(s, n, 0), j = i;
+		while (j < n && is_word((u8)s[j]))
+			j++;
+		if (word_is(s + i, j - i, "endef")) {
+			emit(o, i, 5, TK_CONTROL);
+			mk_text(s, n, j, n, o, true, TK_TEXT);
+			return MK_NORMAL;
+		}
+		mk_text(s, n, 0, n, o, false, TK_TEXT);
+		return MK_DEFINE;
+	}
+	if (n && s[0] == '\t') {
+		/* recipe: @ - + prefixes, then shell */
+		u32 i = 1;
+		while (i < n && (s[i] == '@' || s[i] == '-' || s[i] == '+' || s[i] == ' ' || s[i] == '\t')) {
+			if (s[i] != ' ' && s[i] != '\t')
+				emit(o, i, 1, TK_CONTROL);
+			i++;
+		}
+		u32 r = mk_recipe(0, s, n, i, o);
+		return mk_recipe_state(r, line_continues(s, n));
+	}
+	u32 i = skip_ws(s, n, 0);
+	if (i >= n)
+		return MK_NORMAL;
+	if (s[i] == '#') {
+		emit(o, i, n - i, TK_COMMENT);
+		return mk_end_state(s, n, MK_COMMENT);
+	}
+	/* BSD directive: '.' blanks word */
+	if (s[i] == '.') {
+		u32 a = skip_ws(s, n, i + 1), b = a;
+		while (b < n && (is_word((u8)s[b]) || s[b] == '-'))
+			b++;
+		if (b > a && kw_find(&kw_bsddir, s + a, b - a) >= 0) {
+			emit(o, i, 1, TK_CONTROL);
+			emit(o, a, b - a, TK_CONTROL);
+			if (word_is(s + a, b - a, "for")) {
+				/* .for x y in list */
+				u32 k = b;
+				for (;;) {
+					k = skip_ws(s, n, k);
+					u32 w = k;
+					while (k < n && !is_space((u8)s[k]))
+						k++;
+					if (k == w)
+						break;
+					if (word_is(s + w, k - w, "in")) {
+						emit(o, w, 2, TK_CONTROL);
+						mk_text(s, n, k, n, o, true, TK_TEXT);
+						break;
+					}
+					emit(o, w, k - w, TK_VARIABLE);
+				}
+			} else {
+				mk_cond(s, n, b, o);
+			}
+			return mk_end_state(s, n, MK_CONT);
+		}
+	}
+	/* GNU directive */
+	{
+		u32 b = i;
+		while (b < n && (is_word((u8)s[b]) || s[b] == '-'))
+			b++;
+		if (b > i && (b == n || is_space((u8)s[b]) || s[b] == '(') && kw_find(&kw_mkdir, s + i, b - i) >= 0) {
+			u32 na, op, opl;
+			bool assign_after = (word_is(s + i, b - i, "export") || word_is(s + i, b - i, "override") ||
+			                     word_is(s + i, b - i, "private") || word_is(s + i, b - i, "unexport")) &&
+			                    mk_assign(s, n, skip_ws(s, n, b), &na, &op, &opl);
+			emit(o, i, b - i, TK_CONTROL);
+			if (word_is(s + i, b - i, "define")) {
+				u32 a = skip_ws(s, n, b), e = a;
+				while (e < n && !is_space((u8)s[e]))
+					e++;
+				emit(o, a, e - a, TK_VARIABLE);
+				mk_text(s, n, e, n, o, true, TK_TEXT);
+				return MK_DEFINE;
+			}
+			if (assign_after) {
+				u32 a = skip_ws(s, n, b);
+				mk_text(s, na, a, na, o, false, TK_VARIABLE);
+				emit(o, op, opl, TK_OPERATOR);
+				mk_text(s, n, op + opl, n, o, true, TK_TEXT);
+			} else if (word_is(s + i, b - i, "else")) {
+				/* else ifeq (...) */
+				u32 a = skip_ws(s, n, b), e = a;
+				while (e < n && is_word((u8)s[e]))
+					e++;
+				if (e > a && kw_find(&kw_mkdir, s + a, e - a) >= 0)
+					emit(o, a, e - a, TK_CONTROL);
+				mk_text(s, n, e, n, o, true, TK_TEXT);
+			} else {
+				mk_text(s, n, b, n, o, true, TK_TEXT);
+			}
+			return mk_end_state(s, n, MK_CONT);
+		}
+	}
+	/* assignment */
+	u32 na, op, opl;
+	if (mk_assign(s, n, i, &na, &op, &opl)) {
+		mk_text(s, na, i, na, o, false, TK_VARIABLE);
+		emit(o, op, opl, TK_OPERATOR);
+		mk_text(s, n, op + opl, n, o, true, TK_TEXT);
+		return mk_end_state(s, n, MK_CONT);
+	}
+	/* rule: targets ':' / '::' / '!' prerequisites [; recipe] */
+	u32 k = i;
+	int d = 0;
+	while (k < n) {
+		u8 c = (u8)s[k];
+		if (c == '$' && k + 1 < n && (s[k + 1] == '(' || s[k + 1] == '{')) {
+			d++;
+			k += 2;
+			continue;
+		}
+		if (d && (c == ')' || c == '}'))
+			d--;
+		else if (!d && (c == ':' || c == '#' || (c == '!' && k > i && is_space((u8)s[k - 1]))))
+			break;
+		k++;
+	}
+	if (k < n && (s[k] == ':' || s[k] == '!')) {
+		/* target names */
+		u32 t = i;
+		while (t < k) {
+			t = skip_ws(s, k, t);
+			u32 e = t;
+			int dd = 0;
+			while (e < k && (dd || !is_space((u8)s[e]))) {
+				if (s[e] == '$' && e + 1 < k && (s[e + 1] == '(' || s[e + 1] == '{'))
+					dd++;
+				else if (dd && (s[e] == ')' || s[e] == '}'))
+					dd--;
+				e++;
+			}
+			if (e > t) {
+				u32 run = t;
+				for (u32 q = t; q < e;) {
+					if (s[q] == '$') {
+						emit(o, run, q - run, TK_FUNCTION);
+						q = mk_ref(s, e, q, o, 0);
+						run = q;
+					} else if (s[q] == '%') {
+						emit(o, run, q - run, TK_FUNCTION);
+						emit(o, q, 1, TK_VARIABLE);
+						run = ++q;
+					} else {
+						q++;
+					}
+				}
+				emit(o, run, e - run, TK_FUNCTION);
+			}
+			t = e;
+		}
+		u32 p = k + 1;
+		if (p < n && s[p] == ':')
+			p++;
+		/* prerequisites, then an optional ;recipe */
+		u32 semi = p;
+		int d2 = 0;
+		while (semi < n && !(d2 == 0 && (s[semi] == ';' || s[semi] == '#'))) {
+			if (s[semi] == '$' && semi + 1 < n && (s[semi + 1] == '(' || s[semi + 1] == '{'))
+				d2++;
+			else if (d2 && (s[semi] == ')' || s[semi] == '}'))
+				d2--;
+			semi++;
+		}
+		for (u32 q = p; q < semi;) {
+			if (s[q] == '$') {
+				q = mk_ref(s, semi, q, o, 0);
+			} else {
+				if (s[q] == '%' || s[q] == '*')
+					emit(o, q, 1, TK_VARIABLE);
+				q++;
+			}
+		}
+		if (semi < n && s[semi] == '#') {
+			emit(o, semi, n - semi, TK_COMMENT);
+			return mk_end_state(s, n, MK_COMMENT);
+		}
+		if (semi < n && s[semi] == ';') {
+			u32 r = mk_recipe(0, s, n, semi + 1, o);
+			return mk_recipe_state(r, line_continues(s, n));
+		}
+		return mk_end_state(s, n, MK_CONT);
+	}
+	mk_text(s, n, i, n, o, true, TK_TEXT);
+	return mk_end_state(s, n, MK_CONT);
+}
+
+/* ================================================================== */
+/* Diff / patch (and `git show` output)                                */
+/*
+ * Per VSCodium's diff.tmLanguage under Dark+: meta.diff.header lines
+ * (diff --git, --- a/x, +++ b/x) #569CD6 / #000080, markup.inserted
+ * (+, >) #B5CEA8 / #098658, markup.deleted (-, <) #CE9178 / #A31515,
+ * markup.changed (!) #569CD6 / #0451A5, '#' comments. Range lines (@@)
+ * and index lines have no colour in VSCodium and none here. For `git
+ * show`: "commit <sha>" and the Author:/Date:/Merge: keys use the header
+ * colour, the sha the number colour. Stateless. */
+static u32 lex_diff(u32 state, const char *s, u32 n, SynSpans *o)
+{
+	(void)state;
+	if (n == 0)
+		return 0;
+	if ((n >= 5 && memcmp(s, "diff ", 5) == 0) || (n >= 4 && (memcmp(s, "--- ", 4) == 0 ||
+	                                                          memcmp(s, "+++ ", 4) == 0 || memcmp(s, "*** ", 4) == 0))) {
+		/* "--- x" and "*** x" are headers; "*** x ****" is a context range */
+		if (s[0] == '*' && n >= 5 && memcmp(s + n - 4, "****", 4) == 0)
+			return 0;
+		if (s[0] == '-' && n >= 5 && memcmp(s + n - 4, "----", 4) == 0)
+			return 0;
+		emit(o, 0, n, TK_DIFFHDR);
+		return 0;
+	}
+	if (n >= 7 && memcmp(s, "commit ", 7) == 0) {
+		emit(o, 0, 6, TK_DIFFHDR);
+		u32 a = 7, b = a;
+		while (b < n && is_xdigit((u8)s[b]))
+			b++;
+		emit(o, a, b - a, TK_NUMBER);
+		return 0;
+	}
+	static const char *const keys[] = {"Author:", "AuthorDate:", "Commit:", "CommitDate:", "Date:", "Merge:"};
+	for (size_t k = 0; k < VX_COUNT(keys); k++) {
+		u32 l = (u32)strlen(keys[k]);
+		if (n >= l && memcmp(s, keys[k], l) == 0) {
+			emit(o, 0, l, TK_DIFFHDR);
+			if (k == 5) /* Merge: sha sha */
+				for (u32 q = l; q < n;) {
+					q = skip_ws(s, n, q);
+					u32 e = q;
+					while (e < n && is_xdigit((u8)s[e]))
+						e++;
+					emit(o, q, e - q, TK_NUMBER);
+					q = e > q ? e : q + 1;
+				}
+			return 0;
+		}
+	}
+	switch (s[0]) {
+	case '+':
+	case '>':
+		emit(o, 0, n, TK_INSERTED);
+		break;
+	case '-':
+	case '<':
+		if (!(n == 3 && memcmp(s, "---", 3) == 0))
+			emit(o, 0, n, TK_DELETED);
+		break;
+	case '!':
+		emit(o, 0, n, TK_CHANGED);
+		break;
+	case '#':
+		emit(o, 0, n, TK_COMMENT);
+		break;
+	default:
+		break;
+	}
+	return 0;
+}
+
+/* ================================================================== */
+/* Git commit message                                                  */
+/*
+ * Per git-commit.tmLanguage: the first line of each message block (after
+ * the start or a comment block) is the subject; characters past 50 are
+ * invalid.deprecated and past 72 invalid.illegal (both #F44747 under
+ * Dark+). '#' lines are comments, with "#\tmodified:" changed,
+ * "#\tnew file:" inserted, "#\tdeleted:" deleted, other "#\tkind: file"
+ * keyword + string. From "diff --git" to the end: embedded diff.
+ *
+ * State: bit 0 inside the trailing diff, bit 1 subject already seen. */
+static u32 lex_git_commit(u32 state, const char *s, u32 n, SynSpans *o)
+{
+	if ((state & 1u) || (n >= 10 && memcmp(s, "diff --git", 10) == 0)) {
+		lex_diff(0, s, n, o);
+		return 1u;
+	}
+	if (n && s[0] == '#') {
+		if (n > 2 && s[1] == '\t') {
+			const char *r = s + 2;
+			u32 rn = n - 2;
+			u32 cls = 0;
+			if ((rn >= 9 && memcmp(r, "modified:", 9) == 0) || (rn >= 8 && memcmp(r, "renamed:", 8) == 0))
+				cls = TK_CHANGED;
+			else if (rn >= 9 && memcmp(r, "new file:", 9) == 0)
+				cls = TK_INSERTED;
+			else if (rn >= 7 && memcmp(r, "deleted", 7) == 0)
+				cls = TK_DELETED;
+			if (cls) {
+				emit(o, 0, 2, TK_COMMENT);
+				emit(o, 2, n - 2, cls);
+				return 0;
+			}
+			const char *colon = memchr(r, ':', rn);
+			if (colon) {
+				u32 c = (u32)(colon - s);
+				emit(o, 0, 2, TK_COMMENT);
+				emit(o, 2, c - 2, TK_STORAGE);
+				emit(o, c, 1, TK_COMMENT);
+				u32 f = skip_ws(s, n, c + 1);
+				emit(o, c + 1, f - c - 1, TK_COMMENT);
+				emit(o, f, n - f, TK_STRING);
+				return 0;
+			}
+		}
+		emit(o, 0, n, TK_COMMENT);
+		return 0; /* the next message line is a subject again */
+	}
+	if (!(state & 2u)) {
+		/* subject: count characters, not bytes */
+		u32 chars = 0, i = 0, at50 = n;
+		while (i < n) {
+			if (chars == 50)
+				at50 = i;
+			u32 cp;
+			i += utf8_decode(s + i, n - i, &cp);
+			chars++;
+		}
+		if (at50 < n)
+			emit(o, at50, n - at50, TK_INVALID); /* 51-72 deprecated, >72 illegal: both "invalid" */
+		return 2u;
+	}
+	return 2u;
+}
+
+/* ================================================================== */
+/* git-rebase-todo                                                     */
+/*
+ * Per git-rebase.tmLanguage: commands support.function.git-rebase
+ * (#9CDCFE / #0451A5, the property class), shas constant.sha.git-rebase
+ * (#B5CEA8 / #098658), exec lines embed the shell, '#' comments. vxide
+ * also knows label/reset/merge/update-ref and fixup -C/-c. Stateless. */
+static u32 lex_git_rebase(u32 state, const char *s, u32 n, SynSpans *o)
+{
+	(void)state;
+	u32 i = skip_ws(s, n, 0);
+	if (i >= n)
+		return 0;
+	if (s[i] == '#') {
+		emit(o, 0, n, TK_COMMENT);
+		return 0;
+	}
+	u32 e = i;
+	while (e < n && (is_alpha((u8)s[e]) || s[e] == '-'))
+		e++;
+	static const char *const sha_cmds[] = {"pick", "p", "reword", "r", "edit", "e", "squash", "s", "fixup", "f", "drop", "d"};
+	static const char *const other[] = {"break", "b", "label", "l", "reset", "t", "merge", "m", "update-ref", "u"};
+	bool sha = false, known = false;
+	for (size_t k = 0; k < VX_COUNT(sha_cmds); k++)
+		if (word_is(s + i, e - i, sha_cmds[k]))
+			sha = known = true;
+	for (size_t k = 0; k < VX_COUNT(other) && !known; k++)
+		if (word_is(s + i, e - i, other[k]))
+			known = true;
+	if (word_is(s + i, e - i, "exec") || word_is(s + i, e - i, "x")) {
+		emit(o, i, e - i, TK_PROPERTY);
+		lex_shifted(LANG_SH, 0, s, n, skip_ws(s, n, e), o);
+		return 0;
+	}
+	if (!known)
+		return 0;
+	emit(o, i, e - i, TK_PROPERTY);
+	u32 k = skip_ws(s, n, e);
+	/* options like fixup -C / merge -C <sha> */
+	while (k + 1 < n && s[k] == '-' && is_alpha((u8)s[k + 1])) {
+		emit(o, k, 2, TK_PROPERTY);
+		k = skip_ws(s, n, k + 2);
+		sha = true;
+	}
+	if (sha) {
+		u32 h = k;
+		while (h < n && is_xdigit((u8)s[h]))
+			h++;
+		if (h > k && (h == n || is_space((u8)s[h])))
+			emit(o, k, h - k, TK_NUMBER);
+	}
+	return 0;
+}
+
+/* ================================================================== */
 /* Markdown                                                            */
 /*
  * Block structure per line, inline spans after it, following VSCodium's
@@ -2928,9 +4103,9 @@ static u32 lex_troff(u32 state, const char *s, u32 n, SynSpans *o)
  *
  * State (32 bits):
  *   bits 0-1   mode: 0 normal, 1 fenced code, 2 inside <!-- -->
- *   bits 2-5   embedded LANG_* of the fence (0 = none)
- *   bit 6      fence uses '~'
- *   bits 7-11  fence length (3..31)
+ *   bits 2-6   embedded LANG_* of the fence (0 = none)
+ *   bit 7      fence uses '~'
+ *   bits 8-11  fence length (3..15; longer fences are clamped to 15)
  *   bits 12-31 embedded lexer state (20 bits) in fenced code;
  *              in normal mode bit 12 = the previous line was paragraph
  *              text (an ===/--- line under it is a setext heading). */
@@ -2960,6 +4135,11 @@ static int md_fence_lang(const char *w, u32 n)
 	    {"masm", LANG_ASM_INTEL}, {"gas", LANG_ASM_GAS}, {"att", LANG_ASM_GAS},    {"s", LANG_ASM_GAS},
 	    {"troff", LANG_TROFF},  {"roff", LANG_TROFF},    {"groff", LANG_TROFF},    {"nroff", LANG_TROFF},
 	    {"man", LANG_TROFF},    {"mdoc", LANG_TROFF},
+	    {"cmake", LANG_CMAKE},  {"make", LANG_MAKE},     {"makefile", LANG_MAKE},  {"mk", LANG_MAKE},
+	    {"bsdmake", LANG_MAKE}, {"json", LANG_JSON},     {"jsonc", LANG_JSONC},    {"json5", LANG_JSONC},
+	    {"gitignore", LANG_IGNORE}, {"ignore", LANG_IGNORE}, {"diff", LANG_DIFF},  {"patch", LANG_DIFF},
+	    {"gitcommit", LANG_GIT_COMMIT}, {"git-commit", LANG_GIT_COMMIT},
+	    {"gitrebase", LANG_GIT_REBASE}, {"git-rebase", LANG_GIT_REBASE},
 	};
 	for (size_t i = 0; i < VX_COUNT(map); i++)
 		if (!strcmp(b, map[i].name))
@@ -3219,15 +4399,15 @@ static u32 lex_md(u32 state, const char *s, u32 n, SynSpans *o)
 {
 	u32 mode = state & 3u;
 	if (mode == MD_FENCE) {
-		u8 fch = (state & 0x40u) ? '~' : '`';
-		u32 flen = (state >> 7) & 31u;
+		u8 fch = (state & 0x80u) ? '~' : '`';
+		u32 flen = (state >> 8) & 15u;
 		u32 k = skip_ws(s, n, 0);
 		u32 r = k;
 		while (r < n && (u8)s[r] == fch)
 			r++;
 		if (r - k >= flen && skip_ws(s, n, r) == n)
 			return MD_NORMAL; /* closing fence */
-		int lang = (int)((state >> 2) & 15u);
+		int lang = (int)((state >> 2) & 31u);
 		if (lang == LANG_NONE)
 			return state;
 		u32 inner = lex_any(lang, state >> 12, s, n, o) & ((1u << SYN_STATE_BITS) - 1u);
@@ -3264,8 +4444,8 @@ static u32 lex_md(u32 state, const char *s, u32 n, SynSpans *o)
 			while (b < n && !is_space((u8)s[b]) && s[b] != '{' && s[b] != ',')
 				b++;
 			int lang = md_fence_lang(s + a, b - a);
-			u32 fl = VX_MIN(r - i, 31u);
-			return MD_FENCE | ((u32)lang << 2) | (ch == '~' ? 0x40u : 0u) | (fl << 7);
+			u32 fl = VX_MIN(r - i, 15u); /* longer fences close on >= 15 marks */
+			return MD_FENCE | ((u32)lang << 2) | (ch == '~' ? 0x80u : 0u) | (fl << 8);
 		}
 	}
 	/* ATX heading */
@@ -3342,6 +4522,14 @@ static u32 lex_any(int lang, u32 state, const char *s, u32 n, SynSpans *o)
 	case LANG_MARKDOWN: return lex_md(state, s, n, o);
 	case LANG_TROFF: return lex_troff(state, s, n, o);
 	case LANG_PERL: return lex_perl(state, s, n, o);
+	case LANG_CMAKE: return lex_cmake(state, s, n, o);
+	case LANG_MAKE: return lex_make(state, s, n, o);
+	case LANG_JSON:
+	case LANG_JSONC: return lex_json(state, s, n, o);
+	case LANG_IGNORE: return lex_ignore(state, s, n, o);
+	case LANG_DIFF: return lex_diff(state, s, n, o);
+	case LANG_GIT_COMMIT: return lex_git_commit(state, s, n, o);
+	case LANG_GIT_REBASE: return lex_git_rebase(state, s, n, o);
 	default: return 0;
 	}
 }
@@ -3366,6 +4554,13 @@ static void syn_build2(void)
 	kw_list(&kw_pl, pl_block, PLK_BLOCK);
 
 	kw_list(&kw_mdoc, mdoc_callable, 1);
+
+	kw_list(&kw_cmake, cmake_control, TK_CONTROL);
+	kw_list(&kw_cmake, cmake_const, TK_LANGCONST);
+	kw_list(&kw_mkfn, mk_functions, MKF_FUNC);
+	kw_list(&kw_mkfn, mk_builtins, MKF_BUILTIN);
+	kw_list(&kw_mkdir, mk_gnu_dirs, 1);
+	kw_list(&kw_bsddir, mk_bsd_dirs, 1);
 }
 
 /* ================================================================== */
@@ -3390,6 +4585,14 @@ const char *syn_lang_name(int lang)
 	case LANG_MARKDOWN: return "Markdown";
 	case LANG_TROFF: return "Roff";
 	case LANG_PERL: return "Perl";
+	case LANG_CMAKE: return "CMake";
+	case LANG_MAKE: return "Makefile";
+	case LANG_JSON: return "JSON";
+	case LANG_JSONC: return "JSON with Comments";
+	case LANG_IGNORE: return "Ignore";
+	case LANG_DIFF: return "Diff";
+	case LANG_GIT_COMMIT: return "Git Commit Message";
+	case LANG_GIT_REBASE: return "Git Rebase Message";
 	default: return "Plain Text";
 	}
 }
@@ -3404,6 +4607,14 @@ const char *syn_lang_lsp_id(int lang)
 	case LANG_SH: return "shellscript";
 	case LANG_MARKDOWN: return "markdown";
 	case LANG_PERL: return "perl";
+	case LANG_CMAKE: return "cmake";
+	case LANG_MAKE: return "makefile";
+	case LANG_JSON: return "json";
+	case LANG_JSONC: return "jsonc";
+	case LANG_IGNORE: return "ignore";
+	case LANG_DIFF: return "diff";
+	case LANG_GIT_COMMIT: return "git-commit";
+	case LANG_GIT_REBASE: return "git-rebase";
 	default: return NULL;
 	}
 }
@@ -3414,7 +4625,13 @@ const char *syn_line_comment(int lang)
 	case LANG_C: return "//";
 	case LANG_ASM_GAS:
 	case LANG_SH:
-	case LANG_PERL: return "#";
+	case LANG_PERL:
+	case LANG_CMAKE:
+	case LANG_MAKE:
+	case LANG_IGNORE:
+	case LANG_GIT_COMMIT:
+	case LANG_GIT_REBASE: return "#";
+	case LANG_JSONC: return "//";
 	case LANG_ASM_INTEL:
 	case LANG_LISP: return ";";
 	case LANG_TROFF: return ".\\\"";
@@ -3555,10 +4772,67 @@ static bool roff_head(const char *h, size_t n)
 	return false;
 }
 
+/* Extensionless head with BSD/GNU make constructs (.include, .if, .PHONY:). */
+static bool make_head(const char *h, size_t n)
+{
+	if (!h)
+		return false;
+	size_t i = 0;
+	int lines = 0;
+	while (i < n && lines < 40) {
+		size_t e = i;
+		while (e < n && h[e] != '\n')
+			e++;
+		const char *l = h + i;
+		size_t ln = e - i;
+		static const char *const pre[] = {".include", ".if ", ".ifdef", ".ifndef", ".for ", ".PHONY:", "include ", ".SUFFIXES:"};
+		for (size_t k = 0; k < VX_COUNT(pre); k++) {
+			size_t pl = strlen(pre[k]);
+			if (ln >= pl && memcmp(l, pre[k], pl) == 0)
+				return k < 6 || k == 7;
+		}
+		i = e + 1;
+		lines++;
+	}
+	return false;
+}
+
 int syn_lang_for_path(const char *path, const char *head, size_t headlen)
 {
 	const char *base = strrchr(path, '/');
 	base = base ? base + 1 : path;
+	static const struct {
+		const char *name;
+		u8 lang;
+	} names[] = {
+	    {"CMakeLists.txt", LANG_CMAKE},   {"Makefile", LANG_MAKE},          {"makefile", LANG_MAKE},
+	    {"GNUmakefile", LANG_MAKE},       {"BSDmakefile", LANG_MAKE},       {".depend", LANG_MAKE},
+	    {".gitignore", LANG_IGNORE},      {".dockerignore", LANG_IGNORE},   {".ignore", LANG_IGNORE},
+	    {".rgignore", LANG_IGNORE},       {".npmignore", LANG_IGNORE},      {".hgignore", LANG_IGNORE},
+	    {".eslintignore", LANG_IGNORE},   {".prettierignore", LANG_IGNORE}, {".vscodeignore", LANG_IGNORE},
+	    {".cvsignore", LANG_IGNORE},      {".gitattributes", LANG_IGNORE},  {".stylelintignore", LANG_IGNORE},
+	    {".clang-format-ignore", LANG_IGNORE},
+	    {"COMMIT_EDITMSG", LANG_GIT_COMMIT}, {"MERGE_MSG", LANG_GIT_COMMIT}, {"TAG_EDITMSG", LANG_GIT_COMMIT},
+	    {"SQUASH_MSG", LANG_GIT_COMMIT},  {"git-rebase-todo", LANG_GIT_REBASE},
+	    {"settings.json", LANG_JSONC},    {"keybindings.json", LANG_JSONC}, {"launch.json", LANG_JSONC},
+	    {"tasks.json", LANG_JSONC},       {"extensions.json", LANG_JSONC},  {"devcontainer.json", LANG_JSONC},
+	    {".devcontainer.json", LANG_JSONC}, {".babelrc", LANG_JSONC},       {".eslintrc", LANG_JSONC},
+	    {".jshintrc", LANG_JSONC},        {".swcrc", LANG_JSONC},           {".jscsrc", LANG_JSONC},
+	};
+	for (size_t i = 0; i < VX_COUNT(names); i++)
+		if (!strcmp(base, names[i].name))
+			return names[i].lang;
+	size_t bl = strlen(base);
+	if (bl > 8 && (!strncmp(base, "Makefile.", 9) || !strncmp(base, "makefile.", 9)))
+		return LANG_MAKE;
+	if (bl > 9 && !strcmp(base + bl - 9, ".cmake.in"))
+		return LANG_CMAKE;
+	if (bl > 15 && !strcmp(base + bl - 15, ".code-workspace"))
+		return LANG_JSONC;
+	if (strstr(path, "/info/exclude") && !strcmp(base, "exclude"))
+		return LANG_IGNORE;
+	if ((!strncmp(base, "tsconfig", 8) || !strncmp(base, "jsconfig", 8)) && bl > 5 && !strcmp(base + bl - 5, ".json"))
+		return LANG_JSONC;
 	static const char *const sh_names[] = {".bashrc", ".bash_profile", ".bash_login", ".bash_logout", ".bash_aliases",
 	                                       ".profile", ".zshrc", ".zprofile", ".zshenv", ".zlogin", ".zlogout",
 	                                       ".kshrc", ".mkshrc", "PKGBUILD", "APKBUILD", ".xinitrc", ".xsession"};
@@ -3567,8 +4841,13 @@ int syn_lang_for_path(const char *path, const char *head, size_t headlen)
 			return LANG_SH;
 	int bang = shebang_lang(head, headlen);
 	const char *dot = strrchr(base, '.');
-	if (!dot || dot == base)
+	if (!dot || dot == base) {
+		if (!bang && make_head(head, headlen))
+			return LANG_MAKE;
+		if (!bang && head && headlen >= 10 && memcmp(head, "diff --git", 10) == 0)
+			return LANG_DIFF;
 		return bang;
+	}
 	char e[12];
 	size_t el = strlen(dot + 1);
 	if (el == 0 || el >= sizeof e)
@@ -3577,6 +4856,18 @@ int syn_lang_for_path(const char *path, const char *head, size_t headlen)
 		e[i] = (char)lower((u8)dot[1 + i]);
 	if (!strcmp(e, "c") || !strcmp(e, "h"))
 		return LANG_C;
+	if (!strcmp(e, "cmake"))
+		return LANG_CMAKE;
+	if (!strcmp(e, "mk") || !strcmp(e, "mak") || !strcmp(e, "make"))
+		return LANG_MAKE;
+	if (!strcmp(e, "jsonc") || !strcmp(e, "json5") || !strcmp(e, "code-workspace"))
+		return LANG_JSONC;
+	static const char *const json[] = {"json", "webmanifest", "har", "geojson", "topojson", "jsonl", "ndjson", "tsbuildinfo"};
+	for (size_t i = 0; i < VX_COUNT(json); i++)
+		if (!strcmp(e, json[i]))
+			return LANG_JSON;
+	if (!strcmp(e, "diff") || !strcmp(e, "patch") || !strcmp(e, "rej"))
+		return LANG_DIFF;
 	static const char *const lisp[] = { "lisp", "lsp", "cl", "el", "scm", "ss", "rkt", "clj",
 	                                    "cljs", "cljc", "edn", "fnl", "asd", "sld", "sls" };
 	for (size_t i = 0; i < VX_COUNT(lisp); i++)

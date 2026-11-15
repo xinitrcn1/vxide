@@ -33,6 +33,23 @@ static int map_mods(SDL_Keymod m)
 
 static float density = 1.0f;
 
+/* System cursors for the UI's cursor shapes (CURSOR_*). */
+static void apply_cursor(int shape)
+{
+	static SDL_Cursor *cur[5];
+	static int last = -1;
+	static const SDL_SystemCursor ids[5] = {SDL_SYSTEM_CURSOR_DEFAULT, SDL_SYSTEM_CURSOR_TEXT,
+	                                        SDL_SYSTEM_CURSOR_POINTER, SDL_SYSTEM_CURSOR_EW_RESIZE,
+	                                        SDL_SYSTEM_CURSOR_NS_RESIZE};
+	if (shape == last || shape < 0 || shape >= 5)
+		return;
+	if (!cur[shape])
+		cur[shape] = SDL_CreateSystemCursor(ids[shape]);
+	if (cur[shape])
+		SDL_SetCursor(cur[shape]);
+	last = shape;
+}
+
 static bool translate(const SDL_Event *s, Event *e)
 {
 	memset(e, 0, sizeof *e);
@@ -67,6 +84,7 @@ static bool translate(const SDL_Event *s, Event *e)
 		e->type = EV_MMOVE;
 		e->x = (int)(s->motion.x * density);
 		e->y = (int)(s->motion.y * density);
+		e->mods = map_mods(SDL_GetModState());
 		return true;
 	case SDL_EVENT_MOUSE_WHEEL: {
 		e->type = EV_WHEEL;
@@ -217,6 +235,20 @@ static int run_script(const char *path)
 				send(&e);
 				p += k;
 			}
+		} else if (!strcmp(s, "rclick")) {
+			int x = 0, y = 0;
+			sscanf(arg, "%d %d", &x, &y);
+			memset(&e, 0, sizeof e);
+			e.x = x;
+			e.y = y;
+			e.type = EV_MMOVE;
+			send(&e);
+			e.type = EV_MDOWN;
+			e.button = 3;
+			e.clicks = 1;
+			send(&e);
+			e.type = EV_MUP;
+			send(&e);
 		} else if (!strcmp(s, "click") || !strcmp(s, "dclick") || !strcmp(s, "move") ||
 		           !strcmp(s, "drag")) {
 			int x = 0, y = 0, x2 = 0, y2 = 0;
@@ -432,6 +464,7 @@ int main(int argc, char **argv)
 				} while (SDL_PollEvent(&se));
 			}
 			ui_tick();
+			apply_cursor(app.cursor);
 			u64 blink = (vx_now_ns() - app.blink_t0) / 530000000ull;
 			if (blink != last_blink) {
 				last_blink = blink;

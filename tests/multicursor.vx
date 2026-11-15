@@ -1,0 +1,21 @@
+# Multi-cursor keys (VSCodium Linux defaults)
+open src/m.c
+key shift+Down shift+Down
+key shift+alt+i
+type ;
+expect text aa x;\nbb x;\ncc x\n
+key ctrl+z
+key Escape
+key ctrl+Home
+key End
+key ctrl+d ctrl+d ctrl+d
+key ctrl+u
+type Y
+expect text aa Y\nbb Y\ncc x\n
+key ctrl+z
+key Escape
+key ctrl+Home
+key ctrl+shift+alt+Right ctrl+shift+alt+Right
+key ctrl+shift+alt+PageDown
+type Z
+expect text Z x\nZ x\nZ x\nZ\n

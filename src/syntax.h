@@ -35,6 +35,12 @@ enum {
 	TK_TAGPUNCT,  /* punctuation.definition.tag            #808080 / #800000     */
 	TK_ATTR,      /* entity.other.attribute-name           #9CDCFE / #E50000     */
 	TK_REGEX,     /* string.regexp                         #D16969 / #811F3F     */
+	TK_PROPERTY,  /* support.type.property-name.json,
+	                 support.function.git-rebase           #9CDCFE / #0451A5     */
+	TK_INSERTED,  /* markup.inserted                       #B5CEA8 / #098658     */
+	TK_DELETED,   /* markup.deleted                        #CE9178 / #A31515     */
+	TK_CHANGED,   /* markup.changed                        #569CD6 / #0451A5     */
+	TK_DIFFHDR,   /* meta.diff.header                      #569CD6 / #000080     */
 	TK_COUNT
 };
 
@@ -48,7 +54,15 @@ enum {
 	LANG_MARKDOWN,  /* Markdown (CommonMark + GFM bits)              */
 	LANG_TROFF,     /* roff: man, mdoc, ms, me, mm                   */
 	LANG_PERL,      /* Perl 5 (+ POD)                                */
-	LANG_COUNT
+	LANG_CMAKE,     /* CMakeLists.txt, *.cmake                       */
+	LANG_MAKE,      /* BSD make and GNU make                         */
+	LANG_JSON,      /* JSON (comments tolerated)                     */
+	LANG_IGNORE,    /* .gitignore, .dockerignore, ...                */
+	LANG_DIFF,      /* unified/context diffs, git show output        */
+	LANG_GIT_COMMIT, /* COMMIT_EDITMSG, MERGE_MSG, TAG_EDITMSG       */
+	LANG_GIT_REBASE, /* git-rebase-todo                              */
+	LANG_JSONC,     /* JSON with Comments (.jsonc, settings.json)    */
+	LANG_COUNT /* Markdown keeps a fence language in 5 bits: <= 32  */
 };
 
 /* Output spans for one line. Arrays are caller-owned with capacity cap;

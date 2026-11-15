@@ -767,7 +767,10 @@ void search_draw(int x, int y, int w, int h)
 			bool col = app.search_collapsed && app.search_collapsed[f];
 			draw_icon(col ? ICON_CHEVRON_RIGHT : ICON_CHEVRON_DOWN, x + PX(8), ry + (rh - PX(16)) / 2, COL(C_SIDEBAR_FG));
 			int tx = file_icon_draw(base, x + PX(24), ry, rh);
-			tx = draw_text(FONT_UI, tx, ty, base, strlen(base), COL(C_SIDEBAR_FG));
+			char letter;
+			bool has;
+			u32 gc = path_git_color(p, &letter, &has);
+			tx = draw_text(FONT_UI, tx, ty, base, strlen(base), has ? gc : COL(C_SIDEBAR_FG));
 			u32 cnt = 0;
 			for (u32 k = 0; k < r->n; k++)
 				cnt += r->file[k] == f;
@@ -1316,9 +1319,27 @@ static char status_letter(u16 f, bool staged, u32 *color)
 	return 'M';
 }
 
+extern int gitui_graph_height(int h);
+extern void gitui_graph_draw(int x, int y, int w, int h);
+extern bool gitui_graph_event(const Event *e, int x, int y, int w, int h);
+extern void ctx_menu_scm_title(int x, int y);
+extern void gitui_status_line(int x, int y, int w);
+
 void scm_draw(int x, int y, int w, int h)
 {
 	int cy = view_title(x, y, w, "SOURCE CONTROL");
+	if (app.git) {
+		/* "..." opens the git actions menu, like VSCodium's view title */
+		draw_text(FONT_UI_BOLD, x + w - PX(28), y + (PX(35) - font_m[FONT_UI_BOLD].line) / 2 - PX(3),
+		          "\xE2\x80\xA6", 3, COL(C_SIDEBAR_FG));
+		draw_icon(ICON_REFRESH, x + w - PX(54), y + (PX(35) - PX(16)) / 2, COL(C_SIDEBAR_FG));
+		draw_icon(ICON_CHECK, x + w - PX(78), y + (PX(35) - PX(16)) / 2, COL(C_SIDEBAR_FG));
+		/* the graph section takes the lower part */
+		int gh = gitui_graph_height(h);
+		gitui_graph_draw(x, y + h - gh, w, gh);
+		h -= gh;
+		draw_clip(x, y, w, h);
+	}
 	if (!app.git) {
 		const char *m = "The folder currently open doesn't have a git repository.";
 		int yy = cy + PX(8);
@@ -1340,6 +1361,7 @@ void scm_draw(int x, int y, int w, int h)
 	draw_icon(ICON_CHECK, tx, cy + (bh - PX(16)) / 2, COL(C_BUTTON_FG));
 	draw_text(FONT_UI, tx + PX(22), cy + (bh - font_m[FONT_UI].line) / 2, bt, strlen(bt), COL(C_BUTTON_FG));
 	cy += bh + PX(8);
+	gitui_status_line(x, cy - PX(6), w);
 	scm_rows();
 	int rh = app.row_h;
 	int list_h = y + h - cy;
@@ -1413,6 +1435,24 @@ bool scm_event(const Event *e, int x, int y, int w, int h)
 {
 	if (!app.git)
 		return false;
+	{
+		int gh = gitui_graph_height(h);
+		bool in_graph = (e->type == EV_MDOWN || e->type == EV_WHEEL || e->type == EV_MMOVE) && e->y >= y + h - gh;
+		if (in_graph)
+			return gitui_graph_event(e, x, y + h - gh, w, gh);
+		if (e->type == EV_KEY && app.focus == FOCUS_SIDEBAR && gitui_graph_event(e, x, y + h - gh, w, gh))
+			return true;
+		h -= gh;
+	}
+	if (e->type == EV_MDOWN && e->y < y + PX(35)) {
+		if (e->x >= x + w - PX(32))
+			ctx_menu_scm_title(e->x, y + PX(30));
+		else if (e->x >= x + w - PX(58))
+			run_command(CMD_GIT_REFRESH);
+		else if (e->x >= x + w - PX(82))
+			run_command(CMD_GIT_COMMIT);
+		return true;
+	}
 	int iy = y + PX(35) + PX(8);
 	int by = iy + PX(26) + PX(8);
 	int cy = scm_list_y(y);
@@ -1716,6 +1756,53 @@ bool output_event(const Event *e, int x, int y, int w, int h)
 		app.output_scroll -= (int)(e->wy * app.line_h * 3);
 		output_follow = e->wy < 0 && app.output_scroll >= (int)app.out_n * app.line_h - h;
 		return true;
+	}
+	return false;
+}
+
+/* Right click in the Source Control view. */
+bool scm_context(int x, int y, int w, int h, int mx, int my)
+{
+	if (!app.git)
+		return false;
+	int gh = gitui_graph_height(h);
+	if (my >= y + h - gh) {
+		extern bool gitui_graph_context(int x, int y, int w, int h, int mx, int my);
+		return gitui_graph_context(x, y + h - gh, w, gh, mx, my);
+	}
+	if (my < y + PX(35)) {
+		ctx_menu_scm_title(mx, my);
+		return true;
+	}
+	int cy = scm_list_y(y);
+	if (my < cy)
+		return false;
+	scm_rows();
+	u32 i = (u32)((my - cy + app.scm_scroll) / app.row_h);
+	if (i >= scm_n || (scm_item[i] & 0x80000000u))
+		return false;
+	app.scm_sel = i;
+	const GitStatus *st = git_status(app.git);
+	u32 si = scm_item[i] & 0x3FFFFFFFu;
+	ctx_menu_scm_file(mx, my, st->pool.b + st->path[si], (scm_item[i] & 0x40000000u) != 0);
+	return true;
+}
+
+/* I-beam over the side bar's text boxes. */
+bool sidebar_over_input(int x, int y, int w, int mx, int my)
+{
+	if (app.side_view == SIDE_SEARCH) {
+		SLayout L = search_layout(x, y, w);
+		int ys[4] = {L.find_y, app.search_show_replace ? L.repl_y : -1000, app.search_show_details ? L.inc_y : -1000,
+		             app.search_show_details ? L.exc_y : -1000};
+		for (int k = 0; k < 4; k++)
+			if (my >= ys[k] && my < ys[k] + PX(26) && mx >= L.ix && mx < L.ix + L.iw - (k == 0 ? PX(70) : 0))
+				return true;
+		return false;
+	}
+	if (app.side_view == SIDE_SCM && app.git) {
+		int iy = y + PX(35) + PX(8);
+		return my >= iy && my < iy + PX(26) && mx >= x + PX(12) && mx < x + w - PX(12);
 	}
 	return false;
 }

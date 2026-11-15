@@ -185,6 +185,15 @@ bool text_changed_on_disk(const Text *t, const char *path)
 	return stat_ns(&st) != t->mtime_ns || (u64)st.st_ino != t->inode;
 }
 
+void text_restat(Text *t, const char *path)
+{
+	struct stat st;
+	if (stat(path, &st) == 0) {
+		t->mtime_ns = stat_ns(&st);
+		t->inode = (u64)st.st_ino;
+	}
+}
+
 int text_save(Text *t, const char *path)
 {
 	char tmp[4096];

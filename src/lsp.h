@@ -94,6 +94,10 @@ void lsp_did_close(Lsp *l, const char *path);
 i32 lsp_completion(Lsp *l, const char *path, u32 line, u32 col);
 i32 lsp_hover(Lsp *l, const char *path, u32 line, u32 col);
 i32 lsp_definition(Lsp *l, const char *path, u32 line, u32 col);
+/* These reply with LSP_EV_LOCATION as well (match by request id). */
+i32 lsp_declaration(Lsp *l, const char *path, u32 line, u32 col);
+i32 lsp_type_definition(Lsp *l, const char *path, u32 line, u32 col);
+i32 lsp_references(Lsp *l, const char *path, u32 line, u32 col); /* includeDeclaration */
 i32 lsp_semantic_tokens(Lsp *l, const char *path);
 
 /* Position encoding the server chose (true = utf-8 byte columns). */
