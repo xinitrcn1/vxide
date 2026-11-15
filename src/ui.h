@@ -533,6 +533,11 @@ int ed_cursor_shape(View *v, int mx, int my, int x, int y, int w, int h, int mod
 u32 blame_key_of(u32 d);
 const char *doc_repo_rel(u32 d);
 bool ed_command(View *v, int cmd);
+/* Find in views that draw themselves: the widget over x,y,w when this view
+ * has the focus, and the query's matches in v->doc (sorted offsets). */
+void ed_find_widget(View *v, int x, int y, int w);
+u32 ed_find_matches(View *v, const u32 **a, const u32 **b);
+
 
 /* panes.c */
 void explorer_draw(int x, int y, int w, int h);

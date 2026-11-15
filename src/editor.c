@@ -2188,6 +2188,10 @@ static int drag_grab;
 
 void ed_mouse(View *v, const Event *e, int x, int y, int w, int h)
 {
+	/* the find widget sits over diffs too */
+	if (v->diff_left != UINT32_MAX && e->type == EV_MDOWN && e->button == 1 &&
+	    find_widget_click(v, e))
+		return;
 	if (v->diff_left != UINT32_MAX) {
 		diff_mouse(v, e, x, y, w, h);
 		return;
@@ -3419,3 +3423,23 @@ void ed_draw_popups(View *v)
 
 int ed_x_of(Text *t, u32 l, u32 off) { return x_of(t, l, off); }
 u32 ed_off_at_x(Text *t, u32 l, int px) { return off_at_x(t, l, px); }
+
+/* ---- find for views that draw themselves (diffs, binary views) --------------------- */
+
+void ed_find_widget(View *v, int x, int y, int w)
+{
+	if (app.find_open && v == active_view())
+		find_widget_draw(x, y, w);
+}
+
+u32 ed_find_matches(View *v, const u32 **a, const u32 **b)
+{
+	if (!app.find_open || !app.find_in.n) {
+		*a = *b = NULL;
+		return 0;
+	}
+	find_matches(v);
+	*a = app.fm_a;
+	*b = app.fm_b;
+	return app.fm_n;
+}

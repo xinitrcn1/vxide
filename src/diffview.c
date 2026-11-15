@@ -305,7 +305,9 @@ void diff_draw(Group *g, View *v, int x, int y, int w, int h, bool focused)
 		r->last_head = v->head[0];
 		u32 row = row_of_right(r, text_line_of(R, v->head[0]));
 		i64 ry = (i64)row * lh;
-		if (ry < v->scroll_y)
+		if (app.find_open && (ry < v->scroll_y || ry + lh > v->scroll_y + h))
+			v->scroll_y = ry - h / 3; /* a find result: show it with context */
+		else if (ry < v->scroll_y)
 			v->scroll_y = ry;
 		else if (ry + lh > v->scroll_y + h)
 			v->scroll_y = ry + lh - h;
@@ -317,6 +319,9 @@ void diff_draw(Group *g, View *v, int x, int y, int w, int h, bool focused)
 	int y0 = y - (int)(v->scroll_y % lh);
 	u32 last = VX_MIN(r->n, first + (u32)(h / lh) + 2);
 	u32 filler = (COL(C_FG) & 0xFFFFFF00u) | 0x0Cu;
+	/* find: matches on the right (new) side, like the editor */
+	const u32 *fa, *fb;
+	u32 fn = ed_find_matches(v, &fa, &fb);
 	for (int side = 0; side < 2; side++) {
 		int px = x + side * half, pw = side ? w - half : half;
 		int tx = px + gut - v->scroll_x;
@@ -334,6 +339,26 @@ void diff_draw(Group *g, View *v, int x, int y, int w, int h, bool focused)
 			if (k == ROW_CHANGED || (side == 0 && k == ROW_DELETE) || (side == 1 && k == ROW_INSERT))
 				draw_rect(px, ly, pw, lh, side ? COL(C_DIFF_INSERTED) : COL(C_DIFF_REMOVED));
 			draw_words(r, row, side == 0, t, line, tx, ly, lh, px + gut, px + pw);
+			if (side == 1 && fn) {
+				u32 ls = text_line_start(t, line), le = ls + text_line_len(t, line);
+				u32 lo = 0, hi = fn;
+				while (lo < hi) { /* first match ending after the line start */
+					u32 mid = (lo + hi) / 2;
+					if (fb[mid] <= ls)
+						lo = mid + 1;
+					else
+						hi = mid;
+				}
+				for (u32 k = lo; k < fn && fa[k] <= le; k++) {
+					u32 a = VX_MAX(fa[k], ls), b = VX_MIN(fb[k], le);
+					int xa = VX_MAX(tx + ed_x_of(t, line, a), px + gut), xb = tx + ed_x_of(t, line, b);
+					if (xb <= xa)
+						xb = xa + PX(2);
+					bool cur = v->nc == 1 && fa[k] == VX_MIN(v->head[0], v->anchor[0]) &&
+					           fb[k] == VX_MAX(v->head[0], v->anchor[0]);
+					draw_rect(xa, ly, xb - xa, lh, cur ? COL(C_FIND_MATCH) : COL(C_FIND_MATCH_OTHER));
+				}
+			}
 			/* selections (right side) */
 			if (side == 1) {
 				u32 ls = text_line_start(t, line), le = ls + text_line_len(t, line);
@@ -393,6 +418,19 @@ void diff_draw(Group *g, View *v, int x, int y, int w, int h, bool focused)
 			u32 c = r->kind[row] == ROW_DELETE ? COL(C_GUTTER_DELETED) : r->kind[row] == ROW_INSERT ? COL(C_GUTTER_ADDED) : COL(C_GUTTER_MODIFIED);
 			draw_rect(x + w - PX(6), my, PX(5), PX(2), c);
 		}
+	/* find matches in the overview too (the right side's rows) */
+	if (fn && r->n)
+		for (u32 row = 0, k = 0; row < r->n && k < fn; row++) {
+			u32 l = r->rr[row];
+			if (l == NONE)
+				continue;
+			u32 ls = text_line_start(R, l), le = ls + text_line_len(R, l);
+			while (k < fn && fb[k] <= ls && !(fa[k] == ls && fb[k] == ls))
+				k++;
+			if (k < fn && fa[k] <= le)
+				draw_rect(x + w - PX(12), y + (int)((i64)row * h / (i64)r->n), PX(5), PX(2), COL(C_FIND_MATCH));
+		}
+	ed_find_widget(v, x, y, w);
 }
 
 /* ---- range staging ---------------------------------------------------------------- */
