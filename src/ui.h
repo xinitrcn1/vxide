@@ -468,6 +468,16 @@ void mdview_doc_changed(u32 d);
 int mdview_subtabs_height(View *v, int w);
 void mdview_subtabs_draw(View *v, int x, int y, int w);
 void mdview_subtab_click(View *v, int rel_x, int rel_y, int w);
+/* mdview.c: Markdown text that is not a document (the LLM agent's answers),
+ * laid out with the preview's renderer and cached until the text, width or
+ * scale changes */
+typedef struct MdText MdText;
+MdText *md_text_new(void);
+void md_text_free(MdText *m);
+int md_text_layout(MdText *m, const char *s, size_t n, int width); /* the height */
+int md_text_height(const MdText *m);
+void md_text_draw(const MdText *m, int x, int y, int clip_y, int clip_h);
+const char *md_text_link_at(const MdText *m, int x, int y, int mx, int my); /* the URL, or NULL */
 /* source annotation, drawn by the editor */
 int profann_gutter_w(u32 d); /* 0 when the document is not annotated */
 void profann_gutter(u32 d, u32 first, u32 last, int x, int y0, int lh);

@@ -1099,6 +1099,16 @@ static void blocks(Ctx *c, Ln *L, u32 n, bool tight)
 #define SIDE_PAD PX(14)
 static int content_w(int w) { return VX_MAX(w - 2 * SIDE_PAD, PX(100)); }
 
+/* lay out ln[0..nl) at width into L (just cleared) */
+static void lay_lines(Layout *L, Ln *ln, u32 nl, int width)
+{
+	pool_add(&L->pool, "", 0);
+	Ctx c = {L, 0, 0, width, 0, 0, 0, 0, true, 0};
+	row_begin(&c);
+	blocks(&c, ln, nl, false);
+	L->height = c.y;
+}
+
 static Layout *layout_for(u32 d, int w)
 {
 	Text *t = &app.docs.text[d];
@@ -1114,7 +1124,6 @@ static Layout *layout_for(u32 d, int w)
 	L->ver = t->version;
 	L->width = width;
 	L->scale = app.scale;
-	pool_add(&L->pool, "", 0);
 	/* the document's lines */
 	const char *s = text_flat(t);
 	u32 nl = text_lines(t);
@@ -1123,10 +1132,7 @@ static Layout *layout_for(u32 d, int w)
 		u32 a = text_line_start(t, l);
 		ln[l] = (Ln){s + a, text_line_len(t, l), l};
 	}
-	Ctx c = {L, 0, 0, width, 0, 0, 0, 0, true, 0};
-	row_begin(&c);
-	blocks(&c, ln, nl, false);
-	L->height = c.y;
+	lay_lines(L, ln, nl, width);
 	free(ln);
 	return L;
 }
@@ -1136,6 +1142,117 @@ void mdview_doc_changed(u32 d)
 	for (int i = 0; i < 4; i++)
 		if (lays[i].used && lays[i].doc == d)
 			lay_free(&lays[i]);
+}
+
+/* ---- Markdown text outside a document (the LLM agent's answers) ----------------------- */
+
+static u32 col_of(u16 c, u8 alpha);
+
+struct MdText {
+	Layout L;
+	u64 hash;
+	u32 n;
+};
+
+static u64 fnv1a(const char *s, size_t n)
+{
+	u64 h = 1469598103934665603ull;
+	for (size_t i = 0; i < n; i++)
+		h = (h ^ (u8)s[i]) * 1099511628211ull;
+	return h;
+}
+
+MdText *md_text_new(void) { return vx_alloc(sizeof(MdText)); }
+
+void md_text_free(MdText *m)
+{
+	if (!m)
+		return;
+	lay_free(&m->L);
+	free(m);
+}
+
+/* The layout of s[0..n) at width: rebuilt only when the text, the width or
+ * the scale changed (a streamed answer grows; most frames reuse it). */
+int md_text_layout(MdText *m, const char *s, size_t n, int width)
+{
+	width = VX_MAX(width, PX(60));
+	u64 h = fnv1a(s, n);
+	Layout *L = &m->L;
+	if (L->used && m->hash == h && m->n == n && L->width == width && L->scale == app.scale)
+		return L->height;
+	lay_free(L);
+	L->used = true;
+	L->width = width;
+	L->scale = app.scale;
+	m->hash = h;
+	m->n = (u32)n;
+	u32 nl = 1;
+	for (size_t i = 0; i < n; i++)
+		nl += s[i] == '\n';
+	Ln *ln = vx_alloc(nl * sizeof(Ln));
+	u32 k = 0;
+	for (size_t a = 0; a <= n && k < nl;) {
+		const char *e = memchr(s + a, '\n', n - a);
+		size_t b = e ? (size_t)(e - s) : n;
+		ln[k] = (Ln){s + a, (u32)(b - a), k};
+		k++;
+		a = b + 1;
+	}
+	lay_lines(L, ln, k, width);
+	free(ln);
+	return L->height;
+}
+
+int md_text_height(const MdText *m) { return m->L.height; }
+
+static u32 md_text_link_item(const MdText *m, int x, int y, int mx, int my)
+{
+	const Layout *L = &m->L;
+	for (u32 i = 0; i < L->n; i++) {
+		if (L->kind[i] != IT_TEXT || !L->link[i])
+			continue;
+		int ix = x + L->x[i], iy = y + L->y[i];
+		int iw = font_width(L->font[i], L->pool.b + L->str[i], L->len[i]);
+		if (mx >= ix && mx < ix + iw && my >= iy && my < iy + L->h[i])
+			return i;
+	}
+	return NONE;
+}
+
+const char *md_text_link_at(const MdText *m, int x, int y, int mx, int my)
+{
+	u32 k = md_text_link_item(m, x, y, mx, my);
+	return k == NONE ? NULL : m->L.pool.b + m->L.link[k] - 1;
+}
+
+/* Draw the layout with its top left at (x, y); items outside the rows
+ * clip_y .. clip_y + clip_h are skipped (the caller sets the clip). */
+void md_text_draw(const MdText *m, int x, int y, int clip_y, int clip_h)
+{
+	const Layout *L = &m->L;
+	u32 hover = md_text_link_item(m, x, y, app.hover_x, app.hover_y);
+	if (hover != NONE && (app.hover_y < clip_y || app.hover_y >= clip_y + clip_h))
+		hover = NONE;
+	for (u32 i = 0; i < L->n; i++) {
+		int iy = y + L->y[i];
+		if (iy > clip_y + clip_h || iy + L->h[i] < clip_y)
+			continue;
+		u32 c = col_of(L->col[i], L->alpha[i]);
+		if (L->kind[i] == IT_RECT) {
+			draw_rect(x + L->x[i], iy, L->w[i], L->h[i], c);
+			continue;
+		}
+		const char *s = L->pool.b + L->str[i];
+		int ex = L->w[i] > 0 ? draw_text_fit(L->font[i], x + L->x[i], iy, s, L->len[i], L->w[i], c)
+		                     : draw_text(L->font[i], x + L->x[i], iy, s, L->len[i], c);
+		if (hover != NONE && L->link[i] && L->link[i] == L->link[hover])
+			draw_rect(x + L->x[i], iy + font_m[L->font[i]].ascent + PX(2), ex - x - L->x[i], PX(1), c);
+	}
+	if (hover != NONE)
+		ui_tip(x + L->x[hover], y + L->y[hover],
+		       font_width(L->font[hover], L->pool.b + L->str[hover], L->len[hover]), L->h[hover],
+		       L->pool.b + L->link[hover] - 1);
 }
 
 /* ---- views ---------------------------------------------------------------------------- */
