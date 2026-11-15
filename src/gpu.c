@@ -78,6 +78,22 @@ static struct {
 	bool bg_pending; /* staged, not yet copied */
 	float bg_pc[4];
 
+	/* pictures (binding 2): a 1x1 placeholder until the first use, then
+	 * PIC_SIZE^2; their placements (binding 3), PIC_MAX a frame */
+	VkImage pic;
+	VkDeviceMemory pic_mem;
+	VkImageView pic_view;
+	VkBuffer pic_stage;
+	VkDeviceMemory pic_stage_mem;
+	u8 *pic_map;
+	u32 pic_w;          /* 1 or PIC_SIZE */
+	bool pic_ready;     /* its layout is SHADER_READ_ONLY */
+	int pdx0, pdy0, pdx1, pdy1;
+	VkBuffer pic_ubo;
+	VkDeviceMemory pic_ubo_mem;
+	float *pic_place;   /* FRAMES * PIC_MAX * 8 floats */
+	u32 pic_n;          /* this frame's placements */
+
 	Frame fr[FRAMES];
 	u32 fi;
 	bool need_recreate;
@@ -296,19 +312,20 @@ void gpu_set_background(const u8 *rgba, int w, int h);
 
 static void make_pipeline(void)
 {
-	VkDescriptorSetLayoutBinding b[2] = {{0}, {0}};
-	for (u32 i = 0; i < 2; i++) {
+	/* 0 glyph atlas, 1 background, 2 pictures, 3 picture placements */
+	VkDescriptorSetLayoutBinding b[4] = {{0}, {0}, {0}, {0}};
+	for (u32 i = 0; i < 4; i++) {
 		b[i].binding = i;
-		b[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		b[i].descriptorType = i == 3 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 		b[i].descriptorCount = 1;
 		b[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 	}
 	VkDescriptorSetLayoutCreateInfo dli = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-	dli.bindingCount = 2;
+	dli.bindingCount = 4;
 	dli.pBindings = b;
 	VK(vkCreateDescriptorSetLayout(G.dev, &dli, NULL, &G.dsl));
 
-	VkPushConstantRange pcr = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32};
+	VkPushConstantRange pcr = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 48};
 	VkPipelineLayoutCreateInfo pli = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
 	pli.setLayoutCount = 1;
 	pli.pSetLayouts = &G.dsl;
@@ -383,11 +400,11 @@ static void make_pipeline(void)
 	sci.magFilter = sci.minFilter = VK_FILTER_LINEAR; /* the background is scaled */
 	VK(vkCreateSampler(G.dev, &sci, NULL, &G.bg_samp));
 
-	VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2};
+	VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1}};
 	VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
 	dpi.maxSets = 1;
-	dpi.poolSizeCount = 1;
-	dpi.pPoolSizes = &ps;
+	dpi.poolSizeCount = 2;
+	dpi.pPoolSizes = ps;
 	VK(vkCreateDescriptorPool(G.dev, &dpi, NULL, &G.dpool));
 	VkDescriptorSetAllocateInfo dai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
 	dai.descriptorPool = G.dpool;
@@ -416,6 +433,54 @@ static void make_atlas(void)
 	G.dy0 = 0;
 	G.dx1 = ATLAS_SIZE;
 	G.dy1 = ATLAS_SIZE;
+}
+
+/* The picture image at w x w (1: the placeholder), its staging copy zeroed,
+ * all of it to upload. The frames must be idle. */
+static void make_pics(u32 w)
+{
+	if (G.pic) {
+		vkDestroyImageView(G.dev, G.pic_view, NULL);
+		vkDestroyImage(G.dev, G.pic, NULL);
+		vkFreeMemory(G.dev, G.pic_mem, NULL);
+		vkDestroyBuffer(G.dev, G.pic_stage, NULL);
+		vkFreeMemory(G.dev, G.pic_stage_mem, NULL);
+	}
+	make_image(w, w, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, &G.pic,
+	           &G.pic_mem, &G.pic_view);
+	void *map;
+	make_buffer((VkDeviceSize)w * w * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &G.pic_stage, &G.pic_stage_mem, &map);
+	G.pic_map = map;
+	memset(G.pic_map, 0, (size_t)w * w * 4);
+	G.pic_w = w;
+	G.pic_ready = false;
+	G.pdx0 = G.pdy0 = 0;
+	G.pdx1 = G.pdy1 = (int)w;
+	VkDescriptorImageInfo ii = {G.bg_samp, G.pic_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+	VkWriteDescriptorSet wr = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+	wr.dstSet = G.ds;
+	wr.dstBinding = 2;
+	wr.descriptorCount = 1;
+	wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	wr.pImageInfo = &ii;
+	vkUpdateDescriptorSets(G.dev, 1, &wr, 0, NULL);
+}
+
+static void make_pic_ubo(void)
+{
+	VkDeviceSize sz = (VkDeviceSize)FRAMES * PIC_MAX * 8 * sizeof(float);
+	void *map;
+	make_buffer(sz, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &G.pic_ubo, &G.pic_ubo_mem, &map);
+	G.pic_place = map;
+	memset(map, 0, (size_t)sz);
+	VkDescriptorBufferInfo bi = {G.pic_ubo, 0, sz};
+	VkWriteDescriptorSet wr = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+	wr.dstSet = G.ds;
+	wr.dstBinding = 3;
+	wr.descriptorCount = 1;
+	wr.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+	wr.pBufferInfo = &bi;
+	vkUpdateDescriptorSets(G.dev, 1, &wr, 0, NULL);
 }
 
 static void make_frames(void)
@@ -567,6 +632,8 @@ bool gpu_init(SDL_Window *win, int w, int h)
 		const u8 none[4] = {0, 0, 0, 0};
 		gpu_set_background(none, 1, 1); /* binding 1 always has an image */
 	}
+	make_pics(1); /* binding 2 too, until a picture is drawn */
+	make_pic_ubo();
 	make_frames();
 	make_target();
 	return true;
@@ -599,6 +666,13 @@ void gpu_shutdown(void)
 	vkDestroyBuffer(G.dev, G.bg_stage, NULL);
 	vkFreeMemory(G.dev, G.bg_stage_mem, NULL);
 	vkDestroySampler(G.dev, G.bg_samp, NULL);
+	vkDestroyImageView(G.dev, G.pic_view, NULL);
+	vkDestroyImage(G.dev, G.pic, NULL);
+	vkFreeMemory(G.dev, G.pic_mem, NULL);
+	vkDestroyBuffer(G.dev, G.pic_stage, NULL);
+	vkFreeMemory(G.dev, G.pic_stage_mem, NULL);
+	vkDestroyBuffer(G.dev, G.pic_ubo, NULL);
+	vkFreeMemory(G.dev, G.pic_ubo_mem, NULL);
 	vkDestroyDescriptorPool(G.dev, G.dpool, NULL);
 	vkDestroyPipeline(G.dev, G.pipe, NULL);
 	vkDestroyPipelineLayout(G.dev, G.pl, NULL);
@@ -628,6 +702,7 @@ Quad *gpu_frame_quads(u32 *cap)
 	Frame *f = &G.fr[G.fi];
 	VK(vkWaitForFences(G.dev, 1, &f->fence, VK_TRUE, UINT64_MAX));
 	*cap = MAX_QUADS;
+	G.pic_n = 0;
 	return (Quad *)f->inst_map;
 }
 bool gpu_atlas_ready(void) { return G.stage_map != NULL; }
@@ -698,6 +773,82 @@ static void upload_atlas(VkCommandBuffer c)
 	        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
 	G.atlas_init = true;
 	G.dx0 = G.dx1 = 0;
+}
+
+u8 *gpu_pic_pixels(void)
+{
+	if (G.pic_w != PIC_SIZE) {
+		vkDeviceWaitIdle(G.dev);
+		make_pics(PIC_SIZE);
+	} else {
+		/* a copy from the staging buffer may be in flight in either frame */
+		VkFence fs[FRAMES];
+		for (int i = 0; i < FRAMES; i++)
+			fs[i] = G.fr[i].fence;
+		VK(vkWaitForFences(G.dev, FRAMES, fs, VK_TRUE, UINT64_MAX));
+	}
+	return G.pic_map;
+}
+
+void gpu_pic_dirty(int x, int y, int w, int h)
+{
+	if (G.pdx0 >= G.pdx1) {
+		G.pdx0 = x;
+		G.pdy0 = y;
+		G.pdx1 = x + w;
+		G.pdy1 = y + h;
+		return;
+	}
+	G.pdx0 = VX_MIN(G.pdx0, x);
+	G.pdy0 = VX_MIN(G.pdy0, y);
+	G.pdx1 = VX_MAX(G.pdx1, x + w);
+	G.pdy1 = VX_MAX(G.pdy1, y + h);
+}
+
+u16 gpu_pic_place(float sx, float sy, float scale, int u, int v, int w, int h)
+{
+	if (G.pic_n >= PIC_MAX || !G.pic_place)
+		return 0;
+	float *p = G.pic_place + ((size_t)G.fi * PIC_MAX + G.pic_n) * 8;
+	p[0] = sx;
+	p[1] = sy;
+	p[2] = scale;
+	p[3] = 0;
+	p[4] = (float)u;
+	p[5] = (float)v;
+	p[6] = (float)(u + w);
+	p[7] = (float)(v + h);
+	return (u16)(QUAD_PIC + G.pic_n++);
+}
+
+static void upload_pics(VkCommandBuffer c)
+{
+	if (G.pdx0 >= G.pdx1)
+		return;
+	int W = (int)G.pic_w;
+	int x0 = VX_MAX(G.pdx0, 0), y0 = VX_MAX(G.pdy0, 0);
+	int x1 = VX_MIN(G.pdx1, W), y1 = VX_MIN(G.pdy1, W);
+	G.pdx0 = G.pdx1 = 0;
+	if (x0 >= x1 || y0 >= y1)
+		return;
+	if (!G.pic_ready) { /* the first copy is the whole image: no texel is undefined */
+		x0 = y0 = 0;
+		x1 = y1 = W;
+	}
+	barrier(c, G.pic, G.pic_ready ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+	        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, G.pic_ready ? VK_ACCESS_SHADER_READ_BIT : 0,
+	        VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+	VkBufferImageCopy r = {0};
+	r.bufferOffset = ((VkDeviceSize)y0 * (VkDeviceSize)W + (VkDeviceSize)x0) * 4;
+	r.bufferRowLength = (u32)W;
+	r.imageSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+	r.imageOffset = (VkOffset3D){x0, y0, 0};
+	r.imageExtent = (VkExtent3D){(u32)(x1 - x0), (u32)(y1 - y0), 1};
+	vkCmdCopyBufferToImage(c, G.pic_stage, G.pic, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+	barrier(c, G.pic, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+	G.pic_ready = true;
 }
 
 void gpu_set_background(const u8 *rgba, int w, int h)
@@ -793,6 +944,7 @@ bool gpu_frame(const Quad *q, u32 n, u32 clear)
 	VK(vkBeginCommandBuffer(c, &bi));
 	upload_atlas(c);
 	upload_background(c);
+	upload_pics(c);
 
 	VkClearValue cv;
 	cv.color.float32[0] = (float)((clear >> 24) & 255) / 255.0f;
@@ -813,8 +965,13 @@ bool gpu_frame(const Quad *q, u32 n, u32 clear)
 		vkCmdSetScissor(c, 0, 1, &sc);
 		vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, G.pipe);
 		vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, G.pl, 0, 1, &G.ds, 0, NULL);
-		float pc[8] = {2.0f / (float)G.w, 2.0f / (float)G.h, 0, 0, G.bg_pc[0], G.bg_pc[1], G.bg_pc[2], G.bg_pc[3]};
-		vkCmdPushConstants(c, G.pl, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
+		struct {
+			float f[8];
+			u32 pic_base, pad[3];
+		} pc = {{2.0f / (float)G.w, 2.0f / (float)G.h, 0, 0, G.bg_pc[0], G.bg_pc[1], G.bg_pc[2], G.bg_pc[3]},
+		        G.fi * PIC_MAX,
+		        {0, 0, 0}};
+		vkCmdPushConstants(c, G.pl, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
 		VkDeviceSize off = 0;
 		vkCmdBindVertexBuffers(c, 0, 1, &f->inst, &off);
 		vkCmdDraw(c, 4, n, 0, 0); /* corners from gl_VertexIndex, quads from the instance buffer */

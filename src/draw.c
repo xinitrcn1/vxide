@@ -35,7 +35,7 @@ static void push(int x, int y, int w, int h, u16 u, u16 v, u32 c)
 	int cx1 = VX_MIN(x1, draw.x1), cy1 = VX_MIN(y1, draw.y1);
 	if (cx0 >= cx1 || cy0 >= cy1 || !(c & 0xFF))
 		return;
-	if (u < QUAD_IMAGE) {
+	if (u < QUAD_PIC) {
 		u = (u16)(u + (cx0 - x));
 		v = (u16)(v + (cy0 - y));
 	} else if (u == QUAD_SQUIGGLE && (cx0 != x || cy0 != y)) {
@@ -55,6 +55,18 @@ static void push(int x, int y, int w, int h, u16 u, u16 v, u32 c)
 
 void draw_rect(int x, int y, int w, int h, u32 c) { push(x, y, w, h, QUAD_SOLID, 0, c); }
 void push_image_quad(int x, int y, int w, int h, u32 alpha) { push(x, y, w, h, QUAD_IMAGE, 0, 0xFFFFFF00u | (alpha & 255)); }
+
+void draw_picture(int x, int y, int w, int h, int u, int v, int iw, int ih, u32 alpha)
+{
+	if (w <= 0 || h <= 0 || iw <= 0 || ih <= 0)
+		return;
+	/* off screen or clipped away: no placement spent */
+	if (x >= draw.x1 || y >= draw.y1 || x + w <= draw.x0 || y + h <= draw.y0)
+		return;
+	u16 q = gpu_pic_place((float)x, (float)y, (float)iw / (float)w, u, v, iw, ih);
+	if (q)
+		push(x, y, w, h, q, 0, 0xFFFFFF00u | (alpha & 255));
+}
 
 void draw_atlas_rect(int x, int y, int w, int h, u16 u, u16 v, u32 c) { push(x, y, w, h, u, v, c); }
 

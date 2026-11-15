@@ -6,7 +6,7 @@ layout(location = 0) in ivec4 in_rect; // x, y, w, h in pixels
 layout(location = 1) in uvec2 in_uv;   // atlas texel origin; u = 0xFFFF solid, 0xFFFE squiggle
 layout(location = 2) in vec4 in_color; // straight alpha
 
-layout(push_constant) uniform PC { vec2 inv_half_size; vec4 bg; } pc;
+layout(push_constant) uniform PC { vec2 inv_half_size; vec4 bg; uint pic_base; } pc;
 
 layout(location = 0) flat out uvec2 v_uv;
 layout(location = 1) flat out vec4 v_color;
