@@ -78,7 +78,11 @@ enum {
 	LANG_GDSCRIPT,  /* GDScript (.gd)                                */
 	LANG_GODOT_RES, /* Godot resources (.tscn .tres .godot .import)  */
 	LANG_XML,       /* XML (.xml .ui .qrc .svg .csproj ..., <?xml)   */
-	LANG_COUNT /* Markdown keeps a fence language in 5 bits: <= 32  */
+	LANG_GLSL,      /* GLSL (.glsl .comp .frag .vert ...): the C lexer, GLSL's words */
+	/* Markdown keeps a fence language in 5 bits (0..31): the languages from
+	 * here on are not fence languages (their fences stay plain) */
+	LANG_SPIRV,     /* SPIR-V assembly (.spvasm, spirv-dis output)   */
+	LANG_COUNT
 };
 
 /* Output spans for one line. Arrays are caller-owned with capacity cap;
@@ -109,6 +113,9 @@ u32 syn_line(int lang, u32 state, const char *s, u32 n, SynSpans *out);
 /* The language of a Markdown fence's info string ("c", "rust", "sh"...),
  * LANG_NONE when unknown. */
 int syn_fence_lang(const char *w, u32 n);
+/* The language of a ucas code block's tag (```glsl, ```comp, ```spv, ```c
+ * ...): the shader languages too. LANG_NONE when unknown. */
+int syn_block_lang(const char *w, u32 n);
 
 /* Line-comment prefix for toggle comment (Ctrl+/), or NULL. */
 const char *syn_line_comment(int lang);

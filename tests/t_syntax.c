@@ -1148,7 +1148,7 @@ static void test_detect3(void)
 	CHECK(syn_line_comment(LANG_JSON) == NULL);
 	CHECK(syn_line_comment(LANG_DIFF) == NULL);
 	CHECK_STR(syn_line_comment(LANG_CMAKE), "#");
-	CHECK(LANG_COUNT <= 32); /* Markdown keeps a fence language in 5 bits */
+	CHECK(LANG_SPIRV == 32); /* Markdown keeps a fence language in 5 bits: up to GLSL (31) */
 	/* Markdown fences embed the new languages (language id > 15) */
 	u32 s = lex(LANG_MARKDOWN, 0, "```jsonc");
 	s = lex(LANG_MARKDOWN, s, "{\"a\": 1} // c");
@@ -1402,7 +1402,7 @@ static void test_detect4(void)
 	s = lex(LANG_MARKDOWN, s, "k: v");
 	T("k", TK_TAG);
 	(void)s;
-	CHECK(LANG_COUNT <= 32);
+	CHECK(LANG_GLSL < 32);
 }
 
 static void test_java(void)
@@ -1638,7 +1638,7 @@ static void test_detect5(void)
 	CHECK(!strcmp(syn_line_comment(LANG_JAVA), "//") && !strcmp(syn_line_comment(LANG_KOTLIN), "//"));
 	CHECK(!strcmp(syn_line_comment(LANG_TOML), "#"));
 	CHECK(!strcmp(syn_lang_lsp_id(LANG_KOTLIN), "kotlin"));
-	CHECK(LANG_COUNT <= 32);
+	CHECK(LANG_GLSL < 32);
 	/* fenced code in Markdown */
 	u32 s = lex(LANG_MARKDOWN, 0, "```java");
 	s = lex(LANG_MARKDOWN, s, "public class A {}");
@@ -1991,7 +1991,7 @@ static void test_detect6(void)
 	CHECK_STR(syn_lang_lsp_id(LANG_C), "c");
 	CHECK_STR(syn_line_comment(LANG_CPP), "//");
 	CHECK_STR(syn_line_comment(LANG_RUST), "//");
-	CHECK(LANG_COUNT <= 32);
+	CHECK(LANG_GLSL < 32);
 	/* fenced code in Markdown, raw string state carried in the fence */
 	u32 s = lex(LANG_MARKDOWN, 0, "```cpp");
 	s = lex(LANG_MARKDOWN, s, "auto s = R\"(");
@@ -2015,7 +2015,7 @@ static void test_csharp(void)
 {
 	u32 s;
 	CHECK(LANG_CSHARP == 25 && LANG_QML == 26 && LANG_QMAKE == 27 && LANG_GDSCRIPT == 28 && LANG_GODOT_RES == 29 &&
-	      LANG_XML == 30 && LANG_COUNT == 31);
+	      LANG_XML == 30 && LANG_GLSL == 31 && LANG_SPIRV == 32 && LANG_COUNT == 33);
 	/* using directives, namespaces, aliases */
 	lex(LANG_CSHARP, 0, "using System.Collections.Generic;");
 	T("using", TK_CONTROL);
@@ -2750,6 +2750,71 @@ static void test_xml(void)
 	CHECK(s == 0);
 }
 
+/* GLSL (the C lexer with GLSL's words) and SPIR-V assembly: ucas's code blocks */
+static void test_shaders(void)
+{
+	CHECK(syn_lang_for_path("a/b.comp", NULL, 0) == LANG_GLSL);
+	CHECK(syn_lang_for_path("x.frag", NULL, 0) == LANG_GLSL && syn_lang_for_path("x.glsl", NULL, 0) == LANG_GLSL);
+	CHECK(syn_lang_for_path("x.spvasm", NULL, 0) == LANG_SPIRV);
+	CHECK(syn_lang_for_path("x.cs", NULL, 0) == LANG_CSHARP);
+	CHECK(syn_block_lang("comp", 4) == LANG_GLSL && syn_block_lang("GLSL", 4) == LANG_GLSL);
+	CHECK(syn_block_lang("spv", 3) == LANG_SPIRV && syn_block_lang("c", 1) == LANG_C);
+	CHECK(syn_block_lang("rust", 4) == LANG_RUST && syn_block_lang("nope", 4) == LANG_NONE);
+	CHECK(syn_fence_lang("glsl", 4) == LANG_GLSL);  /* fits Markdown's 5 bits */
+	CHECK(syn_fence_lang("spv", 3) == LANG_NONE);   /* 32: does not */
+	CHECK(!strcmp(syn_lang_name(LANG_GLSL), "GLSL") && !strcmp(syn_line_comment(LANG_SPIRV), ";"));
+
+	lex(LANG_GLSL, 0, "layout(std430, binding = 0) buffer B { uvec4 v[]; };");
+	T("layout", TK_STORAGE);
+	T("buffer", TK_STORAGE);
+	T("uvec4", TK_STORAGE);
+	TN("0", 1, TK_NUMBER); /* the first is std430's */
+	lex(LANG_GLSL, 0, "void main() { if (x > 1u) discard; v[0] = gl_GlobalInvocationID.x; }");
+	T("main", TK_FUNCTION);
+	T("if", TK_CONTROL);
+	T("discard", TK_CONTROL);
+	T("gl_GlobalInvocationID", TK_LANGCONST);
+	u32 s = lex(LANG_GLSL, 0, "#version 450 /* a");
+	T("#version", TK_CONTROL); /* a directive, as C's #include */
+	lex(LANG_GLSL, s, "comment */ mat3 m;");
+	T("comment", TK_COMMENT);
+	T("mat3", TK_STORAGE);
+	lex(LANG_GLSL, 0, "struct Light { vec3 dir; };");
+	T("struct", TK_STORAGE);
+	T("Light", TK_TYPE);
+	/* C keeps its own words: no GLSL types there */
+	lex(LANG_C, 0, "vec3 v; uint32_t gl_x;");
+	T("vec3", TK_TEXT);
+	T("gl_x", TK_TEXT);
+
+	s = lex(LANG_SPIRV, 0, "; SPIR-V");
+	T("; SPIR-V", TK_COMMENT);
+	CHECK(s == 0);
+	lex(LANG_SPIRV, 0, "     %uint_300 = OpConstant %uint 300");
+	T("%uint_300", TK_VARIABLE);
+	T("OpConstant", TK_STORAGE);
+	TN("300", 1, TK_NUMBER);
+	T("=", TK_OPERATOR);
+	lex(LANG_SPIRV, 0, "%24 = OpExtInst %uint %2 UMin %20 %uint_300 ; clamp");
+	T("OpExtInst", TK_FUNCTION);
+	T("UMin", TK_CONSTANT);
+	T("; clamp", TK_COMMENT);
+	lex(LANG_SPIRV, 0, "OpBranchConditional %c %a %b");
+	T("OpBranchConditional", TK_CONTROL);
+	lex(LANG_SPIRV, 0, "%v4 = OpTypeVector %float 4");
+	T("OpTypeVector", TK_TYPE);
+	lex(LANG_SPIRV, 0, "OpEntryPoint GLCompute %main \"main\" %gid");
+	T("OpEntryPoint", TK_PREPROC);
+	T("GLCompute", TK_CONSTANT);
+	T("\"main\"", TK_STRING);
+	lex(LANG_SPIRV, 0, "%f = OpConstant %float -1.5e-3");
+	T("-1.5e-3", TK_NUMBER);
+	/* a fence in Markdown: GLSL inside */
+	s = lex(LANG_MARKDOWN, 0, "```glsl");
+	lex(LANG_MARKDOWN, s, "uniform vec4 c;");
+	T("uniform", TK_STORAGE);
+}
+
 static void test_detect7(void)
 {
 	CHECK(syn_lang_for_path("src/Program.cs", NULL, 0) == LANG_CSHARP);
@@ -2796,7 +2861,7 @@ static void test_detect7(void)
 	CHECK_STR(syn_line_comment(LANG_GDSCRIPT), "#");
 	CHECK_STR(syn_line_comment(LANG_GODOT_RES), ";");
 	CHECK(syn_line_comment(LANG_XML) == NULL);
-	CHECK(LANG_COUNT <= 32);
+	CHECK(LANG_GLSL < 32);
 	/* Markdown fences embed the new languages and carry their states */
 	u32 s = lex(LANG_MARKDOWN, 0, "```csharp");
 	s = lex(LANG_MARKDOWN, s, "var r = $$\"\"\"\"");
@@ -2903,6 +2968,7 @@ int main(void)
 	test_godot_res();
 	test_xml();
 	test_detect7();
+	test_shaders();
 	test_fuzz_new();
 	bench();
 	bench_more();

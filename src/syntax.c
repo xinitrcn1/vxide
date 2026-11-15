@@ -199,6 +199,38 @@ static const char c_support[] =
 	"pthread_rwlock_t pthread_rwlockattr_t pthread_t pthread_key_t";
 static const char c_tag[] = "struct union enum";
 
+/* --- GLSL: the C lexer with these words (GLSL 4.60, Vulkan GLSL) ------ */
+static const char glsl_control[] =
+	"break continue do else for if return while switch case default discard demote "
+	"terminateInvocation terminateRayEXT ignoreIntersectionEXT";
+static const char glsl_storage[] =
+	"const uniform buffer shared in out inout attribute varying layout centroid flat smooth "
+	"noperspective patch sample invariant precise coherent volatile restrict readonly writeonly "
+	"nonuniformEXT subroutine precision highp mediump lowp rayPayloadEXT rayPayloadInEXT "
+	"hitAttributeEXT callableDataEXT callableDataInEXT shaderRecordEXT taskPayloadSharedEXT "
+	"perprimitiveEXT";
+static const char glsl_types[] =
+	"void bool int uint float double atomic_uint "
+	"vec2 vec3 vec4 ivec2 ivec3 ivec4 uvec2 uvec3 uvec4 bvec2 bvec3 bvec4 dvec2 dvec3 dvec4 "
+	"i8vec2 i8vec3 i8vec4 u8vec2 u8vec3 u8vec4 i16vec2 i16vec3 i16vec4 u16vec2 u16vec3 u16vec4 "
+	"i64vec2 i64vec3 i64vec4 u64vec2 u64vec3 u64vec4 f16vec2 f16vec3 f16vec4 f64vec2 f64vec3 f64vec4 "
+	"mat2 mat3 mat4 mat2x2 mat2x3 mat2x4 mat3x2 mat3x3 mat3x4 mat4x2 mat4x3 mat4x4 "
+	"dmat2 dmat3 dmat4 dmat2x2 dmat2x3 dmat2x4 dmat3x2 dmat3x3 dmat3x4 dmat4x2 dmat4x3 dmat4x4 "
+	"f16mat2 f16mat3 f16mat4 "
+	"sampler sampler1D sampler2D sampler3D samplerCube sampler2DRect sampler1DArray sampler2DArray "
+	"samplerCubeArray samplerBuffer sampler2DMS sampler2DMSArray sampler1DShadow sampler2DShadow "
+	"samplerCubeShadow sampler1DArrayShadow sampler2DArrayShadow samplerCubeArrayShadow "
+	"sampler2DRectShadow samplerShadow isampler1D isampler2D isampler3D isamplerCube isampler2DArray "
+	"isamplerBuffer usampler1D usampler2D usampler3D usamplerCube usampler2DArray usamplerBuffer "
+	"texture1D texture2D texture3D textureCube texture2DArray textureCubeArray textureBuffer "
+	"texture2DMS itexture2D utexture2D itexture3D utexture3D "
+	"image1D image2D image3D imageCube image2DRect image1DArray image2DArray imageCubeArray "
+	"imageBuffer image2DMS image2DMSArray iimage1D iimage2D iimage3D iimageCube iimage2DArray "
+	"iimageBuffer uimage1D uimage2D uimage3D uimageCube uimage2DArray uimageBuffer "
+	"subpassInput isubpassInput usubpassInput subpassInputMS accelerationStructureEXT rayQueryEXT";
+static const char glsl_langconst[] = "true false";
+static KwSet kw_glsl;
+
 static const char dox_tags[] =
 	"a addindex addtogroup anchor arg attention author authors b brief bug c "
 	"callergraph callgraph category cite class code cond copybrief copydetails "
@@ -407,6 +439,12 @@ static void syn_build(void)
 	kw_list(&kw_c, c_support, TK_TYPE);
 	kw_list(&kw_c, c_tag, KC_TAG);
 	kw_add(&kw_c, "defined", 7, KC_DEFINED);
+	kw_list(&kw_glsl, glsl_control, TK_CONTROL);
+	kw_list(&kw_glsl, glsl_storage, TK_STORAGE);
+	kw_list(&kw_glsl, glsl_langconst, TK_LANGCONST);
+	kw_list(&kw_glsl, glsl_types, TK_STORAGE); /* storage.type, as C's int */
+	kw_add(&kw_glsl, "struct", 6, KC_TAG);
+	kw_add(&kw_glsl, "defined", 7, KC_DEFINED);
 
 	kw_list(&kw_dox, dox_tags, TK_STORAGE);
 	kw_add(&kw_dox, "param", 5, KC_DOXPARAM);
@@ -681,7 +719,8 @@ static bool c_dead_else(const char *w, u32 n)
 
 enum { P_NONE, P_DOT, P_TAG, P_GOTO, P_DEFINE, P_INCLUDE, P_PRAGMA };
 
-static u32 lex_c(u32 state, const char *s, u32 n, SynSpans *o)
+/* C, or GLSL with kw = &kw_glsl */
+static u32 lex_c_kw(const KwSet *kw, u32 state, const char *s, u32 n, SynSpans *o)
 {
 	u32 mode = state & 7u, ppk = (state >> 4) & 3u, if0 = (state >> 8) & 0xFFu;
 	bool pp = (state & C_PP) != 0;
@@ -873,7 +912,7 @@ static u32 lex_c(u32 state, const char *s, u32 n, SynSpans *o)
 				cls = TK_VARIABLE; /* variable.parameter.preprocessor */
 			} else if (prev == P_PRAGMA) {
 				cls = TK_VARIABLE; /* entity.other.attribute-name.pragma */
-			} else if ((k = kw_find(&kw_c, s + i, len)) >= 0) {
+			} else if ((k = kw_find(kw, s + i, len)) >= 0) {
 				if (k == KC_TAG)
 					newprev = P_TAG;
 				else if (k == KC_GOTO)
@@ -882,6 +921,8 @@ static u32 lex_c(u32 state, const char *s, u32 n, SynSpans *o)
 					cls = (line_pp && kind == PPK_COND) ? TK_CONTROL : dflt;
 				else
 					cls = kw_tk((u32)k);
+			} else if (kw == &kw_glsl && len > 3 && !memcmp(s + i, "gl_", 3)) {
+				cls = TK_LANGCONST; /* variable.language: gl_Position, gl_GlobalInvocationID */
 			} else if (attr) {
 				cls = TK_TYPE;
 			} else if (prev == P_TAG) {
@@ -4971,6 +5012,8 @@ static int md_fence_lang(const char *w, u32 n)
 	    {"cs", LANG_CSHARP},    {"csharp", LANG_CSHARP}, {"c#", LANG_CSHARP},    {"qml", LANG_QML},
 	    {"gdscript", LANG_GDSCRIPT}, {"gd", LANG_GDSCRIPT}, {"xml", LANG_XML},  {"svg", LANG_XML},
 	    {"xaml", LANG_XML},    {"qmake", LANG_QMAKE},  {"tscn", LANG_GODOT_RES}, {"tres", LANG_GODOT_RES},
+	    {"glsl", LANG_GLSL},    {"comp", LANG_GLSL},    {"frag", LANG_GLSL},     {"vert", LANG_GLSL},
+	    /* LANG_SPIRV (32) does not fit the fence's 5 bits: no "spv" here */
 	};
 	for (size_t i = 0; i < VX_COUNT(map); i++)
 		if (!strcmp(b, map[i].name))
@@ -9575,10 +9618,102 @@ static u32 lex_godot_res(u32 state, const char *s, u32 n, SynSpans *o)
 	return open ? 1u : 0u;
 }
 
+/* ================================================================== */
+/* SPIR-V assembly (spirv-dis, spirv-as): one line at a time, no state  */
+/*   ; comment   %id   OpCode   "string"   123 0x1F -1.5   Enumerant     */
+
+static bool spv_is_word(u8 c) { return is_cident(c) || c == '.'; }
+
+static u32 spv_opcode_class(const char *w, u32 n)
+{
+	static const char *const ctl[] = {"OpBranch", "OpBranchConditional", "OpSwitch", "OpReturn", "OpReturnValue",
+	                                  "OpKill", "OpUnreachable", "OpTerminateInvocation", "OpDemoteToHelperInvocation",
+	                                  "OpLoopMerge", "OpSelectionMerge", "OpLabel", "OpFunction", "OpFunctionEnd",
+	                                  "OpFunctionCall", "OpPhi", "OpIgnoreIntersectionKHR", "OpTerminateRayKHR"};
+	static const char *const meta[] = {"OpCapability", "OpExtension", "OpExtInstImport", "OpMemoryModel",
+	                                   "OpEntryPoint", "OpExecutionMode", "OpExecutionModeId", "OpSource",
+	                                   "OpSourceExtension", "OpSourceContinued", "OpName", "OpMemberName",
+	                                   "OpString", "OpLine", "OpNoLine", "OpModuleProcessed", "OpDecorate",
+	                                   "OpMemberDecorate", "OpDecorateId", "OpDecorateString",
+	                                   "OpMemberDecorateString", "OpDecorationGroup", "OpGroupDecorate"};
+	for (size_t i = 0; i < VX_COUNT(ctl); i++)
+		if (strlen(ctl[i]) == n && !memcmp(ctl[i], w, n))
+			return TK_CONTROL;
+	for (size_t i = 0; i < VX_COUNT(meta); i++)
+		if (strlen(meta[i]) == n && !memcmp(meta[i], w, n))
+			return TK_PREPROC;
+	if (n > 6 && !memcmp(w, "OpType", 6))
+		return TK_TYPE;
+	if ((n >= 10 && !memcmp(w, "OpConstant", 10)) || (n >= 14 && !memcmp(w, "OpSpecConstant", 14)) ||
+	    (n == 10 && !memcmp(w, "OpVariable", 10)) || (n == 7 && !memcmp(w, "OpUndef", 7)))
+		return TK_STORAGE;
+	return TK_FUNCTION; /* an instruction */
+}
+
+static u32 lex_spirv(const char *s, u32 n, SynSpans *o)
+{
+	u32 i = 0;
+	while (i < n) {
+		u8 c = (u8)s[i];
+		if (c == ';') {
+			emit(o, i, n - i, TK_COMMENT);
+			break;
+		}
+		if (c == '"') {
+			u32 j = i + 1;
+			while (j < n && s[j] != '"')
+				j += s[j] == '\\' && j + 1 < n ? 2 : 1;
+			j = j < n ? j + 1 : n;
+			emit(o, i, j - i, TK_STRING);
+			i = j;
+			continue;
+		}
+		if (c == '%') {
+			u32 j = i + 1;
+			while (j < n && spv_is_word((u8)s[j]))
+				j++;
+			emit(o, i, j - i, TK_VARIABLE);
+			i = j;
+			continue;
+		}
+		if (is_digit(c) || ((c == '-' || c == '+') && i + 1 < n && is_digit((u8)s[i + 1]))) {
+			u32 j = i + 1;
+			while (j < n && (is_cident((u8)s[j]) || s[j] == '.' || ((s[j] == '-' || s[j] == '+') &&
+			                                                         (s[j - 1] == 'e' || s[j - 1] == 'E' ||
+			                                                          s[j - 1] == 'p' || s[j - 1] == 'P'))))
+				j++;
+			emit(o, i, j - i, TK_NUMBER);
+			i = j;
+			continue;
+		}
+		if (is_cident(c)) {
+			u32 j = i;
+			while (j < n && spv_is_word((u8)s[j]))
+				j++;
+			u32 len = j - i;
+			if (len > 2 && s[i] == 'O' && s[i + 1] == 'p' && s[i + 2] >= 'A' && s[i + 2] <= 'Z')
+				emit(o, i, len, spv_opcode_class(s + i, len));
+			else
+				emit(o, i, len, TK_CONSTANT); /* an enumerant: Uniform, Location, GLSL.std.450 */
+			i = j;
+			continue;
+		}
+		if (c == '=' || c == '|') {
+			emit(o, i, 1, TK_OPERATOR);
+			i++;
+			continue;
+		}
+		i++;
+	}
+	return 0;
+}
+
 static u32 lex_any(int lang, u32 state, const char *s, u32 n, SynSpans *o)
 {
 	switch (lang) {
-	case LANG_C: return lex_c(state, s, n, o);
+	case LANG_C: return lex_c_kw(&kw_c, state, s, n, o);
+	case LANG_GLSL: return lex_c_kw(&kw_glsl, state, s, n, o);
+	case LANG_SPIRV: return lex_spirv(s, n, o);
 	case LANG_ASM_GAS: return lex_asm(true, state, s, n, o);
 	case LANG_ASM_INTEL: return lex_asm(false, state, s, n, o);
 	case LANG_LISP: return lex_lisp(state, s, n, o);
@@ -9693,6 +9828,8 @@ const char *syn_lang_name(int lang)
 	case LANG_GDSCRIPT: return "GDScript";
 	case LANG_GODOT_RES: return "Godot Resource";
 	case LANG_XML: return "XML";
+	case LANG_GLSL: return "GLSL";
+	case LANG_SPIRV: return "SPIR-V Assembly";
 	default: return "Plain Text";
 	}
 }
@@ -9735,6 +9872,8 @@ const char *syn_line_comment(int lang)
 {
 	switch (lang) {
 	case LANG_C: return "//";
+	case LANG_GLSL: return "//";
+	case LANG_SPIRV: return ";";
 	case LANG_ASM_GAS:
 	case LANG_SH:
 	case LANG_PERL:
@@ -9998,6 +10137,10 @@ int syn_lang_for_path(const char *path, const char *head, size_t headlen)
 		e[i] = (char)lower((u8)dot[1 + i]);
 	if (!strcmp(e, "c"))
 		return LANG_C;
+	if (syn_block_lang(e, (u32)el) == LANG_GLSL)
+		return LANG_GLSL; /* .glsl .comp .frag .vert ... */
+	if (!strcmp(e, "spvasm"))
+		return LANG_SPIRV;
 	if (!strcmp(e, "h")) /* C unless the head has clear C++ markers */
 		return cpp_head(head, headlen) ? LANG_CPP : LANG_C;
 	static const char *const cpp[] = {"cpp", "cc", "cxx", "c++", "hpp", "hh", "hxx", "h++", "ipp", "tpp", "inl", "ixx", "cppm"};
@@ -10095,3 +10238,22 @@ int syn_lang_for_path(const char *path, const char *head, size_t headlen)
 }
 
 int syn_fence_lang(const char *w, u32 n) { return md_fence_lang(w, n); }
+
+int syn_block_lang(const char *w, u32 n)
+{
+	char b[16];
+	if (n == 0 || n >= sizeof b)
+		return LANG_NONE;
+	for (u32 i = 0; i < n; i++)
+		b[i] = (char)lower((u8)w[i]);
+	b[n] = 0;
+	/* glslang's stage extensions, as ucas reads a block's tag */
+	static const char *const glsl[] = {"glsl", "comp", "frag", "vert", "geom", "tesc", "tese", "mesh", "task",
+	                                   "rgen", "rint", "rahit", "rchit", "rmiss", "rcall"};
+	for (size_t i = 0; i < VX_COUNT(glsl); i++)
+		if (!strcmp(b, glsl[i]))
+			return LANG_GLSL;
+	if (!strcmp(b, "spv") || !strcmp(b, "spirv") || !strcmp(b, "spvasm") || !strcmp(b, "spir-v"))
+		return LANG_SPIRV;
+	return md_fence_lang(w, n);
+}
