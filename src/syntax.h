@@ -82,6 +82,18 @@ enum {
 	/* Markdown keeps a fence language in 5 bits (0..31): the languages from
 	 * here on are not fence languages (their fences stay plain) */
 	LANG_SPIRV,     /* SPIR-V assembly (.spvasm, spirv-dis output)   */
+	LANG_SAIL,      /* Sail ISA specifications (.sail)               */
+	LANG_VERILOG,   /* Verilog-2005 (.v .vh)                         */
+	LANG_SYSTEMVERILOG, /* SystemVerilog (.sv .svh)                  */
+	LANG_TCL,       /* Tcl (.tcl .tk .sdc .xdc, tclsh/wish shebangs)  */
+	LANG_PASCAL,    /* Pascal (.p, .pas/.pp without Object Pascal)   */
+	LANG_OBJPASCAL, /* Object Pascal (.dpr .lpr, .pas/.pp with classes) */
+	LANG_R,         /* R (.r .R, .Rprofile, Rscript shebangs)        */
+	LANG_RUBY,      /* Ruby (.rb .rake .gemspec, Gemfile, Rakefile)  */
+	LANG_ALGOL68,   /* ALGOL 68 (.a68), upper and quote stropping    */
+	LANG_HASKELL,   /* Haskell (.hs .hs-boot .hsig, runghc shebangs) */
+	LANG_BATCH,     /* Windows batch files (.bat .cmd)               */
+	LANG_POWERSHELL, /* PowerShell (.ps1 .psm1 .psd1, pwsh shebangs) */
 	LANG_COUNT
 };
 

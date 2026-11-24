@@ -68,7 +68,15 @@ out (and the ucas tab says so).
   shell), JSON / JSON with Comments, ignore files (.gitignore and friends),
   diff/patch, git commit messages, git-rebase-todo, Python, YAML,
   CODEOWNERS, GLSL (`.glsl .comp .frag .vert` ..., the C lexer with GLSL's
-  words) and SPIR-V assembly (`.spvasm`). Languages are also
+  words), SPIR-V assembly (`.spvasm`), Sail (`.sail`: nested comments,
+  `'n` type variables, `$include`/`$[attributes]`), Verilog and SystemVerilog
+  (sized numbers, `` `define``, `$display`, module instantiations), Tcl
+  (`.tcl .sdc .xdc`, tclsh/wish shebangs), Pascal and Object Pascal (`.pas`/`.pp`
+  told apart by the file head), R, Ruby (heredocs, `%w[]`, `#{}` interpolation)
+  ALGOL 68 (upper and quote stropping, `CO`/`#`/`¢` comments), Haskell (nested
+  `{- -}`, `{-# pragmas #-}`, declarations), Windows batch (`.bat .cmd`: `%var%`,
+  `%%i`, `!delayed!`, labels) and PowerShell (cmdlets, `[types]`, `$(...)` in
+  strings, here-strings, `<# .SYNOPSIS #>`). Languages are also
   detected from shebangs and file heads. They were checked against VSCodium's own `c.tmLanguage.json`
   scopes and the Dark+/Light+ rules. When clangd is running, its semantic
   tokens are overlaid the way the clangd extension does it (readonly

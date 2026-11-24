@@ -2015,7 +2015,7 @@ static void test_csharp(void)
 {
 	u32 s;
 	CHECK(LANG_CSHARP == 25 && LANG_QML == 26 && LANG_QMAKE == 27 && LANG_GDSCRIPT == 28 && LANG_GODOT_RES == 29 &&
-	      LANG_XML == 30 && LANG_GLSL == 31 && LANG_SPIRV == 32 && LANG_COUNT == 33);
+	      LANG_XML == 30 && LANG_GLSL == 31 && LANG_SPIRV == 32);
 	/* using directives, namespaces, aliases */
 	lex(LANG_CSHARP, 0, "using System.Collections.Generic;");
 	T("using", TK_CONTROL);
@@ -2932,6 +2932,807 @@ static void test_fuzz_new(void)
 	CHECK(bad == 0);
 }
 
+static void test_sail(void)
+{
+	u32 s;
+	lex(LANG_SAIL, 0, "val MinMax : forall 'n. (bool, bits('n)) -> bits(32)");
+	T("val", TK_STORAGE);
+	T("MinMax", TK_FUNCTION);
+	T("forall", TK_STORAGE);
+	T("'n", TK_TYPE);
+	T("bool", TK_TYPE);
+	T("bits", TK_TYPE);
+	T("32", TK_NUMBER);
+	T("->", TK_OPERATOR);
+	lex(LANG_SAIL, 0, "function clause decode (0b0110 @ _ as op) if SEE < 1 = execute_X(op, true)");
+	T("function", TK_STORAGE);
+	T("clause", TK_STORAGE);
+	T("decode", TK_FUNCTION);
+	T("0b0110", TK_NUMBER);
+	T("as", TK_STORAGE);
+	T("if", TK_CONTROL);
+	T("execute_X", TK_FUNCTION);
+	T("true", TK_LANGCONST);
+	lex(LANG_SAIL, 0, "union clause ast = ADD : (bits(5), bitzero) // the ADD");
+	T("union", TK_STORAGE);
+	T("ast", TK_TYPE);
+	T("bitzero", TK_LANGCONST);
+	T("// the ADD", TK_COMMENT);
+	lex(LANG_SAIL, 0, "register PC : bits(64)");
+	T("register", TK_STORAGE);
+	T("PC", TK_VARIABLE);
+	lex(LANG_SAIL, 0, "enum Shade = {Shade_Dark, Shade_Light}");
+	T("Shade", TK_TYPE);
+	T("Shade_Dark", TK_TEXT);
+	lex(LANG_SAIL, 0, "$include <prelude.sail>");
+	T("$include", TK_PREPROC);
+	T("<prelude.sail>", TK_STRING);
+	lex(LANG_SAIL, 0, "$[sv_module] let x : bits(32) = 0x0000_FFFF; foreach (i from 0 to 3 by 1 in inc) ()");
+	T("$[sv_module]", TK_PREPROC);
+	T("let", TK_STORAGE);
+	T("0x0000_FFFF", TK_NUMBER);
+	T("foreach", TK_CONTROL);
+	T("from", TK_CONTROL);
+	T("inc", TK_LANGCONST);
+	lex(LANG_SAIL, 0, "print_endline(\"pc=\\n\")");
+	T("\"pc=", TK_STRING);
+	T("\\n", TK_ESCAPE);
+	/* nested block comments span lines */
+	s = lex(LANG_SAIL, 0, "x /* a /* b */");
+	T("/* a /* b */", TK_COMMENT);
+	CHECK(s == 1);
+	s = lex(LANG_SAIL, s, "still */ let");
+	T("still */", TK_COMMENT);
+	T("let", TK_STORAGE);
+	CHECK(s == 0);
+}
+
+static void test_verilog(void)
+{
+	u32 s;
+	lex(LANG_VERILOG, 0, "module top #(parameter W = 8) (input wire clk, output reg [W-1:0] q);");
+	T("module", TK_STORAGE);
+	T("top", TK_TYPE);
+	T("parameter", TK_STORAGE);
+	T("input", TK_STORAGE);
+	T("wire", TK_STORAGE);
+	T("reg", TK_STORAGE);
+	T("8", TK_NUMBER);
+	lex(LANG_VERILOG, 0, "always @(posedge clk) begin if (r == 4'sd3) q <= 8'hFF; else q <= 'b1x0z; end");
+	T("always", TK_CONTROL);
+	T("posedge", TK_CONTROL);
+	T("begin", TK_CONTROL);
+	T("4'sd3", TK_NUMBER);
+	T("8'hFF", TK_NUMBER);
+	T("'b1x0z", TK_NUMBER);
+	T("<=", TK_OPERATOR);
+	T("end", TK_CONTROL);
+	lex(LANG_VERILOG, 0, "`timescale 1ns/1ps `define MAX(a,b) $display(\"%0d\\n\", r); #10");
+	T("`timescale", TK_PREPROC);
+	T("1ns", TK_NUMBER);
+	T("`define", TK_PREPROC);
+	T("$display", TK_FUNCTION);
+	T("\\n", TK_ESCAPE);
+	lex(LANG_VERILOG, 0, "fifo #(.DEPTH(4)) u_fifo (.clk(clk), .din(r));");
+	T("fifo", TK_TYPE);
+	T("DEPTH", TK_VARIABLE);
+	T("u_fifo", TK_TEXT);
+	TN("clk", 0, TK_VARIABLE);
+	TN("clk", 1, TK_TEXT);
+	lex(LANG_VERILOG, 0, "counter u0 (clk, q); assign y = f(a);");
+	T("counter", TK_TYPE);
+	T("u0", TK_TEXT);
+	T("assign", TK_STORAGE);
+	T("f", TK_FUNCTION);
+	lex(LANG_VERILOG, 0, "function [7:0] add; endfunction // c");
+	T("add", TK_FUNCTION);
+	T("// c", TK_COMMENT);
+	/* SystemVerilog words are not Verilog's */
+	lex(LANG_VERILOG, 0, "logic x;");
+	T("logic", TK_TEXT);
+	lex(LANG_SYSTEMVERILOG, 0, "logic [7:0] x = '1; always_ff @(posedge clk) x <= pkg::f(x);");
+	T("logic", TK_STORAGE);
+	T("'1", TK_NUMBER);
+	T("always_ff", TK_CONTROL);
+	T("pkg", TK_TYPE);
+	lex(LANG_SYSTEMVERILOG, 0, "class Pkt extends Base; function new(); super.new(); this.len = null; endfunction");
+	T("class", TK_STORAGE);
+	T("Pkt", TK_TYPE);
+	T("Base", TK_TYPE);
+	T("super", TK_LANGCONST);
+	TN("new", 1, TK_FUNCTION);
+	T("null", TK_LANGCONST);
+	lex(LANG_SYSTEMVERILOG, 0, "function automatic int unsigned sum(input int a); return a; endfunction");
+	T("sum", TK_FUNCTION);
+	T("return", TK_CONTROL);
+	s = lex(LANG_SYSTEMVERILOG, 0, "wire a; /* open");
+	CHECK(s == 1);
+	s = lex(LANG_SYSTEMVERILOG, s, "close */ wire b;");
+	T("close */", TK_COMMENT);
+	T("wire", TK_STORAGE);
+	CHECK(s == 0);
+}
+
+static void test_tcl(void)
+{
+	u32 s;
+	lex(LANG_TCL, 0, "proc greet {name {greeting \"Hi\"}} {");
+	T("proc", TK_STORAGE);
+	T("greet", TK_FUNCTION);
+	T("name", TK_TEXT);
+	T("\"Hi\"", TK_STRING);
+	lex(LANG_TCL, 0, "    set msg \"$greeting, ${name}! [string toupper $name]\\n\"");
+	T("set", TK_STORAGE);
+	T("msg", TK_VARIABLE);
+	T("$greeting", TK_VARIABLE);
+	T("${name}", TK_VARIABLE);
+	T("string", TK_FUNCTION);
+	T("toupper", TK_TEXT);
+	T("\\n", TK_ESCAPE);
+	lex(LANG_TCL, 0, "if {$n > 0} { puts -nonewline stderr $n } elseif {$n == 0} { return 1.5e3 }");
+	T("if", TK_CONTROL);
+	T("$n", TK_VARIABLE);
+	T("puts", TK_FUNCTION);
+	T("-nonewline", TK_LANGCONST);
+	T("stderr", TK_TEXT);
+	T("elseif", TK_CONTROL);
+	T("return", TK_CONTROL);
+	T("1.5e3", TK_NUMBER);
+	lex(LANG_TCL, 0, "global a b; incr ::ns::count 2; set l {x y}");
+	T("global", TK_STORAGE);
+	TN("a", 1, TK_VARIABLE);
+	TN("b", 1, TK_VARIABLE);
+	T("incr", TK_STORAGE);
+	T("2", TK_NUMBER);
+	T("x", TK_TEXT);
+	lex(LANG_TCL, 0, "create_clock -period 10.0 [get_ports clk] ;# trailing");
+	T("create_clock", TK_FUNCTION);
+	T("get_ports", TK_FUNCTION);
+	T("# trailing", TK_COMMENT);
+	lex(LANG_TCL, 0, "puts \"a # not a comment\"");
+	T("# not", TK_STRING);
+	/* comments continue with a trailing backslash; strings span lines */
+	s = lex(LANG_TCL, 0, "# a comment \\");
+	CHECK(s == 2);
+	s = lex(LANG_TCL, s, "  continued");
+	T("continued", TK_COMMENT);
+	CHECK(s == 0);
+	s = lex(LANG_TCL, 0, "set s \"multi");
+	CHECK(s == 1);
+	s = lex(LANG_TCL, s, "line $x\" ; puts ok");
+	T("line", TK_STRING);
+	T("$x", TK_VARIABLE);
+	T("puts", TK_FUNCTION);
+	CHECK(s == 0);
+	/* a continued command: no command word at the next line's start */
+	s = lex(LANG_TCL, 0, "foo a \\");
+	CHECK(s == 4);
+	lex(LANG_TCL, s, "  b c");
+	T("b", TK_TEXT);
+}
+
+static void test_pascal(void)
+{
+	u32 s;
+	lex(LANG_PASCAL, 0, "program Squares(output); var i: integer;");
+	T("program", TK_STORAGE);
+	T("Squares", TK_TYPE);
+	T("var", TK_STORAGE);
+	T("integer", TK_TYPE);
+	lex(LANG_PASCAL, 0, "BEGIN for i := 1 to 10 do WriteLn(i * i div 2) { c } END.");
+	T("BEGIN", TK_CONTROL);
+	T("for", TK_CONTROL);
+	T(":=", TK_OPERATOR);
+	T("WriteLn", TK_FUNCTION);
+	T("div", TK_STORAGE);
+	T("{ c }", TK_COMMENT);
+	T("END", TK_CONTROL);
+	lex(LANG_PASCAL, 0, "s := 'it''s' + #13#10 + #$0A; n := $FF + %101 + &17 + 1.5E3; p := nil");
+	T("'it''s'", TK_STRING);
+	T("#13#10", TK_ESCAPE);
+	T("#$0A", TK_ESCAPE);
+	T("$FF", TK_NUMBER);
+	T("%101", TK_NUMBER);
+	T("&17", TK_NUMBER);
+	T("1.5E3", TK_NUMBER);
+	T("nil", TK_LANGCONST);
+	/* Object Pascal words are not ISO Pascal's */
+	lex(LANG_PASCAL, 0, "try");
+	T("try", TK_TEXT);
+	lex(LANG_OBJPASCAL, 0, "{$mode objfpc}{$H+} TShape = class(TObject) TColor = (Red, Green); PInt = ^Integer;");
+	T("{$mode objfpc}", TK_PREPROC);
+	T("{$H+}", TK_PREPROC);
+	T("TShape", TK_TYPE);
+	T("class", TK_STORAGE);
+	T("TObject", TK_TYPE);
+	T("TColor", TK_TYPE);
+	T("Red", TK_TEXT);
+	T("PInt", TK_TYPE);
+	lex(LANG_OBJPASCAL, 0, "constructor TShape.Create(const AName: string); override; // c");
+	T("constructor", TK_STORAGE);
+	T("TShape", TK_TYPE);
+	T("Create", TK_FUNCTION);
+	T("const", TK_STORAGE);
+	T("string", TK_TYPE);
+	T("override", TK_STORAGE);
+	T("// c", TK_COMMENT);
+	lex(LANG_OBJPASCAL, 0, "try raise Exception.Create('x') except on E: Exception do Self.Free; end;");
+	T("try", TK_CONTROL);
+	T("raise", TK_CONTROL);
+	T("Exception", TK_TYPE);
+	T("except", TK_CONTROL);
+	T("Self", TK_LANGCONST);
+	T("Free", TK_TEXT);
+	lex(LANG_OBJPASCAL, 0, "if a = b then Read(x)");
+	T("a", TK_TEXT);
+	T("Read", TK_FUNCTION);
+	s = lex(LANG_OBJPASCAL, 0, "x := 1; (* open");
+	CHECK(s == 2);
+	s = lex(LANG_OBJPASCAL, s, "still *) y");
+	T("still *)", TK_COMMENT);
+	CHECK(s == 0);
+	s = lex(LANG_OBJPASCAL, 0, "{$IFDEF FPC");
+	CHECK(s == 3);
+	s = lex(LANG_OBJPASCAL, s, "  }");
+	T("}", TK_PREPROC);
+	CHECK(s == 0);
+}
+
+static void test_r(void)
+{
+	u32 s;
+	lex(LANG_R, 0, "f <- function(x, na.rm = TRUE) {");
+	T("f", TK_FUNCTION);
+	T("<-", TK_OPERATOR);
+	T("function", TK_STORAGE);
+	T("na.rm", TK_VARIABLE);
+	T("TRUE", TK_LANGCONST);
+	lex(LANG_R, 0, "  if (is.null(x)) return(NA_real_) else y <- x %>% dplyr::filter(v > 1L) |> mean()");
+	T("if", TK_CONTROL);
+	T("is.null", TK_FUNCTION);
+	T("return", TK_CONTROL);
+	T("NA_real_", TK_LANGCONST);
+	T("%>%", TK_OPERATOR);
+	T("dplyr", TK_TYPE);
+	T("filter", TK_FUNCTION);
+	T("1L", TK_NUMBER);
+	T("|>", TK_OPERATOR);
+	lex(LANG_R, 0, "g = \\(z) z^2; x$name; 0x1F; 1e-3; 2i; .5; `odd name` <- Inf # c");
+	T("g", TK_FUNCTION);
+	T("\\", TK_STORAGE);
+	T("name", TK_TEXT);
+	T("0x1F", TK_NUMBER);
+	T("1e-3", TK_NUMBER);
+	T("2i", TK_NUMBER);
+	T(".5", TK_NUMBER);
+	T("odd", TK_TEXT);
+	T("Inf", TK_LANGCONST);
+	T("# c", TK_COMMENT);
+	lex(LANG_R, 0, "#' @param x a vector");
+	T("#'", TK_COMMENT);
+	T("@param", TK_STORAGE);
+	T("x a vector", TK_COMMENT);
+	lex(LANG_R, 0, "s <- 'a\\tb'; r <- r\"(raw \\d)\"");
+	T("'a", TK_STRING);
+	T("\\t", TK_ESCAPE);
+	T("r\"(raw \\d)\"", TK_STRING);
+	s = lex(LANG_R, 0, "s <- \"multi");
+	CHECK(s == 1);
+	s = lex(LANG_R, s, "line\" ; for (i in 1:3) next");
+	T("line\"", TK_STRING);
+	T("for", TK_CONTROL);
+	TN("in", 1, TK_CONTROL);
+	T("next", TK_CONTROL);
+	CHECK(s == 0);
+	s = lex(LANG_R, 0, "x <- R'--[a ]\" ]-");
+	CHECK((s & 3u) == 3);
+	s = lex(LANG_R, s, "b]--' ; TRUE");
+	T("b]--'", TK_STRING);
+	T("TRUE", TK_LANGCONST);
+	CHECK(s == 0);
+}
+
+static void test_ruby(void)
+{
+	u32 s;
+	lex(LANG_RUBY, 0, "class Circle < Shapes::Base # c");
+	T("class", TK_CONTROL);
+	T("Circle", TK_TYPE);
+	T("Shapes", TK_TYPE);
+	T("Base", TK_TYPE);
+	T("# c", TK_COMMENT);
+	lex(LANG_RUBY, 0, "  attr_reader :radius; PI2 = 6.28; require 'json'");
+	T("attr_reader", TK_FUNCTION);
+	T(":radius", TK_LANGCONST);
+	T("PI2", TK_CONSTANT);
+	T("6.28", TK_NUMBER);
+	T("'json'", TK_STRING);
+	lex(LANG_RUBY, 0, "  def initialize(radius:, name: \"c\") = @radius = @@n = $stderr");
+	T("def", TK_CONTROL);
+	T("initialize", TK_FUNCTION);
+	T("radius:", TK_LANGCONST);
+	T("name:", TK_LANGCONST);
+	T("@radius", TK_VARIABLE);
+	T("@@n", TK_VARIABLE);
+	T("$stderr", TK_VARIABLE);
+	lex(LANG_RUBY, 0, "def self.unit = new; def ==(o) = o.is_a?(C); def name=(v); end");
+	T("self", TK_LANGCONST);
+	T("unit", TK_FUNCTION);
+	T("==", TK_FUNCTION);
+	T("is_a?", TK_FUNCTION);
+	T("name=", TK_FUNCTION);
+	T("end", TK_CONTROL);
+	lex(LANG_RUBY, 0, "puts \"made #{name.upcase} #@r\\n\" unless x and not y");
+	T("puts", TK_FUNCTION);
+	T("\"made ", TK_STRING);
+	T("#{", TK_STORAGE);
+	T("#@r", TK_VARIABLE);
+	T("\\n", TK_ESCAPE);
+	T("unless", TK_CONTROL);
+	T("and", TK_OPERATOR);
+	T("not", TK_OPERATOR);
+	lex(LANG_RUBY, 0, "x = %w[a b] + %i(c); re = /ab+c/i; q = a / b; c = ?a; h = { key: :sym, 1_000 => nil }");
+	T("%w[a b]", TK_STRING);
+	T("%i(c)", TK_LANGCONST);
+	T("/ab+c/i", TK_REGEX);
+	TN("/", 2, TK_OPERATOR); /* a / b */
+	T("?a", TK_STRING);
+	T("key:", TK_LANGCONST);
+	T(":sym", TK_LANGCONST);
+	T("1_000", TK_NUMBER);
+	T("nil", TK_LANGCONST);
+	lex(LANG_RUBY, 0, "puts /x/ if a.empty? ? 1 : 2");
+	T("/x/", TK_REGEX);
+	/* heredocs */
+	s = lex(LANG_RUBY, 0, "text = <<~EOS.strip");
+	T("<<~EOS", TK_STRING);
+	CHECK((s & 7u) == 2);
+	u32 hd = s;
+	s = lex(LANG_RUBY, s, "  Hello #{x.first}");
+	T("  Hello ", TK_STRING);
+	T("#{", TK_STORAGE);
+	CHECK(s == hd);
+	s = lex(LANG_RUBY, s, "  EOS");
+	T("EOS", TK_STRING);
+	CHECK(s == 0);
+	s = lex(LANG_RUBY, 0, "q = <<-'RAW'");
+	s = lex(LANG_RUBY, s, "no #{interp}");
+	T("no #{interp}", TK_STRING);
+	s = lex(LANG_RUBY, s, "RAW");
+	CHECK(s == 0);
+	/* strings, %() and =begin span lines */
+	s = lex(LANG_RUBY, 0, "long = \"spans");
+	CHECK((s & 7u) == 3);
+	s = lex(LANG_RUBY, s, "lines #{h[:k]}\" if ok");
+	T("lines ", TK_STRING);
+	T(":k", TK_LANGCONST);
+	T("if", TK_CONTROL);
+	CHECK(s == 0);
+	s = lex(LANG_RUBY, 0, "w = %w(a (b");
+	s = lex(LANG_RUBY, s, "c) d)");
+	T("c) d)", TK_STRING);
+	CHECK(s == 0);
+	s = lex(LANG_RUBY, 0, "=begin");
+	CHECK(s == 1);
+	s = lex(LANG_RUBY, s, "doc");
+	T("doc", TK_COMMENT);
+	s = lex(LANG_RUBY, s, "=end");
+	CHECK(s == 0);
+	s = lex(LANG_RUBY, 0, "__END__");
+	s = lex(LANG_RUBY, s, "data # here");
+	T("data", TK_TEXT);
+	CHECK(s == 4);
+}
+
+static void test_algol68(void)
+{
+	u32 s;
+	lex(LANG_ALGOL68, 0, "PROC fact = (INT n) INT: IF n <= 1 THEN 1 ELSE n * fact (n - 1) FI; # c #");
+	T("PROC", TK_STORAGE);
+	TN("fact", 0, TK_FUNCTION);
+	TN("fact", 1, TK_FUNCTION);
+	T("INT", TK_STORAGE);
+	T("IF", TK_CONTROL);
+	T("THEN", TK_CONTROL);
+	T("FI", TK_CONTROL);
+	T("1", TK_NUMBER);
+	T("# c #", TK_COMMENT);
+	lex(LANG_ALGOL68, 0, "MODE NODE = STRUCT (INT value, REF NODE next); OP +:= = (REF INT a, INT b) REF INT: a := a + b;");
+	T("MODE", TK_STORAGE);
+	T("NODE", TK_TYPE);
+	T("STRUCT", TK_STORAGE);
+	T("REF", TK_STORAGE);
+	T("value", TK_TEXT);
+	T("+:=", TK_FUNCTION);
+	lex(LANG_ALGOL68, 0, "PRIO MAX = 6; INT x := 16r1f; REAL r = 1.5e3; BOOL b = TRUE; FOR i TO UPB a DO SKIP OD");
+	T("MAX", TK_FUNCTION);
+	T("16r1f", TK_NUMBER);
+	T("1.5e3", TK_NUMBER);
+	T("TRUE", TK_LANGCONST);
+	T("UPB", TK_STORAGE);
+	T("SKIP", TK_LANGCONST);
+	T("OD", TK_CONTROL);
+	lex(LANG_ALGOL68, 0, "print ((\"it \"\"q\"\"\", new line)); 'begin' 'int' z := 1 'end'");
+	T("print", TK_FUNCTION);
+	T("\"it \"\"q\"\"\"", TK_STRING);
+	T("'begin'", TK_CONTROL);
+	T("'int'", TK_STORAGE);
+	T("'end'", TK_CONTROL);
+	lex(LANG_ALGOL68, 0, "PR echo PR x \xC2\xA2 cent \xC2\xA2 y");
+	T("PR echo PR", TK_PREPROC);
+	T("\xC2\xA2 cent \xC2\xA2", TK_COMMENT);
+	/* comments span lines; CO closes CO, not COMMENT */
+	s = lex(LANG_ALGOL68, 0, "x := 1; COMMENT a CO b");
+	CHECK(s == 3);
+	s = lex(LANG_ALGOL68, s, "c COMMENT BEGIN");
+	T("c COMMENT", TK_COMMENT);
+	T("BEGIN", TK_CONTROL);
+	CHECK(s == 0);
+	s = lex(LANG_ALGOL68, 0, "'co' quoted");
+	CHECK(s == (2u | 8u));
+	s = lex(LANG_ALGOL68, s, "CO still 'co' END");
+	T("CO still 'co'", TK_COMMENT);
+	T("END", TK_CONTROL);
+	CHECK(s == 0);
+	s = lex(LANG_ALGOL68, 0, "# open");
+	CHECK(s == 1);
+}
+
+static void test_detect8(void)
+{
+	CHECK(LANG_SAIL == 33 && LANG_VERILOG == 34 && LANG_SYSTEMVERILOG == 35 && LANG_TCL == 36 && LANG_PASCAL == 37 &&
+	      LANG_OBJPASCAL == 38 && LANG_R == 39 && LANG_RUBY == 40 && LANG_ALGOL68 == 41);
+	CHECK(syn_lang_for_path("src/nx/gpu/shader/sail/sm53.sail", NULL, 0) == LANG_SAIL);
+	CHECK(syn_lang_for_path("rtl/top.v", NULL, 0) == LANG_VERILOG);
+	CHECK(syn_lang_for_path("defs.vh", NULL, 0) == LANG_VERILOG);
+	CHECK(syn_lang_for_path("tb.sv", NULL, 0) == LANG_SYSTEMVERILOG);
+	CHECK(syn_lang_for_path("pkg.SVH", NULL, 0) == LANG_SYSTEMVERILOG);
+	static const char *const tcl[] = {"a.tcl", "w.tk", "pkgIndex.tcl", "x.tm", "top.sdc", "pins.xdc", "run.exp"};
+	for (size_t i = 0; i < VX_COUNT(tcl); i++)
+		CHECK(syn_lang_for_path(tcl[i], NULL, 0) == LANG_TCL);
+	static const char tclsh[] = "#!/usr/bin/env tclsh8.6\nputs hi\n", wish[] = "#!/usr/local/bin/wish\n";
+	CHECK(syn_lang_for_path("tool", tclsh, sizeof tclsh - 1) == LANG_TCL);
+	CHECK(syn_lang_for_path("gui", wish, sizeof wish - 1) == LANG_TCL);
+	static const char iso[] = "program p(output);\nbegin writeln('x') end.\n";
+	static const char fpc[] = "{$mode objfpc}\nunit u;\ninterface\n";
+	static const char dlp[] = "unit Shapes;\ninterface\ntype TShape = class\n";
+	CHECK(syn_lang_for_path("p.pas", iso, sizeof iso - 1) == LANG_PASCAL);
+	CHECK(syn_lang_for_path("u.pas", fpc, sizeof fpc - 1) == LANG_OBJPASCAL);
+	CHECK(syn_lang_for_path("u.pp", dlp, sizeof dlp - 1) == LANG_OBJPASCAL);
+	CHECK(syn_lang_for_path("p.p", NULL, 0) == LANG_PASCAL);
+	CHECK(syn_lang_for_path("Project.dpr", NULL, 0) == LANG_OBJPASCAL);
+	CHECK(syn_lang_for_path("app.lpr", NULL, 0) == LANG_OBJPASCAL);
+	CHECK(syn_lang_for_path("analysis.R", NULL, 0) == LANG_R);
+	CHECK(syn_lang_for_path("x.r", NULL, 0) == LANG_R);
+	CHECK(syn_lang_for_path("/home/u/.Rprofile", NULL, 0) == LANG_R);
+	static const char rs[] = "#!/usr/bin/env Rscript\n";
+	CHECK(syn_lang_for_path("plot", rs, sizeof rs - 1) == LANG_R);
+	static const char *const rb[] = {"a.rb", "Rakefile", "Gemfile", "x.gemspec", "config.ru", "t.rake", "Vagrantfile", ".irbrc"};
+	for (size_t i = 0; i < VX_COUNT(rb); i++)
+		CHECK(syn_lang_for_path(rb[i], NULL, 0) == LANG_RUBY);
+	static const char rby[] = "#!/usr/bin/ruby3.3 -w\n";
+	CHECK(syn_lang_for_path("bin/tool", rby, sizeof rby - 1) == LANG_RUBY);
+	CHECK(syn_lang_for_path("Gemfile.lock", NULL, 0) != LANG_RUBY);
+	CHECK(syn_lang_for_path("hello.a68", NULL, 0) == LANG_ALGOL68);
+	static const char a68[] = "#!/usr/bin/a68g --script\n";
+	CHECK(syn_lang_for_path("hello", a68, sizeof a68 - 1) == LANG_ALGOL68);
+	CHECK(syn_lang_for_path("x.inc", NULL, 0) == LANG_ASM_INTEL); /* not Pascal */
+
+	CHECK_STR(syn_lang_name(LANG_SAIL), "Sail");
+	CHECK_STR(syn_lang_name(LANG_VERILOG), "Verilog");
+	CHECK_STR(syn_lang_name(LANG_SYSTEMVERILOG), "SystemVerilog");
+	CHECK_STR(syn_lang_name(LANG_TCL), "Tcl");
+	CHECK_STR(syn_lang_name(LANG_PASCAL), "Pascal");
+	CHECK_STR(syn_lang_name(LANG_OBJPASCAL), "Object Pascal");
+	CHECK_STR(syn_lang_name(LANG_R), "R");
+	CHECK_STR(syn_lang_name(LANG_RUBY), "Ruby");
+	CHECK_STR(syn_lang_name(LANG_ALGOL68), "ALGOL 68");
+	CHECK_STR(syn_lang_lsp_id(LANG_SYSTEMVERILOG), "systemverilog");
+	CHECK_STR(syn_lang_lsp_id(LANG_RUBY), "ruby");
+	CHECK_STR(syn_lang_lsp_id(LANG_R), "r");
+	CHECK_STR(syn_line_comment(LANG_SAIL), "//");
+	CHECK_STR(syn_line_comment(LANG_VERILOG), "//");
+	CHECK_STR(syn_line_comment(LANG_OBJPASCAL), "//");
+	CHECK_STR(syn_line_comment(LANG_TCL), "#");
+	CHECK_STR(syn_line_comment(LANG_R), "#");
+	CHECK_STR(syn_line_comment(LANG_RUBY), "#");
+	CHECK(syn_line_comment(LANG_ALGOL68) == NULL); /* # comments need a closing # */
+	/* not fence languages: the Markdown fence keeps 5 bits */
+	CHECK(syn_fence_lang("ruby", 4) == LANG_NONE);
+}
+
+/* Random lines over the lexers added with Sail: spans in order and in
+ * bounds, states within SYN_STATE_BITS. */
+static void test_fuzz_more(void)
+{
+	static const char alpha[] = "\"'`$@{}[]()<>/\\*#;:=!?&%^.,+-_ \tabcxyzABC019"
+	                            "\"\"\"'''(*{$*)}`#{}<<~EOS=begin=endCOCOMMENTPR\xC2\xA2r\"(-";
+	static const int langs[] = {LANG_SAIL, LANG_VERILOG, LANG_SYSTEMVERILOG, LANG_TCL, LANG_PASCAL,
+	                            LANG_OBJPASCAL, LANG_R, LANG_RUBY, LANG_ALGOL68};
+	u32 rng = 777;
+	char line[200];
+	int bad = 0;
+	for (size_t l = 0; l < VX_COUNT(langs); l++) {
+		u32 s = 0;
+		for (int it = 0; it < 6000; it++) {
+			rng = rng * 1103515245u + 12345u;
+			u32 len = (rng >> 16) % (sizeof line - 1);
+			for (u32 k = 0; k < len; k++) {
+				rng = rng * 1103515245u + 12345u;
+				line[k] = alpha[(rng >> 16) % (sizeof alpha - 1)];
+			}
+			line[len] = 0;
+			s = lex(langs[l], s, line);
+			if (s >= (1u << SYN_STATE_BITS))
+				bad++;
+		}
+	}
+	CHECK(bad == 0);
+}
+
+static void test_haskell(void)
+{
+	u32 s;
+	lex(LANG_HASKELL, 0, "{-# LANGUAGE GADTs #-} module Main (main) where");
+	T("{-# LANGUAGE GADTs #-}", TK_PREPROC);
+	T("module", TK_STORAGE);
+	T("Main", TK_TYPE);
+	T("where", TK_CONTROL);
+	lex(LANG_HASKELL, 0, "import qualified Data.Map as M");
+	T("import", TK_STORAGE);
+	T("qualified", TK_STORAGE);
+	T("Data.Map", TK_TYPE);
+	T("as", TK_STORAGE);
+	lex(LANG_HASKELL, 0, "f as = as -- qualified as");
+	T("f", TK_FUNCTION);
+	TN("as", 0, TK_TEXT); /* not an import line */
+	T("-- qualified as", TK_COMMENT);
+	lex(LANG_HASKELL, 0, "data Tree a = Leaf | Node (Tree a) a deriving (Show, Eq)");
+	T("data", TK_STORAGE);
+	T("Tree", TK_TYPE);
+	T("Leaf", TK_TYPE);
+	T("|", TK_OPERATOR);
+	T("deriving", TK_STORAGE);
+	lex(LANG_HASKELL, 0, "insert :: Ord a => a -> Tree a -> Tree a");
+	T("insert", TK_FUNCTION);
+	T("::", TK_OPERATOR);
+	T("=>", TK_OPERATOR);
+	lex(LANG_HASKELL, 0, "insert x Leaf = Node Leaf x Leaf");
+	T("insert", TK_FUNCTION);
+	lex(LANG_HASKELL, 0, "  let m = M.fromList [(1 :: Int, \"one\\n\"), (0x1F, 'c'), (2.5e-3, '\\n')]");
+	T("let", TK_CONTROL);
+	T("M", TK_TYPE);
+	T("fromList", TK_TEXT);
+	T("\"one", TK_STRING);
+	T("\\n", TK_ESCAPE);
+	T("0x1F", TK_NUMBER);
+	T("'c'", TK_STRING);
+	T("2.5e-3", TK_NUMBER);
+	lex(LANG_HASKELL, 0, "  x' = a `elem` [True, False] --> y");
+	T("x'", TK_FUNCTION);
+	T("`elem`", TK_OPERATOR);
+	T("True", TK_LANGCONST);
+	T("-->", TK_OPERATOR);
+	lex(LANG_HASKELL, 0, "  case xs of { [] -> if a then b else c }");
+	T("case", TK_CONTROL);
+	T("of", TK_CONTROL);
+	T("if", TK_CONTROL);
+	T("->", TK_OPERATOR);
+	/* nested comments span lines */
+	s = lex(LANG_HASKELL, 0, "x {- a {- b -}");
+	CHECK(s == 1);
+	s = lex(LANG_HASKELL, s, "still -} y");
+	T("still -}", TK_COMMENT);
+	T("y", TK_TEXT);
+	CHECK(s == 0);
+	s = lex(LANG_HASKELL, 0, "{-# INLINE");
+	CHECK(s == 0x101);
+	s = lex(LANG_HASKELL, s, "  f #-}");
+	T("f #-}", TK_PREPROC);
+	CHECK(s == 0);
+	/* a string gap */
+	s = lex(LANG_HASKELL, 0, "s = \"abc\\");
+	CHECK(s == 0x200);
+	s = lex(LANG_HASKELL, s, "    \\def\" ++ t");
+	T("def\"", TK_STRING);
+	T("++", TK_OPERATOR);
+	CHECK(s == 0);
+}
+
+static void test_batch(void)
+{
+	lex(LANG_BATCH, 0, "@echo off & rem not a comment here");
+	T("@", TK_OPERATOR);
+	T("echo", TK_STORAGE);
+	T("off", TK_TEXT);
+	T("&", TK_OPERATOR);
+	lex(LANG_BATCH, 0, "REM build script");
+	T("REM build script", TK_COMMENT);
+	lex(LANG_BATCH, 0, "  :: also a comment");
+	T(":: also a comment", TK_COMMENT);
+	lex(LANG_BATCH, 0, ":fail");
+	T(":fail", TK_FUNCTION);
+	lex(LANG_BATCH, 0, "set /a count=0");
+	T("set", TK_STORAGE);
+	T("/a", TK_LANGCONST);
+	T("count", TK_VARIABLE);
+	T("0", TK_NUMBER);
+	lex(LANG_BATCH, 0, "if not exist \"%OUT%\\x\" mkdir \"%~dp0build\"");
+	T("if", TK_CONTROL);
+	T("not", TK_CONTROL);
+	T("exist", TK_CONTROL);
+	T("\"", TK_STRING);
+	T("%OUT%", TK_VARIABLE);
+	T("mkdir", TK_STORAGE);
+	T("%~dp0", TK_VARIABLE);
+	lex(LANG_BATCH, 0, "for %%f in (*.c) do cl /c %%~nxf !OBJ! >nul 2>&1 || goto :eof");
+	T("for", TK_CONTROL);
+	T("%%f", TK_VARIABLE);
+	T("in", TK_CONTROL);
+	T("do", TK_CONTROL);
+	T("/c", TK_LANGCONST);
+	T("%%~nxf", TK_VARIABLE);
+	T("!OBJ!", TK_VARIABLE);
+	T("2>&1", TK_OPERATOR);
+	T("||", TK_OPERATOR);
+	T("goto", TK_CONTROL);
+	T(":eof", TK_FUNCTION);
+	lex(LANG_BATCH, 0, "IF %1 GEQ 10 ECHO many if set ^& more %2");
+	T("IF", TK_CONTROL);
+	T("%1", TK_VARIABLE);
+	T("GEQ", TK_OPERATOR);
+	T("ECHO", TK_STORAGE);
+	TN("if", 0, TK_TEXT); /* echo's text */
+	T("^&", TK_ESCAPE);
+	T("%2", TK_VARIABLE);
+	lex(LANG_BATCH, 0, "if \"%x%\"==\"y\" (call :sub %*) else exit /b 1");
+	T("==", TK_OPERATOR);
+	T("call", TK_CONTROL);
+	T(":sub", TK_FUNCTION);
+	T("%*", TK_VARIABLE);
+	T("else", TK_CONTROL);
+	CHECK(lex(LANG_BATCH, 0, "echo 100%") == 0);
+	T("100%", TK_TEXT);
+}
+
+static void test_powershell(void)
+{
+	u32 s;
+	lex(LANG_POWERSHELL, 0, "function Get-Thing([string]$Name) { # c");
+	T("function", TK_STORAGE);
+	T("Get-Thing", TK_FUNCTION);
+	T("string", TK_STORAGE);
+	T("$Name", TK_VARIABLE);
+	T("# c", TK_COMMENT);
+	lex(LANG_POWERSHELL, 0, "$items = Get-ChildItem -Path $env:TEMP | Where-Object { $_.Length -gt 1mb -and $true }");
+	T("$items", TK_VARIABLE);
+	T("Get-ChildItem", TK_FUNCTION);
+	T("-Path", TK_LANGCONST);
+	T("$env:", TK_STORAGE);
+	T("TEMP", TK_VARIABLE);
+	T("Where-Object", TK_FUNCTION);
+	T("$_", TK_VARIABLE);
+	T("Length", TK_TEXT);
+	T("-gt", TK_OPERATOR);
+	T("1mb", TK_NUMBER);
+	T("-and", TK_OPERATOR);
+	T("$true", TK_LANGCONST);
+	lex(LANG_POWERSHELL, 0, "foreach ($i in $a) { Write-Host \"N: $($i.Name) `n\" -f 1 } ; git status");
+	T("foreach", TK_CONTROL);
+	T("in", TK_CONTROL);
+	T("\"N: ", TK_STRING);
+	T("$(", TK_STORAGE);
+	T("$i", TK_VARIABLE);
+	T("`n", TK_ESCAPE);
+	T("-f", TK_OPERATOR);
+	T("git", TK_FUNCTION);
+	T("status", TK_TEXT);
+	lex(LANG_POWERSHELL, 0, "[CmdletBinding()] param([Parameter(Mandatory)][int[]]$S = @(1, 0x1F))");
+	T("CmdletBinding", TK_FUNCTION);
+	T("param", TK_CONTROL);
+	T("Parameter", TK_FUNCTION);
+	T("Mandatory", TK_VARIABLE);
+	T("int", TK_STORAGE);
+	T("0x1F", TK_NUMBER);
+	lex(LANG_POWERSHELL, 0, "$h = @{ Key = 'it''s' }; [System.IO.Path]::Combine($a[0], \"b\"); & $cmd @splat");
+	T("Key", TK_VARIABLE);
+	T("'it''s'", TK_STRING);
+	T("System.IO.Path", TK_STORAGE);
+	T("Combine", TK_FUNCTION);
+	TN("0", 0, TK_NUMBER);
+	T("@splat", TK_VARIABLE);
+	lex(LANG_POWERSHELL, 0, "class Shape { [int]$Size; static [void] Draw() { $this.Size = $null } }");
+	T("class", TK_STORAGE);
+	T("Shape", TK_TYPE);
+	T("static", TK_STORAGE);
+	T("void", TK_STORAGE);
+	T("$this", TK_LANGCONST);
+	T("$null", TK_LANGCONST);
+	/* block comments with help keywords, here-strings and strings span lines */
+	s = lex(LANG_POWERSHELL, 0, "x <#");
+	CHECK(s == 1);
+	s = lex(LANG_POWERSHELL, s, ".SYNOPSIS");
+	T(".SYNOPSIS", TK_STORAGE);
+	s = lex(LANG_POWERSHELL, s, "  done #> Get-Date");
+	T("  done #>", TK_COMMENT);
+	T("Get-Date", TK_FUNCTION);
+	CHECK(s == 0);
+	s = lex(LANG_POWERSHELL, 0, "$t = @\"");
+	CHECK(s == 2);
+	s = lex(LANG_POWERSHELL, s, "Hi $Name \"q\" $(Get-Date)");
+	T("Hi ", TK_STRING);
+	T("$Name", TK_VARIABLE);
+	T("\"q\"", TK_STRING);
+	T("Get-Date", TK_FUNCTION);
+	s = lex(LANG_POWERSHELL, s, "\"@ | Out-File x");
+	T("\"@", TK_STRING);
+	T("Out-File", TK_FUNCTION);
+	CHECK(s == 0);
+	s = lex(LANG_POWERSHELL, 0, "$r = @'");
+	CHECK(s == 3);
+	s = lex(LANG_POWERSHELL, s, "no $expansion");
+	T("no $expansion", TK_STRING);
+	s = lex(LANG_POWERSHELL, s, "'@");
+	CHECK(s == 0);
+	s = lex(LANG_POWERSHELL, 0, "$m = \"multi");
+	CHECK(s == 4);
+	s = lex(LANG_POWERSHELL, s, "line\"; return");
+	T("return", TK_CONTROL);
+	CHECK(s == 0);
+}
+
+static void test_detect9(void)
+{
+	CHECK(LANG_HASKELL == 42 && LANG_BATCH == 43 && LANG_POWERSHELL == 44 && LANG_COUNT == 45);
+	CHECK(syn_lang_for_path("src/Main.hs", NULL, 0) == LANG_HASKELL);
+	CHECK(syn_lang_for_path("A.hs-boot", NULL, 0) == LANG_HASKELL);
+	static const char ghc[] = "#!/usr/bin/env runghc\nmain = pure ()\n";
+	CHECK(syn_lang_for_path("script", ghc, sizeof ghc - 1) == LANG_HASKELL);
+	CHECK(syn_lang_for_path("build.bat", NULL, 0) == LANG_BATCH);
+	CHECK(syn_lang_for_path("RUN.CMD", NULL, 0) == LANG_BATCH);
+	CHECK(syn_lang_for_path("x.command", NULL, 0) == LANG_SH);
+	static const char *const ps[] = {"a.ps1", "m.psm1", "d.psd1"};
+	for (size_t i = 0; i < VX_COUNT(ps); i++)
+		CHECK(syn_lang_for_path(ps[i], NULL, 0) == LANG_POWERSHELL);
+	static const char pwsh[] = "#!/usr/bin/env pwsh\n";
+	CHECK(syn_lang_for_path("tool", pwsh, sizeof pwsh - 1) == LANG_POWERSHELL);
+	CHECK_STR(syn_lang_name(LANG_HASKELL), "Haskell");
+	CHECK_STR(syn_lang_name(LANG_BATCH), "Batch");
+	CHECK_STR(syn_lang_name(LANG_POWERSHELL), "PowerShell");
+	CHECK_STR(syn_lang_lsp_id(LANG_HASKELL), "haskell");
+	CHECK_STR(syn_lang_lsp_id(LANG_BATCH), "bat");
+	CHECK_STR(syn_lang_lsp_id(LANG_POWERSHELL), "powershell");
+	CHECK_STR(syn_line_comment(LANG_HASKELL), "--");
+	CHECK_STR(syn_line_comment(LANG_BATCH), "REM");
+	CHECK_STR(syn_line_comment(LANG_POWERSHELL), "#");
+}
+
+static void test_fuzz_more2(void)
+{
+	static const char alpha[] = "\"'`$@{}[]()<>/\\*#;:=!?&%^.,+-_ \tabcxyzABC019"
+	                            "{-#-}--<##>@\"\"@@''@%%~!REM::$(";
+	static const int langs[] = {LANG_HASKELL, LANG_BATCH, LANG_POWERSHELL};
+	u32 rng = 4242;
+	char line[200];
+	int bad = 0;
+	for (size_t l = 0; l < VX_COUNT(langs); l++) {
+		u32 s = 0;
+		for (int it = 0; it < 6000; it++) {
+			rng = rng * 1103515245u + 12345u;
+			u32 len = (rng >> 16) % (sizeof line - 1);
+			for (u32 k = 0; k < len; k++) {
+				rng = rng * 1103515245u + 12345u;
+				line[k] = alpha[(rng >> 16) % (sizeof alpha - 1)];
+			}
+			line[len] = 0;
+			s = lex(langs[l], s, line);
+			if (s >= (1u << SYN_STATE_BITS))
+				bad++;
+		}
+	}
+	CHECK(bad == 0);
+}
+
 int main(void)
 {
 	test_c();
@@ -2970,6 +3771,20 @@ int main(void)
 	test_detect7();
 	test_shaders();
 	test_fuzz_new();
+	test_sail();
+	test_verilog();
+	test_tcl();
+	test_pascal();
+	test_r();
+	test_ruby();
+	test_algol68();
+	test_detect8();
+	test_fuzz_more();
+	test_haskell();
+	test_batch();
+	test_powershell();
+	test_detect9();
+	test_fuzz_more2();
 	bench();
 	bench_more();
 	bench3();
